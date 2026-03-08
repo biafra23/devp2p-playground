@@ -1,6 +1,7 @@
 package devp2p.networking.eth;
 
 import devp2p.core.crypto.NodeKey;
+import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.messages.*;
 import devp2p.networking.rlpx.RLPxHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -9,6 +10,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -39,26 +43,46 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_GET_BLOCK_HEADERS = 0x13;
     private static final int ETH_BLOCK_HEADERS = 0x14;
 
-    private enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
-    private State state = State.AWAITING_HELLO;
+    public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
+    private volatile State state = State.AWAITING_HELLO;
+    private volatile String remoteAddress;
 
     private final NodeKey nodeKey;
     private final int tcpPort;
+    private final NetworkConfig network;
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
+    private final Runnable onReady;
     private final AtomicLong requestId = new AtomicLong(1);
+    private final ConcurrentMap<Long, CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>
+            pendingRequests = new ConcurrentHashMap<>();
 
     private RLPxHandler rlpxHandler; // reference to the RLPx layer for sending
+    private volatile ChannelHandlerContext readyCtx; // stored when state reaches READY
+    private int negotiatedEthVersion = StatusMessage.MAX_ETH_VERSION;
 
-    public EthHandler(NodeKey nodeKey, int tcpPort,
-                      Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders) {
+    public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
+                      Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
+                      Runnable onReady) {
         this.nodeKey = nodeKey;
         this.tcpPort = tcpPort;
+        this.network = network;
         this.onHeaders = onHeaders;
+        this.onReady = onReady;
+    }
+
+    /** Set the remote address early (at connect time), before the handshake completes. */
+    public void setRemoteAddress(String address) {
+        this.remoteAddress = address;
     }
 
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
         if ("RLPX_READY".equals(evt)) {
+            // Store remote address early so it's available before READY state
+            var addr = ctx.channel().remoteAddress();
+            if (addr != null) {
+                remoteAddress = addr.toString().replaceFirst("^/", "");
+            }
             // Retrieve the RLPx handler from the pipeline
             rlpxHandler = (RLPxHandler) ctx.pipeline().get("rlpx");
             sendHello(ctx);
@@ -83,14 +107,19 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             HelloMessage hello = HelloMessage.decode(msg.payload());
             log.info("[eth] Hello from peer: {}", hello);
 
-            // Check if peer supports eth/68
-            boolean hasEth68 = hello.capabilities.stream()
-                .anyMatch(c -> c.name().equals("eth") && c.version() == 68);
-            if (!hasEth68) {
-                log.warn("[eth] Peer does not support eth/68, disconnecting");
+            // Negotiate highest common eth version (67 or 68)
+            int bestEthVersion = hello.capabilities.stream()
+                .filter(c -> c.name().equals("eth") && c.version() >= StatusMessage.MIN_ETH_VERSION
+                        && c.version() <= StatusMessage.MAX_ETH_VERSION)
+                .mapToInt(HelloMessage.Capability::version)
+                .max().orElse(-1);
+            if (bestEthVersion < 0) {
+                log.warn("[eth] Peer does not support eth/67+, disconnecting (caps={})", hello.capabilities);
                 ctx.close();
                 return;
             }
+            negotiatedEthVersion = bestEthVersion;
+            log.info("[eth] Negotiated eth/{}", negotiatedEthVersion);
             state = State.AWAITING_STATUS;
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
@@ -115,14 +144,16 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
             log.info("[eth] Status from peer: {}", status);
-            if (!status.isCompatible()) {
+            if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
                 ctx.close();
                 return;
             }
             state = State.READY;
+            readyCtx = ctx;
             log.info("[eth] Peer ready! Requesting recent block headers...");
+            if (onReady != null) onReady.run();
             requestBlockHeaders(ctx, 21_000_000L, 1);
         } else if (msg.code() == P2P_PING) {
             sendPong(ctx);
@@ -141,10 +172,17 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         switch (msg.code()) {
             case ETH_BLOCK_HEADERS -> {
                 try {
-                    List<BlockHeadersMessage.VerifiedHeader> headers =
-                        BlockHeadersMessage.decode(msg.payload());
-                    log.info("[eth] Received {} block headers", headers.size());
-                    onHeaders.accept(headers);
+                    BlockHeadersMessage.DecodeResult decoded =
+                        BlockHeadersMessage.decodeWithRequestId(msg.payload());
+                    log.info("[eth] Received {} block headers (reqId={})",
+                            decoded.headers().size(), decoded.requestId());
+                    // Complete pending future if this was an IPC-originated request
+                    CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+                            pendingRequests.remove(decoded.requestId());
+                    if (future != null) {
+                        future.complete(decoded.headers());
+                    }
+                    onHeaders.accept(decoded.headers());
                 } catch (Exception e) {
                     log.error("[eth] Failed to decode BlockHeaders", e);
                 }
@@ -168,16 +206,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     private void sendStatus(ChannelHandlerContext ctx) {
-        // Mainnet fork ID hash (EIP-2124 CRC32 chain fingerprint)
-        // go-ethereum forkid_test.go ground-truth hashes:
-        //   Prague  (2025-05-07, ts=1746612311): 0xc376cf8b
-        //   Fusaka  (2025-12-03, ts=1764798551): 0x5167e2a6
-        //   BPO1    (2025-12-09, ts=1765290071): 0xcba2a1c0
-        //   BPO2    (2026-01-07, ts=1767747671): 0x07c9462e  ← current mainnet (March 2026)
-        // Glamsterdam: no mainnet timestamp yet → FORK_NEXT = 0
-        byte[] forkIdHash = {(byte)0x07, (byte)0xc9, (byte)0x46, (byte)0x2e};
-        byte[] payload = StatusMessage.encodeMainnet(
-            StatusMessage.MAINNET_GENESIS_HASH, forkIdHash, 0L);
+        byte[] payload = StatusMessage.encode(
+            negotiatedEthVersion, network.networkId(), network.genesisHash(),
+            network.forkIdHash(), network.forkNext());
         log.info("[eth] Sending Status ({} bytes): {}", payload.length, bytesToHex(payload, payload.length));
         rlpxHandler.sendMessage(ctx, ETH_STATUS, payload);
     }
@@ -187,6 +218,40 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.debug("[eth] GetBlockHeaders block={} count={} reqId={}", blockNumber, count, reqId);
         byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+    }
+
+    /**
+     * Request block headers and return a future that completes when the response arrives.
+     * Uses the stored ChannelHandlerContext from the READY state.
+     *
+     * @return a future, or null if this handler is not in READY state
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeadersAsync(
+            long blockNumber, int count) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future = new CompletableFuture<>();
+        pendingRequests.put(reqId, future);
+
+        log.debug("[eth] GetBlockHeaders (async) block={} count={} reqId={}", blockNumber, count, reqId);
+        byte[] payload = GetBlockHeadersMessage.encodeByNumber(reqId, blockNumber, count, 0, false);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
+        return future;
+    }
+
+    public State getState() {
+        return state;
+    }
+
+    public String getRemoteAddress() {
+        return remoteAddress;
+    }
+
+    /** Returns true if this handler has completed the eth handshake. */
+    public boolean isReady() {
+        return state == State.READY && readyCtx != null;
     }
 
     private void sendPong(ChannelHandlerContext ctx) {

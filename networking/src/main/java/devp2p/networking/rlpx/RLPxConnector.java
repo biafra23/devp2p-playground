@@ -1,6 +1,7 @@
 package devp2p.networking.rlpx;
 
 import devp2p.core.crypto.NodeKey;
+import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.EthHandler;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
 import io.netty.bootstrap.Bootstrap;
@@ -14,7 +15,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 /**
@@ -31,17 +37,28 @@ public final class RLPxConnector implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(RLPxConnector.class);
 
+    /** Callback when a peer reaches READY state: (address, publicKeyHex). */
+    public interface PeerReadyCallback {
+        void onPeerReady(InetSocketAddress address, String publicKeyHex);
+    }
+
     private final NodeKey localKey;
     private final int tcpPort;
+    private final NetworkConfig network;
     private final NioEventLoopGroup group;
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
+    private final PeerReadyCallback peerReadyCallback;
+    private final Set<EthHandler> activeHandlers = ConcurrentHashMap.newKeySet();
 
-    public RLPxConnector(NodeKey localKey, int tcpPort,
-                         Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders) {
+    public RLPxConnector(NodeKey localKey, int tcpPort, NetworkConfig network,
+                         Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
+                         PeerReadyCallback peerReadyCallback) {
         this.localKey = localKey;
         this.tcpPort = tcpPort;
+        this.network = network;
         this.group = new NioEventLoopGroup(4);
         this.onHeaders = onHeaders;
+        this.peerReadyCallback = peerReadyCallback;
     }
 
     /**
@@ -53,7 +70,14 @@ public final class RLPxConnector implements AutoCloseable {
     public ChannelFuture connect(InetSocketAddress peerAddr, SECP256K1.PublicKey peerPublicKey) {
         log.info("[rlpx] Connecting to {} ...", peerAddr);
 
-        EthHandler ethHandler = new EthHandler(localKey, tcpPort, onHeaders);
+        String pubKeyHex = peerPublicKey.bytes().toHexString();
+        Runnable onReady = () -> {
+            if (peerReadyCallback != null) {
+                peerReadyCallback.onPeerReady(peerAddr, pubKeyHex);
+            }
+        };
+        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, onHeaders, onReady);
+        ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
 
         Bootstrap bootstrap = new Bootstrap()
             .group(group)
@@ -70,10 +94,58 @@ public final class RLPxConnector implements AutoCloseable {
                     );
                     ch.pipeline().addLast("rlpx", rlpxHandler);
                     ch.pipeline().addLast("eth", ethHandler);
+                    ch.closeFuture().addListener(f -> activeHandlers.remove(ethHandler));
                 }
             });
 
-        return bootstrap.connect(peerAddr);
+        ChannelFuture connectFuture = bootstrap.connect(peerAddr);
+        connectFuture.addListener((ChannelFuture f) -> {
+            if (f.isSuccess()) {
+                activeHandlers.add(ethHandler);
+            } else {
+                log.debug("[rlpx] Connection to {} failed: {}", peerAddr, f.cause().getMessage());
+            }
+        });
+        return connectFuture;
+    }
+
+    /**
+     * Request block headers from any active READY peer.
+     *
+     * @return a future that completes with the headers, or a failed future if no peer is available
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeaders(
+            long blockNumber, int count) {
+        Iterator<EthHandler> it = activeHandlers.iterator();
+        while (it.hasNext()) {
+            EthHandler handler = it.next();
+            if (!handler.isReady()) {
+                continue;
+            }
+            CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+                    handler.requestBlockHeadersAsync(blockNumber, count);
+            if (future != null) {
+                log.info("[rlpx] Routed GetBlockHeaders(block={}, count={}) to active peer", blockNumber, count);
+                return future;
+            }
+            // Handler reported ready but requestBlockHeadersAsync returned null —
+            // channel likely closed between the two checks; remove it.
+            it.remove();
+        }
+        return CompletableFuture.failedFuture(
+                new IllegalStateException("No active peer with completed eth handshake"));
+    }
+
+    public record PeerInfo(String remoteAddress, String state) {}
+
+    public List<PeerInfo> getActivePeers() {
+        List<PeerInfo> result = new ArrayList<>();
+        for (EthHandler handler : activeHandlers) {
+            String addr = handler.getRemoteAddress();
+            String state = handler.getState().name();
+            result.add(new PeerInfo(addr != null ? addr : "unknown", state));
+        }
+        return result;
     }
 
     @Override

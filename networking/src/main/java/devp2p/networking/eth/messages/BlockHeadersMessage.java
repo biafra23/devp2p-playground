@@ -25,14 +25,25 @@ public final class BlockHeadersMessage {
 
     public record VerifiedHeader(Bytes32 hash, BlockHeader header, Bytes rawRlp) {}
 
+    /** Decoded response including the eth/68 request ID. */
+    public record DecodeResult(long requestId, List<VerifiedHeader> headers) {}
+
     /**
      * Decode and return parsed headers with their computed hashes.
      * The hash can be verified against a trusted block hash from sync committees.
      */
     public static List<VerifiedHeader> decode(byte[] rlp) {
+        return decodeWithRequestId(rlp).headers();
+    }
+
+    /**
+     * Decode and return parsed headers together with the eth/68 request ID.
+     */
+    public static DecodeResult decodeWithRequestId(byte[] rlp) {
         List<VerifiedHeader> result = new ArrayList<>();
+        long[] reqId = {0};
         RLP.decodeList(Bytes.wrap(rlp), reader -> {
-            long requestId = reader.readLong(); // eth/68 request ID
+            reqId[0] = reader.readLong(); // eth/68 request ID
             // Read list of headers
             reader.readList(headersReader -> {
                 while (!headersReader.isComplete()) {
@@ -107,6 +118,6 @@ public final class BlockHeadersMessage {
             });
             return null;
         });
-        return result;
+        return new DecodeResult(reqId[0], result);
     }
 }

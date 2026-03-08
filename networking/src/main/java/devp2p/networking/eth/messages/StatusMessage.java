@@ -19,15 +19,11 @@ public final class StatusMessage {
     // eth/68 code within the eth namespace = 0x00 (first message)
     // Over the wire: 0x10 (base offset for eth capability after p2p hello)
     public static final int CODE = 0x10;
-    public static final int ETH_VERSION = 68;
+    public static final int MIN_ETH_VERSION = 67;
+    public static final int MAX_ETH_VERSION = 68;
 
-    // Mainnet constants
-    public static final long MAINNET_NETWORK_ID = 1L;
-    // Genesis hash of Ethereum mainnet
-    public static final Bytes32 MAINNET_GENESIS_HASH = Bytes32.fromHexString(
-        "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3");
-    // Mainnet genesis total difficulty (used in legacy eth; for post-Merge td=0 is accepted)
-    public static final Bytes MAINNET_TOTAL_DIFFICULTY = Bytes.fromHexString("0x400000000000000000");
+    // Post-Merge total difficulty (legacy field; peers accept any value)
+    private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.fromHexString("0x400000000000000000");
 
     public final int protocolVersion;
     public final long networkId;
@@ -45,19 +41,21 @@ public final class StatusMessage {
     }
 
     /**
-     * Encode a mainnet Status message.
+     * Encode a Status message for any network.
      *
-     * @param bestBlockHash  the hash of our best known block (use genesis for new node)
-     * @param forkIdHash     4-byte fork ID hash (post-Cancun mainnet: 0x9f3d2254)
-     * @param forkNext       block number of next fork (0 if none known)
+     * @param networkId    chain network ID
+     * @param genesisHash  genesis block hash (also used as bestBlockHash for light nodes)
+     * @param forkIdHash   4-byte EIP-2124 fork ID hash
+     * @param forkNext     next fork timestamp (0 if none known)
      */
-    public static byte[] encodeMainnet(Bytes32 bestBlockHash, byte[] forkIdHash, long forkNext) {
+    public static byte[] encode(int ethVersion, long networkId, Bytes32 genesisHash,
+                                byte[] forkIdHash, long forkNext) {
         return RLP.encodeList(writer -> {
-            writer.writeInt(ETH_VERSION);
-            writer.writeLong(MAINNET_NETWORK_ID);
-            writer.writeValue(MAINNET_TOTAL_DIFFICULTY);
-            writer.writeValue(bestBlockHash);
-            writer.writeValue(MAINNET_GENESIS_HASH);
+            writer.writeInt(ethVersion);
+            writer.writeLong(networkId);
+            writer.writeValue(DEFAULT_TOTAL_DIFFICULTY);
+            writer.writeValue(genesisHash);
+            writer.writeValue(genesisHash);
             writer.writeList(forkWriter -> {
                 forkWriter.writeValue(Bytes.wrap(forkIdHash));
                 forkWriter.writeLong(forkNext);
@@ -80,13 +78,14 @@ public final class StatusMessage {
         });
     }
 
-    public boolean isCompatible() {
-        return networkId == MAINNET_NETWORK_ID && genesisHash.equals(MAINNET_GENESIS_HASH);
+    public boolean isCompatible(long expectedNetworkId, Bytes32 expectedGenesis) {
+        return networkId == expectedNetworkId && genesisHash.equals(expectedGenesis);
     }
 
     @Override
     public String toString() {
         return "Status{version=" + protocolVersion + ", networkId=" + networkId +
+               ", genesis=" + genesisHash.toShortHexString() +
                ", best=" + bestHash.toShortHexString() + "}";
     }
 }
