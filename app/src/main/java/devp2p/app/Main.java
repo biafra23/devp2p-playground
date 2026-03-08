@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -61,6 +62,7 @@ public final class Main {
 
     private static final int UDP_PORT = 30303;
     private static final int TCP_PORT = 30303;
+    private static final long BACKOFF_MS = 5 * 60 * 1000L; // 5 minutes
 
     /** Socket path; override via {@code DEVP2P_SOCKET} env var. Network-specific suffix for non-mainnet. */
     static Path socketPath(String networkName) {
@@ -143,6 +145,7 @@ public final class Main {
 
         // 4. RLPx connector
         Set<String> attempted = ConcurrentHashMap.newKeySet();
+        Map<String, Long> backoff = new ConcurrentHashMap<>();
         RLPxConnector connector = new RLPxConnector(nodeKey, TCP_PORT, network, headers -> {
             if (!headers.isEmpty()) {
                 log.info("\n=== BLOCK HEADERS RECEIVED ===");
@@ -170,10 +173,23 @@ public final class Main {
                 SECP256K1.PublicKey pubKey = SECP256K1.PublicKey.fromBytes(
                         Bytes.fromHexString(peer.publicKeyHex()));
                 log.info("[main] Connecting to cached peer {}", peer.address());
-                connector.connect(peer.address(), pubKey);
+                connector.connect(peer.address(), pubKey)
+                        .addListener(future -> {
+                            if (future.isSuccess()) {
+                                ((io.netty.channel.ChannelFuture) future).channel().closeFuture()
+                                        .addListener(f -> {
+                                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+                                            attempted.remove(peerKey);
+                                        });
+                            } else {
+                                // Don't blacklist cached peers on first attempt
+                                attempted.remove(peerKey);
+                            }
+                        });
             } catch (Exception e) {
                 log.warn("[main] Failed to connect to cached peer {}: {}",
                         peer.address(), e.getMessage());
+                attempted.remove(peerKey);
             }
         }
 
@@ -182,11 +198,16 @@ public final class Main {
             if (entry.tcpPort() > 0 && attempted.size() < 2000) {
                 String peerKey = entry.udpAddr().getAddress().getHostAddress()
                         + ":" + entry.tcpPort();
+                Long expiry = backoff.get(peerKey);
+                if (expiry != null) {
+                    if (System.currentTimeMillis() < expiry) return;
+                    backoff.remove(peerKey);
+                }
                 if (attempted.add(peerKey)) {
                     InetSocketAddress peerTcp = new InetSocketAddress(
                             entry.udpAddr().getAddress(), entry.tcpPort());
                     log.info("[main] Attempting RLPx connection to {}", peerTcp);
-                    tryConnectWithKnownKey(connector, entry, peerTcp, nodeKey);
+                    tryConnectWithKnownKey(connector, entry, peerTcp, nodeKey, attempted, peerKey, backoff);
                 }
             }
         });
@@ -195,7 +216,7 @@ public final class Main {
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", UDP_PORT);
 
         // 7. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch);
+        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff);
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         server.start();
 
@@ -248,23 +269,36 @@ public final class Main {
      */
     private static void tryConnectWithKnownKey(
             RLPxConnector connector, KademliaTable.Entry entry,
-            InetSocketAddress peerTcp, NodeKey localKey) {
+            InetSocketAddress peerTcp, NodeKey localKey,
+            Set<String> attempted, String peerKey,
+            Map<String, Long> backoff) {
         try {
             Bytes nodeId = entry.nodeId();
             if (nodeId.size() != 64) {
                 log.warn("[main] Node ID is not 64 bytes ({}b), skipping", nodeId.size());
+                attempted.remove(peerKey);
                 return;
             }
             SECP256K1.PublicKey peerPubkey = SECP256K1.PublicKey.fromBytes(nodeId);
             connector.connect(peerTcp, peerPubkey)
                     .addListener(future -> {
-                        if (!future.isSuccess()) {
+                        if (future.isSuccess()) {
+                            ((io.netty.channel.ChannelFuture) future).channel().closeFuture()
+                                    .addListener(f -> {
+                                        backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+                                        attempted.remove(peerKey);
+                                    });
+                        } else {
                             log.warn("[main] Connection to {} failed: {}",
                                     peerTcp, future.cause().getMessage());
+                            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+                            attempted.remove(peerKey);
                         }
                     });
         } catch (Exception e) {
             log.warn("[main] Failed to connect to {}: {}", peerTcp, e.getMessage());
+            backoff.putIfAbsent(peerKey, System.currentTimeMillis() + BACKOFF_MS);
+            attempted.remove(peerKey);
         }
     }
 }

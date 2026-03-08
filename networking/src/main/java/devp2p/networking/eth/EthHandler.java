@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -46,6 +47,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
     private volatile String remoteAddress;
+    private volatile String peerBestHash; // what peer claimed in Status
+    private volatile String ourBestHash;  // what we claimed in Status
 
     private final NodeKey nodeKey;
     private final int tcpPort;
@@ -56,8 +59,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private final ConcurrentMap<Long, CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>>>
             pendingRequests = new ConcurrentHashMap<>();
 
+    // Cache received headers so we can serve them back to peers (by block number)
+    private final ConcurrentMap<Long, byte[]> headerCache = new ConcurrentHashMap<>();
+    // Cache by block hash hex string for hash-based lookups
+    private final ConcurrentMap<String, byte[]> hashCache = new ConcurrentHashMap<>();
+
     private RLPxHandler rlpxHandler; // reference to the RLPx layer for sending
     private volatile ChannelHandlerContext readyCtx; // stored when state reaches READY
+    private volatile long readyTimestamp; // when we entered READY state
     private int negotiatedEthVersion = StatusMessage.MAX_ETH_VERSION;
 
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
@@ -68,6 +77,21 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         this.network = network;
         this.onHeaders = onHeaders;
         this.onReady = onReady;
+
+        // Pre-cache genesis block header so we can serve it when peers test us
+        if ("mainnet".equals(network.name())) {
+            byte[] genesisRlp = NetworkConfig.MAINNET_GENESIS_HEADER_RLP;
+            // Verify hash matches (BouncyCastle is registered by now via NodeKey)
+            org.apache.tuweni.bytes.Bytes32 computed =
+                    org.apache.tuweni.crypto.Hash.keccak256(org.apache.tuweni.bytes.Bytes.wrap(genesisRlp));
+            if (!computed.equals(network.genesisHash())) {
+                throw new IllegalStateException("Genesis header RLP hash mismatch: " + computed.toHexString());
+            }
+            headerCache.put(0L, genesisRlp);
+            hashCache.put(network.genesisHash().toHexString(), genesisRlp);
+            log.info("[eth] Pre-cached mainnet genesis header ({} bytes, hash={})",
+                    genesisRlp.length, network.genesisHash().toShortHexString());
+        }
     }
 
     /** Set the remote address early (at connect time), before the handshake completes. */
@@ -86,7 +110,31 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             // Retrieve the RLPx handler from the pipeline
             rlpxHandler = (RLPxHandler) ctx.pipeline().get("rlpx");
             sendHello(ctx);
+
+            // Handshake timeout: close if not READY within 30 seconds
+            ctx.executor().schedule(() -> {
+                if (state != State.READY) {
+                    log.warn("[eth] Handshake timeout (30s), closing {}", remoteAddress);
+                    ctx.close();
+                }
+            }, 30, TimeUnit.SECONDS);
         }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        if (state == State.AWAITING_STATUS) {
+            log.warn("[eth] Peer {} closed without responding to Status", remoteAddress);
+        } else if (state == State.AWAITING_HELLO) {
+            log.warn("[eth] Peer {} closed before Hello exchange", remoteAddress);
+        }
+        // Complete all pending request futures exceptionally on disconnect
+        if (!pendingRequests.isEmpty()) {
+            Exception cause = new java.io.IOException("Channel closed: " + remoteAddress);
+            pendingRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingRequests.clear();
+        }
+        super.channelInactive(ctx);
     }
 
     /** Called by RLPxHandler when a decoded message arrives. */
@@ -133,6 +181,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // -------------------------------------------------------------------------
     private void handleStatus(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
         if (msg.code() == ETH_STATUS) {
+            log.info("[eth] Received Status raw payload ({} bytes): {}", msg.payload().length,
+                bytesToHex(msg.payload(), msg.payload().length));
             StatusMessage status;
             try {
                 status = StatusMessage.decode(msg.payload());
@@ -143,7 +193,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 ctx.close();
                 return;
             }
-            log.info("[eth] Status from peer: {}", status);
+            peerBestHash = status.bestHash.toShortHexString();
+            log.info("[eth] Status from peer: {} (bestHash={})", status, peerBestHash);
             if (!status.isCompatible(network.networkId(), network.genesisHash())) {
                 log.warn("[eth] Incompatible network: chainId={}, genesis={}",
                     status.networkId, status.genesisHash);
@@ -152,8 +203,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             }
             state = State.READY;
             readyCtx = ctx;
-            log.info("[eth] Peer ready! Requesting recent block headers...");
+            readyTimestamp = System.currentTimeMillis();
+            log.info("[eth] Peer ready! Requesting peer's best block and recent headers...");
             if (onReady != null) onReady.run();
+            // Request the peer's advertised best block by hash
+            requestBlockHeadersByHash(ctx, status.bestHash);
             requestBlockHeaders(ctx, 21_000_000L, 1);
         } else if (msg.code() == P2P_PING) {
             sendPong(ctx);
@@ -170,12 +224,94 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // -------------------------------------------------------------------------
     private void handleReady(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
         switch (msg.code()) {
+            case ETH_GET_BLOCK_HEADERS -> {
+                // Peer is requesting headers from us. Serve from cache or return empty.
+                try {
+                    org.apache.tuweni.bytes.Bytes payload = org.apache.tuweni.bytes.Bytes.wrap(msg.payload());
+                    long[] reqIdHolder = new long[1];
+                    long[] blockNumHolder = new long[1];
+                    int[] countHolder = new int[1];
+                    String[] hashHolder = new String[1];     // short hex for logging
+                    String[] fullHashHolder = new String[1]; // full hex for cache lookup
+                    org.apache.tuweni.rlp.RLP.decodeList(payload, reader -> {
+                        reqIdHolder[0] = reader.readLong();
+                        reader.readList(r -> {
+                            // Start can be a block number (long) or hash (32 bytes)
+                            org.apache.tuweni.bytes.Bytes start = r.readValue();
+                            if (start.size() <= 8) {
+                                blockNumHolder[0] = start.toLong();
+                                hashHolder[0] = null;
+                                fullHashHolder[0] = null;
+                            } else {
+                                blockNumHolder[0] = -1; // hash-based request
+                                hashHolder[0] = start.toShortHexString();
+                                fullHashHolder[0] = start.toHexString();
+                            }
+                            countHolder[0] = r.readInt();
+                            return null;
+                        });
+                        return null;
+                    });
+                    long reqId = reqIdHolder[0];
+                    long blockNum = blockNumHolder[0];
+                    int count = countHolder[0];
+                    String requestedHash = hashHolder[0];
+                    String fullHash = fullHashHolder[0];
+
+                    // Try to serve from cache — by hash or by number
+                    java.util.List<byte[]> cached = new java.util.ArrayList<>();
+                    if (fullHash != null) {
+                        // Hash-based request: look up in hashCache
+                        byte[] h = hashCache.get(fullHash);
+                        if (h != null) cached.add(h);
+                    } else if (blockNum >= 0) {
+                        // Number-based request: look up in headerCache
+                        for (int i = 0; i < count && cached.size() < count; i++) {
+                            byte[] h = headerCache.get(blockNum + i);
+                            if (h != null) cached.add(h);
+                            else break;
+                        }
+                    }
+
+                    byte[] response = org.apache.tuweni.rlp.RLP.encodeList(w -> {
+                        w.writeLong(reqId);
+                        w.writeList(l -> {
+                            for (byte[] h : cached) {
+                                l.writeRLP(org.apache.tuweni.bytes.Bytes.wrap(h));
+                            }
+                        });
+                    }).toArrayUnsafe();
+
+                    // Log what they asked vs what we claimed, with timing
+                    String requested = requestedHash != null
+                        ? "hash=" + requestedHash
+                        : "block=" + blockNum;
+                    long msSinceReady = readyTimestamp > 0
+                        ? System.currentTimeMillis() - readyTimestamp : -1;
+                    log.info("[eth] PEER ASKS: GetBlockHeaders({}, count={}, reqId={}) | " +
+                             "WE CLAIMED bestHash={} | PEER CLAIMED bestHash={} | " +
+                             "SERVING {} from cache (cacheSize={}) | {}ms after READY",
+                        requested, count, reqId, ourBestHash, peerBestHash,
+                        cached.size(), headerCache.size(), msSinceReady);
+                    rlpxHandler.sendMessage(ctx, ETH_BLOCK_HEADERS, response);
+                } catch (Exception e) {
+                    log.warn("[eth] Failed to handle GetBlockHeaders from peer", e);
+                }
+            }
             case ETH_BLOCK_HEADERS -> {
                 try {
                     BlockHeadersMessage.DecodeResult decoded =
                         BlockHeadersMessage.decodeWithRequestId(msg.payload());
                     log.info("[eth] Received {} block headers (reqId={})",
                             decoded.headers().size(), decoded.requestId());
+                    // Cache received headers so we can serve them to peers (by number and hash)
+                    for (BlockHeadersMessage.VerifiedHeader vh : decoded.headers()) {
+                        byte[] raw = vh.rawRlp().toArrayUnsafe();
+                        headerCache.put(vh.header().number, raw);
+                        hashCache.put(vh.hash().toHexString(), raw);
+                        log.debug("[eth] Cached header for block #{} hash={}",
+                                vh.header().number, vh.hash().toShortHexString());
+                    }
                     // Complete pending future if this was an IPC-originated request
                     CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
                             pendingRequests.remove(decoded.requestId());
@@ -206,11 +342,19 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     private void sendStatus(ChannelHandlerContext ctx) {
+        ourBestHash = network.bestBlockHash().toShortHexString();
         byte[] payload = StatusMessage.encode(
             negotiatedEthVersion, network.networkId(), network.genesisHash(),
-            network.forkIdHash(), network.forkNext());
-        log.info("[eth] Sending Status ({} bytes): {}", payload.length, bytesToHex(payload, payload.length));
+            network.bestBlockHash(), network.forkIdHash(), network.forkNext());
+        log.info("[eth] Sending Status ({} bytes): bestHash={}", payload.length, ourBestHash);
         rlpxHandler.sendMessage(ctx, ETH_STATUS, payload);
+    }
+
+    public void requestBlockHeadersByHash(ChannelHandlerContext ctx, org.apache.tuweni.bytes.Bytes32 hash) {
+        long reqId = requestId.getAndIncrement();
+        log.info("[eth] GetBlockHeaders by hash={} reqId={}", hash.toShortHexString(), reqId);
+        byte[] payload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, payload);
     }
 
     public void requestBlockHeaders(ChannelHandlerContext ctx, long blockNumber, int count) {

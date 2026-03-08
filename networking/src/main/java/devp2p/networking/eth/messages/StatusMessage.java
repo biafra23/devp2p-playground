@@ -22,8 +22,8 @@ public final class StatusMessage {
     public static final int MIN_ETH_VERSION = 67;
     public static final int MAX_ETH_VERSION = 68;
 
-    // Post-Merge total difficulty (legacy field; peers accept any value)
-    private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.fromHexString("0x400000000000000000");
+    // Genesis block difficulty (honest — we haven't synced the chain)
+    private static final Bytes DEFAULT_TOTAL_DIFFICULTY = Bytes.fromHexString("0x0400000000");
 
     public final int protocolVersion;
     public final long networkId;
@@ -44,17 +44,18 @@ public final class StatusMessage {
      * Encode a Status message for any network.
      *
      * @param networkId    chain network ID
-     * @param genesisHash  genesis block hash (also used as bestBlockHash for light nodes)
+     * @param genesisHash  genesis block hash
+     * @param bestHash     best known block hash (recent block to avoid being deprioritized)
      * @param forkIdHash   4-byte EIP-2124 fork ID hash
      * @param forkNext     next fork timestamp (0 if none known)
      */
     public static byte[] encode(int ethVersion, long networkId, Bytes32 genesisHash,
-                                byte[] forkIdHash, long forkNext) {
+                                Bytes32 bestHash, byte[] forkIdHash, long forkNext) {
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
             writer.writeLong(networkId);
             writer.writeValue(DEFAULT_TOTAL_DIFFICULTY);
-            writer.writeValue(genesisHash);
+            writer.writeValue(bestHash);
             writer.writeValue(genesisHash);
             writer.writeList(forkWriter -> {
                 forkWriter.writeValue(Bytes.wrap(forkIdHash));

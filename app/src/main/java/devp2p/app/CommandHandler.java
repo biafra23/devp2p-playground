@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -24,12 +25,15 @@ public class CommandHandler {
     private final RLPxConnector connector;
     private final long startTimeMs;
     private final CountDownLatch stopLatch;
+    private final Map<String, Long> backoff;
 
-    public CommandHandler(DiscV4Service discV4, RLPxConnector connector, CountDownLatch stopLatch) {
+    public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
+                          CountDownLatch stopLatch, Map<String, Long> backoff) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
         this.stopLatch = stopLatch;
+        this.backoff = backoff;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -56,8 +60,19 @@ public class CommandHandler {
     private String handleStatus() {
         long uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000;
         int discovered = discV4.table().size();
+        List<RLPxConnector.PeerInfo> peers = connector.getActivePeers();
+        int connectedPeers = peers.size();
+        long readyPeers = peers.stream()
+                .filter(p -> "READY".equals(p.state()))
+                .count();
+        long now = System.currentTimeMillis();
+        backoff.values().removeIf(exp -> now >= exp);
+        long blacklistedPeers = backoff.size();
         return "{\"ok\":true,\"state\":\"RUNNING\",\"uptimeSeconds\":" + uptimeSec
-                + ",\"discoveredPeers\":" + discovered + "}";
+                + ",\"discoveredPeers\":" + discovered
+                + ",\"connectedPeers\":" + connectedPeers
+                + ",\"readyPeers\":" + readyPeers
+                + ",\"blacklistedPeers\":" + blacklistedPeers + "}";
     }
 
     private String handlePeers() {

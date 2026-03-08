@@ -77,8 +77,9 @@ public final class RLPxHandler extends ByteToMessageDecoder {
     }
 
     @Override
-    public void channelInactive(ChannelHandlerContext ctx) {
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         log.warn("[rlpx] Connection closed by peer: {} (state={})", ctx.channel().remoteAddress(), state);
+        super.channelInactive(ctx);  // propagate to EthHandler
     }
 
     // -------------------------------------------------------------------------
