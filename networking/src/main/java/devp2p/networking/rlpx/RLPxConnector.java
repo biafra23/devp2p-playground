@@ -1,6 +1,7 @@
 package devp2p.networking.rlpx;
 
 import devp2p.core.crypto.NodeKey;
+import devp2p.networking.ChainHead;
 import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.EthHandler;
 import devp2p.networking.eth.messages.BlockBodiesMessage;
@@ -53,6 +54,7 @@ public final class RLPxConnector implements AutoCloseable {
     private final NodeKey localKey;
     private final int tcpPort;
     private final NetworkConfig network;
+    private final ChainHead chainHead;
     private final NioEventLoopGroup group;
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
     private final PeerReadyCallback peerReadyCallback;
@@ -64,6 +66,7 @@ public final class RLPxConnector implements AutoCloseable {
         this.localKey = localKey;
         this.tcpPort = tcpPort;
         this.network = network;
+        this.chainHead = new ChainHead(network.genesisHash());
         this.group = new NioEventLoopGroup(4);
         this.onHeaders = onHeaders;
         this.peerReadyCallback = peerReadyCallback;
@@ -89,7 +92,7 @@ public final class RLPxConnector implements AutoCloseable {
                 peerReadyCallback.onPeerReady(peerAddr, pubKeyHex);
             }
         };
-        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, onHeaders, onReady);
+        EthHandler ethHandler = new EthHandler(localKey, tcpPort, network, chainHead, onHeaders, onReady);
         ethHandler.setRemoteAddress(peerAddr.getAddress().getHostAddress() + ":" + peerAddr.getPort());
 
         Bootstrap bootstrap = new Bootstrap()
@@ -220,7 +223,7 @@ public final class RLPxConnector implements AutoCloseable {
         });
     }
 
-    public record PeerInfo(String remoteAddress, String state, boolean snapSupported) {}
+    public record PeerInfo(String remoteAddress, String state, boolean snapSupported, String clientId) {}
 
     public List<PeerInfo> getActivePeers() {
         List<PeerInfo> result = new ArrayList<>();
@@ -228,7 +231,8 @@ public final class RLPxConnector implements AutoCloseable {
             String addr = handler.getRemoteAddress();
             String state = handler.getState().name();
             boolean snap = handler.isSnapNegotiated();
-            result.add(new PeerInfo(addr != null ? addr : "unknown", state, snap));
+            String clientId = handler.getClientId();
+            result.add(new PeerInfo(addr != null ? addr : "unknown", state, snap, clientId));
         }
         return result;
     }

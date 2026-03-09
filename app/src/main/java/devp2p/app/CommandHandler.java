@@ -111,8 +111,11 @@ public class CommandHandler {
             first = false;
             sb.append("{\"remoteAddress\":\"").append(escapeJson(p.remoteAddress())).append("\"")
               .append(",\"state\":\"").append(p.state()).append("\"")
-              .append(",\"snap\":").append(p.snapSupported())
-              .append("}");
+              .append(",\"snap\":").append(p.snapSupported());
+            if (p.clientId() != null) {
+                sb.append(",\"clientId\":\"").append(escapeJson(p.clientId())).append("\"");
+            }
+            sb.append("}");
         }
         sb.append("]}");
         return sb.toString();

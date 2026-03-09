@@ -1,6 +1,7 @@
 package devp2p.networking.eth;
 
 import devp2p.core.crypto.NodeKey;
+import devp2p.networking.ChainHead;
 import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.messages.*;
 import devp2p.networking.rlpx.RLPxHandler;
@@ -59,6 +60,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
     private volatile boolean snapNegotiated = false;
+    private volatile String clientId;
     private volatile boolean snapServingFailed = false;
     private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
     private volatile long latestStateRootBlockNumber = -1;
@@ -66,6 +68,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private final NodeKey nodeKey;
     private final int tcpPort;
     private final NetworkConfig network;
+    private final ChainHead chainHead;
     private final Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders;
     private final Runnable onReady;
     private final AtomicLong requestId = new AtomicLong(1);
@@ -88,11 +91,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private int negotiatedEthVersion = StatusMessage.MAX_ETH_VERSION;
 
     public EthHandler(NodeKey nodeKey, int tcpPort, NetworkConfig network,
+                      ChainHead chainHead,
                       Consumer<List<BlockHeadersMessage.VerifiedHeader>> onHeaders,
                       Runnable onReady) {
         this.nodeKey = nodeKey;
         this.tcpPort = tcpPort;
         this.network = network;
+        this.chainHead = chainHead;
         this.onHeaders = onHeaders;
         this.onReady = onReady;
 
@@ -183,6 +188,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         if (msg.code() == P2P_HELLO) {
             HelloMessage hello = HelloMessage.decode(msg.payload());
             log.info("[eth] Hello from peer: {}", hello);
+            this.clientId = hello.clientId;
 
             // Negotiate highest eth version that BOTH sides support
             int bestEthVersion = hello.capabilities.stream()
@@ -340,6 +346,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         hashCache.put(vh.hash().toHexString(), raw);
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
+                        chainHead.update(vh.header().number, vh.hash());
                         if (vh.header().number > latestStateRootBlockNumber) {
                             latestStateRootBlockNumber = vh.header().number;
                             latestStateRoot = vh.header().stateRoot;
@@ -416,10 +423,14 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     private void sendStatus(ChannelHandlerContext ctx) {
-        ourBestHash = network.bestBlockHash().toShortHexString();
+        ChainHead.Head head = chainHead.get();
+        org.apache.tuweni.bytes.Bytes32 bestHash = head.blockNumber() > 0
+            ? head.blockHash() : network.bestBlockHash();
+        ourBestHash = bestHash.toShortHexString();
         byte[] payload = StatusMessage.encode(
             negotiatedEthVersion, network.networkId(), network.genesisHash(),
-            network.bestBlockHash(), network.forkIdHash(), network.forkNext());
+            bestHash, network.forkIdHash(), network.forkNext(),
+            head.blockNumber());
         log.info("[eth] Sending Status ({} bytes, eth/{}): bestHash={} forkIdHash={} forkNext={} hex={}",
             payload.length, negotiatedEthVersion, ourBestHash,
             bytesToHex(network.forkIdHash(), network.forkIdHash().length),
@@ -539,6 +550,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
         return future;
     }
+
+    public String getClientId() { return clientId; }
 
     public boolean isSnapNegotiated() { return snapNegotiated; }
 

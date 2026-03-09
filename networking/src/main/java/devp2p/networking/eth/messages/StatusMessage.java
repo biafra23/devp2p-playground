@@ -48,9 +48,10 @@ public final class StatusMessage {
      * Encode an eth/67-68 Status message.
      */
     public static byte[] encode(int ethVersion, long networkId, Bytes32 genesisHash,
-                                Bytes32 bestHash, byte[] forkIdHash, long forkNext) {
+                                Bytes32 bestHash, byte[] forkIdHash, long forkNext,
+                                long latestBlockNumber) {
         if (ethVersion >= 69) {
-            return encode69(ethVersion, networkId, genesisHash, bestHash, forkIdHash, forkNext);
+            return encode69(ethVersion, networkId, genesisHash, bestHash, forkIdHash, forkNext, latestBlockNumber);
         }
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
@@ -70,7 +71,8 @@ public final class StatusMessage {
      * Format: [version, networkId, genesis, forkId, earliestBlock, latestBlock, latestBlockHash]
      */
     private static byte[] encode69(int ethVersion, long networkId, Bytes32 genesisHash,
-                                   Bytes32 latestBlockHash, byte[] forkIdHash, long forkNext) {
+                                   Bytes32 latestBlockHash, byte[] forkIdHash, long forkNext,
+                                   long latestBlockNumber) {
         return RLP.encodeList(writer -> {
             writer.writeInt(ethVersion);
             writer.writeLong(networkId);
@@ -79,8 +81,8 @@ public final class StatusMessage {
                 forkWriter.writeValue(Bytes.wrap(forkIdHash));
                 forkWriter.writeLong(forkNext);
             });
-            writer.writeLong(0);  // earliestBlock (we have genesis = block 0)
-            writer.writeLong(0);  // latestBlock (honest — we haven't synced)
+            writer.writeLong(0);              // earliestBlock (we have genesis = block 0)
+            writer.writeLong(latestBlockNumber); // latestBlock from chain head
             writer.writeValue(latestBlockHash);
         }).toArrayUnsafe();
     }
