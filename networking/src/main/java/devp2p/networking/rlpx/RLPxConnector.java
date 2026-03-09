@@ -201,14 +201,15 @@ public final class RLPxConnector implements AutoCloseable {
             new IllegalStateException("No active peer with snap/1 support"));
     }
 
-    public record PeerInfo(String remoteAddress, String state) {}
+    public record PeerInfo(String remoteAddress, String state, boolean snapSupported) {}
 
     public List<PeerInfo> getActivePeers() {
         List<PeerInfo> result = new ArrayList<>();
         for (EthHandler handler : activeHandlers) {
             String addr = handler.getRemoteAddress();
             String state = handler.getState().name();
-            result.add(new PeerInfo(addr != null ? addr : "unknown", state));
+            boolean snap = handler.isSnapNegotiated();
+            result.add(new PeerInfo(addr != null ? addr : "unknown", state, snap));
         }
         return result;
     }

@@ -12,12 +12,16 @@ import org.apache.tuweni.crypto.SECP256K1;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +77,12 @@ public final class Main {
         return Path.of("/tmp/devp2p" + suffix + ".sock");
     }
 
+    /** Lock file path, network-suffixed like the socket. */
+    static Path lockPath(String networkName) {
+        String suffix = "mainnet".equals(networkName) ? "" : "-" + networkName;
+        return Path.of("/tmp/devp2p" + suffix + ".lock");
+    }
+
     static Path cacheFile(String networkName) {
         String suffix = "mainnet".equals(networkName) ? "" : "-" + networkName;
         return Path.of("peers" + suffix + ".cache");
@@ -92,7 +102,8 @@ public final class Main {
         String[] cmdArgs = remaining.toArray(new String[0]);
 
         Path socketPath = socketPath(networkName);
-        boolean daemonAlive = isDaemonRunning(socketPath);
+        Path lockPath = lockPath(networkName);
+        boolean daemonAlive = isDaemonRunning(socketPath, lockPath);
 
         // Handle purge-cache before socket check — works without a running daemon
         if (cmdArgs.length > 0 && "purge-cache".equals(cmdArgs[0])) {
@@ -121,7 +132,7 @@ public final class Main {
         } else {
             // ── Daemon mode ──────────────────────────────────────────────────
             NetworkConfig network = NetworkConfig.byName(networkName);
-            runDaemon(socketPath, network);
+            runDaemon(socketPath, lockPath, network);
         }
     }
 
@@ -129,9 +140,20 @@ public final class Main {
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(Path socketPath, NetworkConfig network) throws Exception {
+    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network) throws Exception {
         log.info("=== devp2p Playground Daemon ({}) ===", network.name());
         log.info("IPC socket: {}", socketPath);
+
+        // 0. Acquire exclusive lock file — auto-released on process death (even kill -9)
+        FileChannel lockChannel = FileChannel.open(lockPath,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        FileLock fileLock = lockChannel.tryLock();
+        if (fileLock == null) {
+            System.err.println("Daemon already running (lock held: " + lockPath + ")");
+            lockChannel.close();
+            System.exit(1);
+            return;
+        }
 
         // 1. Load or generate node key
         Path keyFile = Path.of("nodekey.hex");
@@ -211,13 +233,44 @@ public final class Main {
             }
         });
 
-        discV4.start(UDP_PORT);
+        try {
+            discV4.start(UDP_PORT);
+        } catch (Exception e) {
+            Throwable cause = e instanceof BindException ? e : e.getCause();
+            if (cause instanceof BindException) {
+                System.err.println("Cannot bind UDP port " + UDP_PORT + ": " + cause.getMessage());
+                System.err.println("Is another instance already running?");
+            } else {
+                System.err.println("Failed to start discovery: " + e.getMessage());
+            }
+            fileLock.release();
+            lockChannel.close();
+            System.exit(1);
+            return;
+        }
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", UDP_PORT);
 
         // 7. IPC server
         CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff);
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
-        server.start();
+        try {
+            server.start();
+        } catch (BindException e) {
+            System.err.println("Cannot bind IPC socket " + socketPath + ": " + e.getMessage());
+            System.err.println("Is another instance already running?");
+            discV4.close();
+            fileLock.release();
+            lockChannel.close();
+            System.exit(1);
+            return;
+        } catch (Exception e) {
+            System.err.println("Failed to start IPC server: " + e.getMessage());
+            discV4.close();
+            fileLock.release();
+            lockChannel.close();
+            System.exit(1);
+            return;
+        }
 
         // 8. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here
         //    because the JVM may exit before the main thread resumes after await().
@@ -226,6 +279,7 @@ public final class Main {
             server.close();
             connector.close();
             discV4.close();
+            try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
             stopLatch.countDown();
             log.info("[daemon] Done.");
         }, "shutdown-hook"));
@@ -237,6 +291,7 @@ public final class Main {
         server.close();
         connector.close();
         discV4.close();
+        try { fileLock.release(); lockChannel.close(); } catch (Exception ignored) {}
         log.info("[daemon] Done.");
     }
 
@@ -249,17 +304,39 @@ public final class Main {
      * Tries to connect; if it succeeds the daemon is alive.
      * If the socket file exists but no one is listening, it's stale — delete it.
      */
-    private static boolean isDaemonRunning(Path socketPath) {
-        if (!Files.exists(socketPath)) return false;
-        try (SocketChannel ch = SocketChannel.open(StandardProtocolFamily.UNIX)) {
-            ch.connect(UnixDomainSocketAddress.of(socketPath));
-            return true;
-        } catch (Exception e) {
-            // Stale socket file — remove it
+    private static boolean isDaemonRunning(Path socketPath, Path lockPath) {
+        // Try socket first
+        if (Files.exists(socketPath)) {
+            try (SocketChannel ch = SocketChannel.open(StandardProtocolFamily.UNIX)) {
+                ch.connect(UnixDomainSocketAddress.of(socketPath));
+                return true;
+            } catch (Exception e) {
+                // Socket exists but nobody listening — check lock before declaring stale
+            }
+        }
+
+        // Fallback: check if lock file is held by another process
+        if (Files.exists(lockPath)) {
+            try (FileChannel fc = FileChannel.open(lockPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                FileLock lock = fc.tryLock();
+                if (lock == null) {
+                    // Lock held → daemon is running but socket is missing
+                    System.err.println("WARNING: Daemon is running (lock held: " + lockPath
+                            + ") but IPC socket is missing (" + socketPath + ")");
+                    return true;
+                }
+                // Lock acquired → no daemon running; release immediately
+                lock.release();
+            } catch (Exception ignored) {}
+        }
+
+        // No daemon running; clean up stale socket if present
+        if (Files.exists(socketPath)) {
             log.debug("[main] Removing stale socket file: {}", socketPath);
             try { Files.deleteIfExists(socketPath); } catch (Exception ignored) {}
-            return false;
         }
+        return false;
     }
 
     /**

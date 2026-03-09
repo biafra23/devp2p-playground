@@ -72,6 +72,9 @@ public class CommandHandler {
         long readyPeers = peers.stream()
                 .filter(p -> "READY".equals(p.state()))
                 .count();
+        long snapPeers = peers.stream()
+                .filter(p -> "READY".equals(p.state()) && p.snapSupported())
+                .count();
         long now = System.currentTimeMillis();
         backoff.values().removeIf(exp -> now >= exp);
         long blacklistedPeers = backoff.size();
@@ -79,6 +82,7 @@ public class CommandHandler {
                 + ",\"discoveredPeers\":" + discovered
                 + ",\"connectedPeers\":" + connectedPeers
                 + ",\"readyPeers\":" + readyPeers
+                + ",\"snapPeers\":" + snapPeers
                 + ",\"blacklistedPeers\":" + blacklistedPeers + "}";
     }
 
@@ -107,6 +111,7 @@ public class CommandHandler {
             first = false;
             sb.append("{\"remoteAddress\":\"").append(escapeJson(p.remoteAddress())).append("\"")
               .append(",\"state\":\"").append(p.state()).append("\"")
+              .append(",\"snap\":").append(p.snapSupported())
               .append("}");
         }
         sb.append("]}");
