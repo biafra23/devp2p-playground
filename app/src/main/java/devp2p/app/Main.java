@@ -175,9 +175,9 @@ public final class Main {
                 for (BlockHeadersMessage.VerifiedHeader vh : headers) {
                     BlockHeader h = vh.header();
                     log.info("  Block #{}", h.number);
-                    log.info("  Hash:      0x{}", vh.hash().toHexString());
-                    log.info("  StateRoot: 0x{}", h.stateRoot.toHexString());
-                    log.info("  TxRoot:    0x{}", h.transactionsRoot.toHexString());
+                    log.info("  Hash:      {}", vh.hash().toHexString());
+                    log.info("  StateRoot: {}", h.stateRoot.toHexString());
+                    log.info("  TxRoot:    {}", h.transactionsRoot.toHexString());
                     if (h.baseFeePerGas != null) {
                         log.info("  BaseFee:   {} gwei",
                                 h.baseFeePerGas.divide(java.math.BigInteger.valueOf(1_000_000_000L)));

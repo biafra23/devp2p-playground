@@ -59,6 +59,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
     private volatile boolean snapNegotiated = false;
+    private volatile boolean snapServingFailed = false;
     private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
     private volatile long latestStateRootBlockNumber = -1;
 
@@ -371,6 +372,11 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 }
             }
             case SNAP_ACCOUNT_RANGE -> {
+                // Extract request ID first so we can complete the future even if full decode fails
+                long snapReqId = -1;
+                try {
+                    snapReqId = AccountRangeMessage.extractRequestId(msg.payload());
+                } catch (Exception ignored) {}
                 try {
                     AccountRangeMessage.DecodeResult decoded = AccountRangeMessage.decode(msg.payload());
                     log.info("[snap] AccountRange: {} accounts (reqId={})",
@@ -379,7 +385,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         pendingSnapRequests.remove(decoded.requestId());
                     if (f != null) f.complete(decoded);
                 } catch (Exception e) {
-                    log.error("[snap] Failed to decode AccountRange", e);
+                    log.error("[snap] Failed to decode AccountRange (reqId={}): {}",
+                        snapReqId, e.getMessage());
+                    if (snapReqId >= 0) {
+                        CompletableFuture<AccountRangeMessage.DecodeResult> f =
+                            pendingSnapRequests.remove(snapReqId);
+                        if (f != null) f.completeExceptionally(e);
+                    }
                 }
             }
             case SNAP_GET_ACCOUNT_RANGE ->
@@ -529,6 +541,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     }
 
     public boolean isSnapNegotiated() { return snapNegotiated; }
+
+    public boolean isSnapServingFailed() { return snapServingFailed; }
+
+    public void markSnapServingFailed() { snapServingFailed = true; }
 
     public State getState() {
         return state;

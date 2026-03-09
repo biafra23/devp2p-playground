@@ -179,26 +179,45 @@ public final class RLPxConnector implements AutoCloseable {
 
     /**
      * Fetch a single account from the snap/1 state trie via any active READY + snap peer.
+     * Automatically retries with the next snap peer if the first one fails.
      *
      * @param address 20-byte Ethereum address
      * @return future completing with the AccountRange result, or failed future if no snap peer available
      */
     public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccount(Bytes address) {
-        Iterator<EthHandler> it = activeHandlers.iterator();
-        while (it.hasNext()) {
-            EthHandler handler = it.next();
-            if (!handler.isReady() || !handler.isSnapNegotiated()) continue;
-            CompletableFuture<AccountRangeMessage.DecodeResult> future =
-                handler.requestAccountAsync(address);
-            if (future != null) {
-                log.info("[rlpx] Routed snap GetAccountRange for {} to active peer",
-                    address.toShortHexString());
-                return future;
+        List<EthHandler> snapPeers = new ArrayList<>();
+        for (EthHandler handler : activeHandlers) {
+            if (handler.isReady() && handler.isSnapNegotiated() && !handler.isSnapServingFailed()) {
+                snapPeers.add(handler);
             }
-            it.remove();
         }
-        return CompletableFuture.failedFuture(
-            new IllegalStateException("No active peer with snap/1 support"));
+        if (snapPeers.isEmpty()) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No active peer with snap/1 support"));
+        }
+        return trySnapPeer(address, snapPeers, 0);
+    }
+
+    private CompletableFuture<AccountRangeMessage.DecodeResult> trySnapPeer(
+            Bytes address, List<EthHandler> peers, int index) {
+        if (index >= peers.size()) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("All " + peers.size() + " snap peers failed to serve account data"));
+        }
+        EthHandler handler = peers.get(index);
+        CompletableFuture<AccountRangeMessage.DecodeResult> future =
+            handler.requestAccountAsync(address);
+        if (future == null) {
+            return trySnapPeer(address, peers, index + 1);
+        }
+        log.info("[rlpx] Routed snap GetAccountRange for {} to peer {} ({}/{})",
+            address.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
+        return future.exceptionallyCompose(ex -> {
+            log.warn("[rlpx] Snap request failed on peer {}: {}, trying next peer",
+                handler.getRemoteAddress(), ex.getMessage());
+            handler.markSnapServingFailed();
+            return trySnapPeer(address, peers, index + 1);
+        });
     }
 
     public record PeerInfo(String remoteAddress, String state, boolean snapSupported) {}
