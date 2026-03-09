@@ -17,6 +17,7 @@ out/
 
 # macOS
 .DS_Store
+._*
 
 # Node key (contains private key)
 nodekey.hex
