@@ -4,6 +4,8 @@ import devp2p.core.crypto.NodeKey;
 import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.messages.*;
 import devp2p.networking.rlpx.RLPxHandler;
+import devp2p.networking.snap.messages.AccountRangeMessage;
+import devp2p.networking.snap.messages.GetAccountRangeMessage;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.slf4j.Logger;
@@ -46,12 +48,19 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     private static final int ETH_GET_BLOCK_BODIES = 0x15;
     private static final int ETH_BLOCK_BODIES = 0x16;
 
+    // snap/1 absolute message codes: snap base = 0x10 (p2p len) + 17 (eth len) = 0x21
+    private static final int SNAP_GET_ACCOUNT_RANGE = 0x21;
+    private static final int SNAP_ACCOUNT_RANGE     = 0x22;
+
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
     private volatile String remoteAddress;
     private volatile String peerBestHash; // what peer claimed in Status
     private volatile String ourBestHash;  // what we claimed in Status
     private volatile boolean incompatibleNetwork; // confirmed wrong chain
+    private volatile boolean snapNegotiated = false;
+    private volatile org.apache.tuweni.bytes.Bytes32 latestStateRoot;
+    private volatile long latestStateRootBlockNumber = -1;
 
     private final NodeKey nodeKey;
     private final int tcpPort;
@@ -63,6 +72,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<List<BlockBodiesMessage.BlockBody>>>
             pendingBodyRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<AccountRangeMessage.DecodeResult>>
+            pendingSnapRequests = new ConcurrentHashMap<>();
 
 
     // Cache received headers so we can serve them back to peers (by block number)
@@ -144,6 +155,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingBodyRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingBodyRequests.clear();
         }
+        if (!pendingSnapRequests.isEmpty()) {
+            pendingSnapRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingSnapRequests.clear();
+        }
         super.channelInactive(ctx);
     }
 
@@ -180,6 +195,9 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             }
             negotiatedEthVersion = bestEthVersion;
             log.info("[eth] Negotiated eth/{}", negotiatedEthVersion);
+            snapNegotiated = hello.capabilities.stream()
+                .anyMatch(c -> c.name().equals("snap") && c.version() == 1);
+            log.info("[eth] snap/1 {}", snapNegotiated ? "negotiated" : "NOT supported by peer");
             state = State.AWAITING_STATUS;
             sendStatus(ctx);
         } else if (msg.code() == P2P_DISCONNECT) {
@@ -321,6 +339,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                         hashCache.put(vh.hash().toHexString(), raw);
                         log.debug("[eth] Cached header for block #{} hash={}",
                                 vh.header().number, vh.hash().toShortHexString());
+                        if (vh.header().number > latestStateRootBlockNumber) {
+                            latestStateRootBlockNumber = vh.header().number;
+                            latestStateRoot = vh.header().stateRoot;
+                        }
                     }
                     // Complete pending future
                     CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
@@ -348,6 +370,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     log.error("[eth] Failed to decode BlockBodies", e);
                 }
             }
+            case SNAP_ACCOUNT_RANGE -> {
+                try {
+                    AccountRangeMessage.DecodeResult decoded = AccountRangeMessage.decode(msg.payload());
+                    log.info("[snap] AccountRange: {} accounts (reqId={})",
+                        decoded.accounts().size(), decoded.requestId());
+                    CompletableFuture<AccountRangeMessage.DecodeResult> f =
+                        pendingSnapRequests.remove(decoded.requestId());
+                    if (f != null) f.complete(decoded);
+                } catch (Exception e) {
+                    log.error("[snap] Failed to decode AccountRange", e);
+                }
+            }
+            case SNAP_GET_ACCOUNT_RANGE ->
+                log.debug("[snap] Ignoring inbound GetAccountRange (we don't serve snap data)");
             case P2P_PING -> sendPong(ctx);
             case P2P_DISCONNECT -> {
                 log.info("[eth] Peer disconnected (reason={})", decodeDisconnectReason(msg.payload()));
@@ -431,6 +467,68 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_BODIES, payload);
         return future;
     }
+
+    /**
+     * Fetch a single account from the snap/1 state trie.
+     *
+     * Computes keccak256(address) as the account hash and sends a GetAccountRange request.
+     * If no state root is cached yet (no block headers received), one is fetched first.
+     *
+     * @param address 20-byte Ethereum address
+     * @return future completing with the AccountRange decode result, or null if not READY
+     */
+    public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
+            org.apache.tuweni.bytes.Bytes address) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        org.apache.tuweni.bytes.Bytes32 accountHash =
+            org.apache.tuweni.crypto.Hash.keccak256(address);
+
+        if (latestStateRoot != null) {
+            return sendGetAccountRange(ctx, accountHash, latestStateRoot);
+        }
+
+        // Lazy fallback: request a header to obtain a state root, then send snap query
+        CompletableFuture<AccountRangeMessage.DecodeResult> result = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
+        pendingRequests.put(reqId, headerFut);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS,
+            GetBlockHeadersMessage.encodeByNumber(reqId, 21_000_000L, 1, 0, false));
+        headerFut.thenAccept(headers -> {
+            if (headers.isEmpty()) {
+                result.completeExceptionally(new RuntimeException("No header returned for state root"));
+                return;
+            }
+            sendGetAccountRange(ctx, accountHash, latestStateRoot)
+                .whenComplete((r, ex) -> {
+                    if (ex != null) result.completeExceptionally(ex);
+                    else result.complete(r);
+                });
+        }).exceptionally(ex -> { result.completeExceptionally(ex); return null; });
+        return result;
+    }
+
+    private CompletableFuture<AccountRangeMessage.DecodeResult> sendGetAccountRange(
+            ChannelHandlerContext ctx,
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<AccountRangeMessage.DecodeResult> future = new CompletableFuture<>();
+        pendingSnapRequests.put(reqId, future);
+        org.apache.tuweni.bytes.Bytes32 limitHash = org.apache.tuweni.bytes.Bytes32.fromHexString(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        byte[] payload = GetAccountRangeMessage.encode(reqId, stateRoot, accountHash, limitHash, 128 * 1024L);
+        rlpxHandler.sendMessage(ctx, SNAP_GET_ACCOUNT_RANGE, payload);
+        log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
+            reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
+        return future;
+    }
+
+    public boolean isSnapNegotiated() { return snapNegotiated; }
 
     public State getState() {
         return state;

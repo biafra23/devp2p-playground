@@ -89,6 +89,10 @@ public class DaemonClient {
                 long blockNumber = args.length > 1 ? Long.parseLong(args[1]) : 21_000_000L;
                 yield "{\"cmd\":\"get-block\",\"blockNumber\":" + blockNumber + "}";
             }
+            case "get-account" -> {
+                if (args.length < 2) throw new IllegalArgumentException("Usage: get-account <0xAddress>");
+                yield "{\"cmd\":\"get-account\",\"address\":\"" + args[1] + "\"}";
+            }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };
     }

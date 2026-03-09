@@ -6,6 +6,10 @@ import devp2p.networking.discv4.KademliaTable;
 import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
 import devp2p.networking.rlpx.RLPxConnector;
+import devp2p.networking.snap.messages.AccountRangeMessage;
+import org.apache.tuweni.bytes.Bytes;
+import org.apache.tuweni.bytes.Bytes32;
+import org.apache.tuweni.crypto.Hash;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +50,7 @@ public class CommandHandler {
                 case "peers"       -> handlePeers();
                 case "get-headers" -> handleGetHeaders(jsonLine);
                 case "get-block"   -> handleGetBlock(jsonLine);
+                case "get-account" -> handleGetAccount(jsonLine);
                 case "stop"        -> handleStop();
                 default            -> jsonError("Unknown command: " + cmd);
             };
@@ -189,6 +194,39 @@ public class CommandHandler {
             sb.append(",\"withdrawalCount\":").append(body.withdrawalCount());
             sb.append("}}");
             return sb.toString();
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            return jsonError(msg);
+        }
+    }
+
+    private String handleGetAccount(String jsonLine) {
+        String addr = extractString(jsonLine, "address");
+        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
+        if (hex.length() != 40) {
+            return jsonError("address must be a 20-byte hex string (40 hex chars)");
+        }
+        Bytes address = Bytes.fromHexString(hex);
+        Bytes32 accountHash = Hash.keccak256(address);
+        try {
+            AccountRangeMessage.DecodeResult result =
+                connector.requestAccount(address).get(30, TimeUnit.SECONDS);
+            AccountRangeMessage.AccountData found = result.accounts().stream()
+                .filter(a -> a.accountHash().equals(accountHash))
+                .findFirst().orElse(null);
+            if (found == null) {
+                return "{\"ok\":true,\"exists\":false"
+                    + ",\"address\":\"" + addr + "\""
+                    + ",\"accountHash\":\"0x" + accountHash.toHexString() + "\"}";
+            }
+            return "{\"ok\":true,\"exists\":true"
+                + ",\"address\":\"" + addr + "\""
+                + ",\"accountHash\":\"0x" + found.accountHash().toHexString() + "\""
+                + ",\"nonce\":" + found.nonce()
+                + ",\"balance\":\"" + found.balance() + "\""
+                + ",\"storageRoot\":\"0x" + found.storageRoot().toHexString() + "\""
+                + ",\"codeHash\":\"0x" + found.codeHash().toHexString() + "\"}";
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();

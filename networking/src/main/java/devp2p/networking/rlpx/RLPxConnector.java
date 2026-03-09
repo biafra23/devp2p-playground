@@ -5,6 +5,7 @@ import devp2p.networking.NetworkConfig;
 import devp2p.networking.eth.EthHandler;
 import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
+import devp2p.networking.snap.messages.AccountRangeMessage;
 import org.apache.tuweni.bytes.Bytes32;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
@@ -174,6 +175,30 @@ public final class RLPxConnector implements AutoCloseable {
         }
         return CompletableFuture.failedFuture(
                 new IllegalStateException("No active peer with completed eth handshake"));
+    }
+
+    /**
+     * Fetch a single account from the snap/1 state trie via any active READY + snap peer.
+     *
+     * @param address 20-byte Ethereum address
+     * @return future completing with the AccountRange result, or failed future if no snap peer available
+     */
+    public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccount(Bytes address) {
+        Iterator<EthHandler> it = activeHandlers.iterator();
+        while (it.hasNext()) {
+            EthHandler handler = it.next();
+            if (!handler.isReady() || !handler.isSnapNegotiated()) continue;
+            CompletableFuture<AccountRangeMessage.DecodeResult> future =
+                handler.requestAccountAsync(address);
+            if (future != null) {
+                log.info("[rlpx] Routed snap GetAccountRange for {} to active peer",
+                    address.toShortHexString());
+                return future;
+            }
+            it.remove();
+        }
+        return CompletableFuture.failedFuture(
+            new IllegalStateException("No active peer with snap/1 support"));
     }
 
     public record PeerInfo(String remoteAddress, String state) {}
