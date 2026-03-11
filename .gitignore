@@ -22,3 +22,4 @@ out/
 # Node key (contains private key)
 nodekey.hex
 app/peers.cache
+*.cache

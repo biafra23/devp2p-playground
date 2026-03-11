@@ -89,6 +89,11 @@ public final class Main {
         return Path.of("peers" + suffix + ".cache");
     }
 
+    static Path clCacheFile(String networkName) {
+        String suffix = "mainnet".equals(networkName) ? "" : "-" + networkName;
+        return Path.of("cl-peers" + suffix + ".cache");
+    }
+
     public static void main(String[] args) throws Exception {
         // Parse --network and --port flags from anywhere in args
         String networkName = "mainnet";
@@ -112,6 +117,7 @@ public final class Main {
         // Handle purge-cache before socket check — works without a running daemon
         if (cmdArgs.length > 0 && "purge-cache".equals(cmdArgs[0])) {
             PeerCache.purge(cacheFile(networkName));
+            CLPeerCache.purge(clCacheFile(networkName));
             return;
         }
 
@@ -266,15 +272,23 @@ public final class Main {
 
         // 7. Beacon light client (consensus layer, runs on virtual thread)
         BeaconSyncState beaconSyncState = new BeaconSyncState();
+        CLPeerCache clPeerCache = new CLPeerCache(clCacheFile(network.name()));
+        List<String> clPeers = new java.util.ArrayList<>(clPeerCache.load());
+        // Append configured peers after cached ones (cached peers are tried first)
+        for (String peer : network.clPeerMultiaddrs()) {
+            if (!clPeers.contains(peer)) clPeers.add(peer);
+        }
         BeaconLightClient beaconLightClient = new BeaconLightClient(
-                network.clPeerMultiaddrs(),
+                clPeers,
                 network.checkpointRoot(),
                 network.currentForkVersion(),
                 network.genesisValidatorsRoot(),
                 beaconSyncState,
-                network.beaconApiUrl());
+                network.beaconApiUrl(),
+                clPeerCache::add);
         beaconLightClient.start();
-        log.info("[daemon] Beacon light client started with {} CL peer(s)", network.clPeerMultiaddrs().size());
+        log.info("[daemon] Beacon light client started with {} CL peer(s) ({} cached)",
+                clPeers.size(), clPeers.size() - network.clPeerMultiaddrs().size());
 
         // 8. IPC server
         CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState);

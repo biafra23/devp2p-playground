@@ -57,6 +57,7 @@ public class BeaconLightClient implements AutoCloseable {
     private final byte[] checkpointRoot;      // 32-byte trusted checkpoint block root
     private final byte[] forkVersion;         // 4-byte fork version
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
+    private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
 
     private volatile Thread syncThread;
     private volatile boolean running;
@@ -77,6 +78,28 @@ public class BeaconLightClient implements AutoCloseable {
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl) {
+        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+                syncState, beaconApiUrl, null);
+    }
+
+    /**
+     * Construct a BeaconLightClient with a peer success callback.
+     *
+     * @param clPeerMultiaddrs       list of multiaddr strings for Consensus Layer peers
+     * @param checkpointRoot         32-byte trusted checkpoint block root (weak subjectivity)
+     * @param forkVersion            4-byte current fork version
+     * @param genesisValidatorsRoot  32-byte genesis validators root
+     * @param syncState              shared state holder updated as finality advances
+     * @param beaconApiUrl           nullable HTTP API URL for local beacon node peer discovery
+     * @param onPeerSuccess          nullable callback invoked with peer multiaddr on successful response
+     */
+    public BeaconLightClient(List<String> clPeerMultiaddrs,
+                              byte[] checkpointRoot,
+                              byte[] forkVersion,
+                              byte[] genesisValidatorsRoot,
+                              BeaconSyncState syncState,
+                              String beaconApiUrl,
+                              java.util.function.Consumer<String> onPeerSuccess) {
         if (checkpointRoot == null || checkpointRoot.length != 32) {
             throw new IllegalArgumentException("checkpointRoot must be 32 bytes");
         }
@@ -93,6 +116,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.forkVersion = forkVersion.clone();
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
         this.syncState = syncState;
+        this.onPeerSuccess = onPeerSuccess;
 
         this.store = new LightClientStore();
         this.processor = new LightClientProcessor(store, forkVersion, genesisValidatorsRoot);
@@ -239,6 +263,7 @@ public class BeaconLightClient implements AutoCloseable {
 
                 store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
                 updateSyncState();
+                notifyPeerSuccess(peer);
                 log.info("[beacon] Bootstrap complete from {}, slot={}",
                         peer, bootstrap.header().beacon().slot());
                 return;
@@ -298,6 +323,7 @@ public class BeaconLightClient implements AutoCloseable {
                 if (attestedRoot != null && attestedRoot.length == 32) {
                     syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
                 }
+                notifyPeerSuccess(peer);
                 log.info("[beacon] Seeded from finality update via {}, finalizedSlot={}", peer, finalizedSlot);
                 return;
 
@@ -430,6 +456,7 @@ public class BeaconLightClient implements AutoCloseable {
                 if (store.isInitialized() && processor.processFinalityUpdate(update)) {
                     updateSyncState();
                     fillChainStateRoots(peer, true);
+                    notifyPeerSuccess(peer);
                     log.debug("[beacon] Finality update applied from {}, finalizedSlot={}",
                             peer, store.getFinalizedSlot());
                     return;
@@ -449,6 +476,7 @@ public class BeaconLightClient implements AutoCloseable {
                         }
                         if (slot > syncState.getFinalizedSlot()) {
                             syncState.update(slot, sr, update.signatureSlot());
+                            notifyPeerSuccess(peer);
                             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
                         }
                         return;
@@ -572,6 +600,16 @@ public class BeaconLightClient implements AutoCloseable {
 
         } catch (Exception e) {
             log.debug("[beacon] Chain fill failed from {}: {}", peer, e.getMessage());
+        }
+    }
+
+    private void notifyPeerSuccess(String peer) {
+        if (onPeerSuccess != null) {
+            try {
+                onPeerSuccess.accept(peer);
+            } catch (Exception e) {
+                log.debug("[beacon] Peer success callback failed: {}", e.getMessage());
+            }
         }
     }
 
