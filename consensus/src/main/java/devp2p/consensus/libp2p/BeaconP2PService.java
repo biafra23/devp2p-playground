@@ -583,6 +583,7 @@ public class BeaconP2PService implements AutoCloseable {
         private final io.libp2p.core.Stream stream;
         private volatile boolean writeClosedOnly;
         private volatile boolean dataReceived;
+        private volatile boolean channelFullyClosed;
         private volatile java.util.concurrent.ScheduledFuture<?> completionTimer;
 
         ReqRespController(byte[] requestBytes, CompletableFuture<byte[]> responseFuture,
@@ -622,23 +623,46 @@ public class BeaconP2PService implements AutoCloseable {
                 @Override
                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
                     int readable = msg.readableBytes();
-                    log.debug("[beacon-p2p] channelRead0: {} bytes received, total={}",
-                            readable, responseBuffer.size() + readable);
                     dataReceived = true;
                     byte[] bytes = new byte[readable];
                     msg.readBytes(bytes);
                     responseBuffer.write(bytes, 0, bytes.length);
+                    log.debug("[beacon-p2p] channelRead0: {} bytes received, total={}, channelClosed={}",
+                            readable, responseBuffer.size(), channelFullyClosed);
+                }
 
-                    // Reset the completion timer on each chunk — complete 200ms after
-                    // the last chunk arrives (we can't predict compressed size).
+                @Override
+                public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+                    if (!dataReceived || responseFuture.isDone()) {
+                        super.channelReadComplete(ctx);
+                        return;
+                    }
+
+                    if (channelFullyClosed) {
+                        // Channel already inactive — all buffered data has been delivered.
+                        // Complete immediately (ctx.executor().schedule() is unreliable on
+                        // inactive channels).
+                        if (responseBuffer.size() > 0) {
+                            log.debug("[beacon-p2p] Completing response (channel closed): {} bytes",
+                                    responseBuffer.size());
+                            responseFuture.complete(responseBuffer.toByteArray());
+                        }
+                        super.channelReadComplete(ctx);
+                        return;
+                    }
+
+                    // Reset the completion timer — complete 200ms after the last
+                    // read batch arrives (we can't predict compressed size).
                     var prev = completionTimer;
                     if (prev != null) prev.cancel(false);
                     completionTimer = ctx.executor().schedule(() -> {
                         if (!responseFuture.isDone() && responseBuffer.size() > 0) {
-                            log.debug("[beacon-p2p] Completing response: {} bytes", responseBuffer.size());
+                            log.debug("[beacon-p2p] Completing response (timer): {} bytes",
+                                    responseBuffer.size());
                             responseFuture.complete(responseBuffer.toByteArray());
                         }
                     }, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    super.channelReadComplete(ctx);
                 }
 
                 @Override
@@ -652,11 +676,14 @@ public class BeaconP2PService implements AutoCloseable {
                         super.channelInactive(ctx);
                         return;
                     }
+                    // Mark channel as fully closed — any subsequent channelRead0
+                    // calls are delivering buffered data and should complete immediately.
+                    channelFullyClosed = true;
                     if (!dataReceived && responseBuffer.size() == 0) {
-                        // Spurious channelInactive before any data arrived (common with
-                        // empty-request protocols like finality_update). Don't complete
-                        // the future — let the caller's timeout handle real failures.
-                        log.debug("[beacon-p2p] Ignoring channelInactive with no data yet");
+                        // No data arrived yet. Data may still come via buffered channelRead0
+                        // after this event. Don't complete the future — let the caller's
+                        // timeout or a subsequent channelRead0 handle it.
+                        log.debug("[beacon-p2p] Channel closed with no data yet, waiting for buffered reads");
                         super.channelInactive(ctx);
                         return;
                     }

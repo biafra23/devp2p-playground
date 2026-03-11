@@ -35,7 +35,8 @@ public final class ReqRespCodec {
         }
         byte[] compressed = snappyCompress(sszPayload);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        writeVarint(out, compressed.length);
+        // eth2 spec: varint encodes UNCOMPRESSED SSZ length, not compressed
+        writeVarint(out, sszPayload.length);
         out.write(compressed);
         return out.toByteArray();
     }

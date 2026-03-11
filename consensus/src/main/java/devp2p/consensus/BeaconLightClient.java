@@ -272,10 +272,11 @@ public class BeaconLightClient implements AutoCloseable {
                 return;
 
             } catch (Throwable e) {
-                String msg = e.getMessage() != null ? e.getMessage()
-                        : e.getClass().getName()
-                          + (e.getCause() != null ? ": " + e.getCause().getMessage() : "");
-                log.warn("[beacon] Bootstrap failed from {}: {}", peer, msg);
+                Throwable root = e;
+                while (root.getCause() != null) root = root.getCause();
+                String msg = root.getMessage() != null ? root.getMessage()
+                        : root.getClass().getSimpleName();
+                log.warn("[beacon] Bootstrap failed from {}: {} ({})", peer, msg, root.getClass().getSimpleName());
             }
         }
         log.warn("[beacon] Could not bootstrap from any peer — will retry on next sync cycle");
