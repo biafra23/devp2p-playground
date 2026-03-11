@@ -1,5 +1,7 @@
 package devp2p.app;
 
+import devp2p.consensus.BeaconSyncState;
+import devp2p.consensus.proof.MerklePatriciaVerifier;
 import devp2p.core.types.BlockHeader;
 import devp2p.networking.discv4.DiscV4Service;
 import devp2p.networking.discv4.KademliaTable;
@@ -33,16 +35,18 @@ public class CommandHandler {
     private final CountDownLatch stopLatch;
     private final Map<String, Long> backoff;
     private final Set<String> blacklistedNodeIds;
+    private final BeaconSyncState beaconSyncState;
 
     public CommandHandler(DiscV4Service discV4, RLPxConnector connector,
                           CountDownLatch stopLatch, Map<String, Long> backoff,
-                          Set<String> blacklistedNodeIds) {
+                          Set<String> blacklistedNodeIds, BeaconSyncState beaconSyncState) {
         this.discV4 = discV4;
         this.connector = connector;
         this.startTimeMs = System.currentTimeMillis();
         this.stopLatch = stopLatch;
         this.backoff = backoff;
         this.blacklistedNodeIds = blacklistedNodeIds;
+        this.beaconSyncState = beaconSyncState;
     }
 
     /** Parse and dispatch one JSON-Lines request; returns a JSON-Lines response. */
@@ -50,14 +54,15 @@ public class CommandHandler {
         try {
             String cmd = extractString(jsonLine, "cmd");
             return switch (cmd) {
-                case "status"      -> handleStatus();
-                case "peers"       -> handlePeers();
-                case "get-headers" -> handleGetHeaders(jsonLine);
-                case "get-block"   -> handleGetBlock(jsonLine);
-                case "get-account" -> handleGetAccount(jsonLine);
-                case "dial"        -> handleDial(jsonLine);
-                case "stop"        -> handleStop();
-                default            -> jsonError("Unknown command: " + cmd);
+                case "status"        -> handleStatus();
+                case "peers"         -> handlePeers();
+                case "get-headers"   -> handleGetHeaders(jsonLine);
+                case "get-block"     -> handleGetBlock(jsonLine);
+                case "get-account"   -> handleGetAccount(jsonLine);
+                case "dial"          -> handleDial(jsonLine);
+                case "stop"          -> handleStop();
+                case "beacon-status" -> handleBeaconStatus();
+                default              -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
             log.warn("[ipc] Error handling command '{}': {}", jsonLine, e.getMessage());
@@ -239,11 +244,17 @@ public class CommandHandler {
             proofSb.append("]");
             String proofJson = proofSb.toString();
 
+            // Attempt beacon-verified proof verification
+            String verificationJson = buildVerificationJson(address.toArrayUnsafe(), result.proof(),
+                    found != null ? found.nonce() : -1,
+                    found != null ? found.balance().toString() : null);
+
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
                     + ",\"address\":\"" + addr + "\""
-                    + ",\"accountHash\":\"0x" + accountHash.toHexString() + "\""
-                    + ",\"proof\":" + proofJson + "}";
+                    + ",\"accountHash\":\"" + accountHash.toHexString() + "\""
+                    + ",\"proof\":" + proofJson
+                    + ",\"verification\":" + verificationJson + "}";
             }
             return "{\"ok\":true,\"exists\":true"
                 + ",\"address\":\"" + addr + "\""
@@ -252,12 +263,30 @@ public class CommandHandler {
                 + ",\"balance\":\"" + found.balance() + "\""
                 + ",\"storageRoot\":\"0x" + found.storageRoot().toHexString() + "\""
                 + ",\"codeHash\":\"0x" + found.codeHash().toHexString() + "\""
-                + ",\"proof\":" + proofJson + "}";
+                + ",\"proof\":" + proofJson
+                + ",\"verification\":" + verificationJson + "}";
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
         }
+    }
+
+    private String handleBeaconStatus() {
+        if (!beaconSyncState.isSynced()) {
+            return "{\"ok\":true,\"state\":\"SYNCING\",\"finalizedSlot\":0,\"optimisticSlot\":0"
+                    + ",\"executionStateRoot\":null}";
+        }
+        byte[] stateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        String stateRootHex = stateRoot != null ? "\"0x" + bytesToHex(stateRoot) + "\"" : "null";
+        long finalizedSlot = beaconSyncState.getFinalizedSlot();
+        long optimisticSlot = beaconSyncState.getOptimisticSlot();
+        long period = finalizedSlot / (32 * 256); // SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        return "{\"ok\":true,\"state\":\"SYNCED\""
+                + ",\"finalizedSlot\":" + finalizedSlot
+                + ",\"optimisticSlot\":" + optimisticSlot
+                + ",\"syncCommitteePeriod\":" + period
+                + ",\"executionStateRoot\":" + stateRootHex + "}";
     }
 
     private String handleDial(String jsonLine) {
@@ -294,6 +323,33 @@ public class CommandHandler {
         log.info("[ipc] Stop command received — initiating graceful shutdown");
         stopLatch.countDown();
         return "{\"ok\":true,\"message\":\"Daemon shutting down\"}";
+    }
+
+    // -------------------------------------------------------------------------
+    // Beacon proof verification helpers
+    // -------------------------------------------------------------------------
+
+    private String buildVerificationJson(byte[] address, List<Bytes> proofNodes,
+                                          long nonce, String balance) {
+        byte[] trustedStateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        if (trustedStateRoot == null) {
+            return "{\"stateRootVerified\":false,\"proofValid\":null,\"reason\":\"beacon not synced\"}";
+        }
+        String stateRootHex = "0x" + bytesToHex(trustedStateRoot);
+        long beaconSlot = beaconSyncState.getFinalizedSlot();
+
+        List<byte[]> proofBytes = proofNodes.stream().map(Bytes::toArrayUnsafe).toList();
+        boolean proofValid = MerklePatriciaVerifier.verify(trustedStateRoot, address, proofBytes, nonce, balance);
+        return "{\"stateRootVerified\":true"
+                + ",\"proofValid\":" + proofValid
+                + ",\"stateRoot\":\"" + stateRootHex + "\""
+                + ",\"beaconSlot\":" + beaconSlot + "}";
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     // -------------------------------------------------------------------------

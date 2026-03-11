@@ -1,11 +1,13 @@
 package devp2p.networking;
 
+import devp2p.core.enr.Enr;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.rlp.RLP;
 
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -18,8 +20,59 @@ public record NetworkConfig(
         Bytes32 bestBlockHash,
         byte[] forkIdHash,
         long forkNext,
-        List<InetSocketAddress> bootnodes
+        List<InetSocketAddress> bootnodes,
+        // Beacon chain / consensus layer fields
+        byte[] genesisValidatorsRoot,   // 32 bytes: genesis_validators_root for BLS domain computation
+        byte[] checkpointRoot,          // 32 bytes: trusted checkpoint block root for bootstrap
+        byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
+        List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
+        String beaconApiUrl             // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
 ) {
+
+    // -------------------------------------------------------------------------
+    // Lighthouse mainnet CL bootstrap ENRs
+    // Source: https://github.com/sigp/lighthouse/blob/stable/common/eth2_network_config/built_in_network_configs/mainnet/bootstrap_nodes.yaml
+    // -------------------------------------------------------------------------
+    private static final List<String> MAINNET_CL_BOOTSTRAP_ENRS = List.of(
+            "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo",
+            "enr:-Iu4QEDJ4Wa_UQNbK8Ay1hFEkXvd8psolVK6OhfTL9irqz3nbXxxWyKwEplPfkju4zduVQj6mMhUCm9R2Lc4YM5jPcIBgmlkgnY0gmlwhANrfESJc2VjcDI1NmsxoQJCYz2-nsqFpeEj6eov9HSi9QssIVIVNr0I89J1vXM9foN0Y3CCIyiDdWRwgiMo",
+            "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg",
+            "enr:-Ku4QP2xDnEtUXIjzJ_DhlCRN9SN99RYQPJL92TMlSv7U5C1YnYLjwOQHgZIUXw6c-BvRg2Yc2QsZxxoS_pPRVe0yK8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQMeFF5GrS7UZpAH2Ly84aLK-TyvH-dRo0JM1i8yygH50YN1ZHCCJxA",
+            "enr:-Ku4QPp9z1W4tAO8Ber_NQierYaOStqhDqQdOPY3bB3jDgkjcbk6YrEnVYIiCBbTxuar3CzS528d2iE7TdJsrL-dEKoBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQMw5fqqkw2hHC4F5HZZDPsNmPdB1Gi8JPQK7pRc9XHh-oN1ZHCCKvg",
+            "enr:-Le4QPUXJS2BTORXxyx2Ia-9ae4YqA_JWX3ssj4E_J-3z1A-HmFGrU8BpvpqhNabayXeOZ2Nq_sbeDgtzMJpLLnXFgAChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISsaa0Zg2lwNpAkAIkHAAAAAPA8kv_-awoTiXNlY3AyNTZrMaEDHAD2JKYevx89W0CcFJFiskdcEzkH_Wdv9iW42qLK79ODdWRwgiMohHVkcDaCI4I",
+            "enr:-Le4QLHZDSvkLfqgEo8IWGG96h6mxwe_PsggC20CL3neLBjfXLGAQFOPSltZ7oP6ol54OvaNqO02Rnvb8YmDR274uq8ChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLosQxg2lwNpAqAX4AAAAAAPA8kv_-ax65iXNlY3AyNTZrMaEDBJj7_dLFACaxBfaI8KZTh_SSJUjhyAyfshimvSqo22WDdWRwgiMohHVkcDaCI4I",
+            "enr:-Le4QH6LQrusDbAHPjU_HcKOuMeXfdEB5NJyXgHWFadfHgiySqeDyusQMvfphdYWOzuSZO9Uq2AMRJR5O4ip7OvVma8BhGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLY9ncg2lwNpAkAh8AgQIBAAAAAAAAAAmXiXNlY3AyNTZrMaECDYCZTZEksF-kmgPholqgVt8IXr-8L7Nu7YrZ7HUpgxmDdWRwgiMohHVkcDaCI4I",
+            "enr:-Le4QIqLuWybHNONr933Lk0dcMmAB5WgvGKRyDihy1wHDIVlNuuztX62W51voT4I8qD34GcTEOTmag1bcdZ_8aaT4NUBhGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISLY04ng2lwNpAkAh8AgAIBAAAAAAAAAA-fiXNlY3AyNTZrMaEDscnRV6n1m-D9ID5UsURk0jsoKNXt1TIrj8uKOGW6iluDdWRwgiMohHVkcDaCI4I",
+            "enr:-Ku4QHqVeJ8PPICcWk1vSn_XcSkjOkNiTg6Fmii5j6vUQgvzMc9L1goFnLKgXqBJspJjIsB91LTOleFmyWWrFVATGngBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhAMRHkWJc2VjcDI1NmsxoQKLVXFOhp2uX6jeT0DvvDpPcU8FWMjQdR4wMuORMhpX24N1ZHCCIyg",
+            "enr:-Ku4QG-2_Md3sZIAUebGYT6g0SMskIml77l6yR-M_JXc-UdNHCmHQeOiMLbylPejyJsdAPsTHJyjJB2sYGDLe0dn8uYBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhBLY-NyJc2VjcDI1NmsxoQORcM6e19T1T9gi7jxEZjk_sjVLGFscUNqAY9obgZaxbIN1ZHCCIyg",
+            "enr:-Ku4QPn5eVhcoF1opaFEvg1b6JNFD2rqVkHQ8HApOKK61OIcIXD127bKWgAtbwI7pnxx6cDyk_nI88TrZKQaGMZj0q0Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhDayLMaJc2VjcDI1NmsxoQK2sBOLGcUb4AwuYzFuAVCaNHA-dy24UuEKkeFNgCVCsIN1ZHCCIyg",
+            "enr:-Ku4QEWzdnVtXc2Q0ZVigfCGggOVB2Vc1ZCPEc6j21NIFLODSJbvNaef1g4PxhPwl_3kax86YPheFUSLXPRs98vvYsoBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhDZBrP2Jc2VjcDI1NmsxoQM6jr8Rb1ktLEsVcKAPa08wCsKUmvoQ8khiOl_SLozf9IN1ZHCCIyg",
+            "enr:-LK4QA8FfhaAjlb_BXsXxSfiysR7R52Nhi9JBt4F8SPssu8hdE1BXQQEtVDC3qStCW60LSO7hEsVHv5zm8_6Vnjhcn0Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhAN4aBKJc2VjcDI1NmsxoQJerDhsJ-KxZ8sHySMOCmTO6sHM3iCFQ6VMvLTe948MyYN0Y3CCI4yDdWRwgiOM",
+            "enr:-LK4QKWrXTpV9T78hNG6s8AM6IO4XH9kFT91uZtFg1GcsJ6dKovDOr1jtAAFPnS2lvNltkOGA9k29BUN7lFh_sjuc9QBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhANAdd-Jc2VjcDI1NmsxoQLQa6ai7y9PMN5hpLe5HmiJSlYzMuzP7ZhwRiwHvqNXdoN0Y3CCI4yDdWRwgiOM",
+            "enr:-IS4QPi-onjNsT5xAIAenhCGTDl4z-4UOR25Uq-3TmG4V3kwB9ljLTb_Kp1wdjHNj-H8VVLRBSSWVZo3GUe3z6k0E-IBgmlkgnY0gmlwhKB3_qGJc2VjcDI1NmsxoQMvAfgB4cJXvvXeM6WbCG86CstbSxbQBSGx31FAwVtOTYN1ZHCCIyg",
+            "enr:-KG4QPUf8-g_jU-KrwzG42AGt0wWM1BTnQxgZXlvCEIfTQ5hSmptkmgmMbRkpOqv6kzb33SlhPHJp7x4rLWWiVq5lSECgmlkgnY0gmlwhFPlR9KDaXA2kCoGxcAJAAAVAAAAAAAAABCJc2VjcDI1NmsxoQLdUv9Eo9sxCt0tc_CheLOWnX59yHJtkBSOL7kpxdJ6GYN1ZHCCIyiEdWRwNoIjKA"
+    );
+
+    /** Prepend a local/priority multiaddr to an existing list. */
+    private static List<String> prependLocal(String local, List<String> rest) {
+        List<String> result = new ArrayList<>();
+        result.add(local);
+        result.addAll(rest);
+        return List.copyOf(result);
+    }
+
+    /** Convert a list of ENR strings to libp2p multiaddr strings, skipping any that lack tcp/secp256k1. */
+    private static List<String> enrsToMultiaddrs(List<String> enrs) {
+        List<String> result = new ArrayList<>();
+        for (String enr : enrs) {
+            try {
+                Enr.fromEnrString(enr).toLibp2pMultiaddr().ifPresent(result::add);
+            } catch (Exception e) {
+                // Skip malformed ENRs silently during static init
+            }
+        }
+        return List.copyOf(result);
+    }
 
     public static final NetworkConfig MAINNET = new NetworkConfig(
             "mainnet",
@@ -33,7 +86,18 @@ public record NetworkConfig(
                     new InetSocketAddress("3.209.45.79", 30303),
                     new InetSocketAddress("18.188.214.86", 30303),
                     new InetSocketAddress("3.219.208.172", 30303)
-            )
+            ),
+            // genesis_validators_root (mainnet)
+            Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
+            // trusted checkpoint: recent finalized mainnet block root from Lighthouse checkpoint sync
+            Bytes.fromHexString("18008fc7d07235279fc2631a1c985e580dba2e785d123bedd21c57832d11ddc1").toArrayUnsafe(),
+            // current fork version: Electra (0x05000000)
+            new byte[]{0x05, 0x00, 0x00, 0x00},
+            // CL peer multiaddrs: local Lighthouse (public IP), then bootstrap ENRs
+            prependLocal(
+                    "/ip4/188.68.32.16/tcp/9100/p2p/16Uiu2HAm5AH9YsNjHqLsQofyd1WUBVxyPY5cPC8Sec3gVwJPU7wD",
+                    enrsToMultiaddrs(MAINNET_CL_BOOTSTRAP_ENRS)),
+            "http://172.17.0.1:5052"
     );
 
     public static final NetworkConfig SEPOLIA = new NetworkConfig(
@@ -49,7 +113,18 @@ public record NetworkConfig(
                     new InetSocketAddress("170.64.250.88", 30303),
                     new InetSocketAddress("139.59.49.206", 30303),
                     new InetSocketAddress("138.68.123.152", 30303)
-            )
+            ),
+            // genesis_validators_root (sepolia)
+            Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
+            // trusted checkpoint: a recent finalized sepolia block root
+            Bytes.fromHexString("1f7c15e7e1a7be27b4e7e9b7bdb0e5e9b2aa5aebd33498ec04b58ef2adb5e9ce").toArrayUnsafe(),
+            // current fork version: Electra on sepolia (0x90000073)
+            new byte[]{(byte) 0x90, 0x00, 0x00, 0x73},
+            // CL peer multiaddrs for sepolia
+            List.of(
+                    "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
+            ),
+            null
     );
 
     public static final NetworkConfig HOLESKY = new NetworkConfig(
@@ -62,7 +137,18 @@ public record NetworkConfig(
             List.of(
                     new InetSocketAddress("146.190.13.128", 30303),
                     new InetSocketAddress("178.128.136.233", 30303)
-            )
+            ),
+            // genesis_validators_root (holesky)
+            Bytes.fromHexString("9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1").toArrayUnsafe(),
+            // trusted checkpoint: a recent finalized holesky block root
+            Bytes.fromHexString("e4571b4f4a3bffdc9b87e75de28b86e5d9e8e1ab2b27d8a66e3e4e9f9ebe7f4c").toArrayUnsafe(),
+            // current fork version: Electra on holesky (0x06017000)
+            new byte[]{0x06, 0x01, 0x70, 0x00},
+            // CL peer multiaddrs for holesky
+            List.of(
+                    "/ip4/159.69.35.70/tcp/9000/p2p/16Uiu2HAmFMfXsymWEK6BFPQNPW3nPz57uB3TKpVNFDmeoW7WXNUA"
+            ),
+            null
     );
 
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block

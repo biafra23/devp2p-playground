@@ -1,5 +1,7 @@
 package devp2p.app;
 
+import devp2p.consensus.BeaconLightClient;
+import devp2p.consensus.BeaconSyncState;
 import devp2p.core.crypto.NodeKey;
 import devp2p.core.types.BlockHeader;
 import devp2p.networking.NetworkConfig;
@@ -260,8 +262,20 @@ public final class Main {
         }
         log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", UDP_PORT);
 
-        // 7. IPC server
-        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds);
+        // 7. Beacon light client (consensus layer, runs on virtual thread)
+        BeaconSyncState beaconSyncState = new BeaconSyncState();
+        BeaconLightClient beaconLightClient = new BeaconLightClient(
+                network.clPeerMultiaddrs(),
+                network.checkpointRoot(),
+                network.currentForkVersion(),
+                network.genesisValidatorsRoot(),
+                beaconSyncState,
+                network.beaconApiUrl());
+        beaconLightClient.start();
+        log.info("[daemon] Beacon light client started with {} CL peer(s)", network.clPeerMultiaddrs().size());
+
+        // 8. IPC server
+        CommandHandler commandHandler = new CommandHandler(discV4, connector, stopLatch, backoff, blacklistedNodeIds, beaconSyncState);
         DaemonServer server = new DaemonServer(socketPath, commandHandler);
         try {
             server.start();
@@ -282,10 +296,11 @@ public final class Main {
             return;
         }
 
-        // 8. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here
+        // 9. Shutdown hook for Ctrl-C / SIGTERM — cleanup happens here
         //    because the JVM may exit before the main thread resumes after await().
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("[daemon] Shutdown hook triggered");
+            beaconLightClient.close();
             server.close();
             connector.close();
             discV4.close();
@@ -298,6 +313,7 @@ public final class Main {
         stopLatch.await();
 
         // Cleanup for graceful "stop" command (shutdown hook handles Ctrl-C/SIGTERM)
+        beaconLightClient.close();
         server.close();
         connector.close();
         discV4.close();

@@ -8,6 +8,10 @@
     <logger name="devp2p" level="DEBUG"/>
     <logger name="io.netty" level="WARN"/>
     <logger name="org.apache.tuweni" level="WARN"/>
+    <logger name="io.libp2p" level="WARN"/>
+    <logger name="io.libp2p.security.noise" level="DEBUG"/>
+    <logger name="io.libp2p.transport" level="DEBUG"/>
+    <logger name="io.libp2p.core" level="DEBUG"/>
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>

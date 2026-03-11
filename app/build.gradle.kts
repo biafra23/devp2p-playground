@@ -1,6 +1,7 @@
 dependencies {
     implementation(project(":core"))
     implementation(project(":networking"))
+    implementation(project(":consensus"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.crypto)
     implementation(libs.slf4j.api)
