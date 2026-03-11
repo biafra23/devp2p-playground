@@ -389,17 +389,6 @@ public class CommandHandler {
             peerStateRootHex = peerStateRoot.toHexString();
         }
 
-        // Verify against the beacon-verified finalized state root
-        byte[] trustedStateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
-        boolean beaconProofValid = false;
-        String beaconStateRootHex = null;
-        long beaconSlot = beaconSyncState.getFinalizedSlot();
-        if (trustedStateRoot != null && !proofBytes.isEmpty()) {
-            beaconProofValid = MerklePatriciaVerifier.verify(
-                    trustedStateRoot, address, proofBytes, nonce, balance);
-            beaconStateRootHex = "0x" + bytesToHex(trustedStateRoot);
-        }
-
         // Check if the peer's state root matches any beacon-attested block.
         // This bridges the gap between the finalized root (which is ~13 min old
         // and usually too stale to match the peer's current state) and the peer's
@@ -424,12 +413,7 @@ public class CommandHandler {
         if (peerStateRootHex != null) {
             sb.append(",\"peerStateRoot\":\"").append(peerStateRootHex).append("\"");
         }
-        sb.append(",\"beaconProofValid\":").append(beaconProofValid);
-        if (beaconStateRootHex != null) {
-            sb.append(",\"beaconStateRoot\":\"").append(beaconStateRootHex).append("\"");
-        }
-        sb.append(",\"beaconSynced\":").append(trustedStateRoot != null);
-        sb.append(",\"beaconSlot\":").append(beaconSlot);
+        sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
         sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
         if (beaconChainVerified) {
             sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);

@@ -148,12 +148,15 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 0: discover peers from beacon API before attempting connections
         discoverPeersFromBeaconApi();
 
-        // Phase 1: try beacon HTTP API first (fast, no P2P overhead)
-        seedFromBeaconApi();
+        // Phase 1: bootstrap with BLS verification (strongest trust)
+        bootstrap();
 
-        // Phase 1b: fall back to P2P seeding if HTTP API unavailable
-        if (!syncState.isSynced()) {
-            seedFromFinalityUpdate();
+        // Phase 2: fall back to seeding without BLS if bootstrap failed
+        if (!store.isInitialized()) {
+            seedFromBeaconApi();
+            if (!syncState.isSynced()) {
+                seedFromFinalityUpdate();
+            }
         }
 
         // Phase 2: steady-state poll loop — one slot = 12 seconds.
@@ -244,7 +247,7 @@ public class BeaconLightClient implements AutoCloseable {
             try {
                 byte[] response = p2pService
                         .requestBootstrap(peer, checkpointRoot)
-                        .get(5, TimeUnit.SECONDS);
+                        .get(15, TimeUnit.SECONDS);
 
                 LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
 
@@ -432,14 +435,17 @@ public class BeaconLightClient implements AutoCloseable {
      */
     private void pollFinalityUpdate() {
         if (!store.isInitialized() && !syncState.isSynced()) {
-            // Not bootstrapped and no seed yet — try HTTP API first, then P2P
+            // Not bootstrapped and no seed yet — try bootstrap first, then fall back
             discoverPeersFromBeaconApi();
-            seedFromBeaconApi();
-            if (!syncState.isSynced()) {
-                for (String peer : List.copyOf(clPeerMultiaddrs)) {
-                    p2pService.disconnectPeer(peer);
+            for (String peer : List.copyOf(clPeerMultiaddrs)) {
+                p2pService.disconnectPeer(peer);
+            }
+            bootstrap();
+            if (!store.isInitialized()) {
+                seedFromBeaconApi();
+                if (!syncState.isSynced()) {
+                    seedFromFinalityUpdate();
                 }
-                seedFromFinalityUpdate();
             }
             return;
         }

@@ -89,8 +89,8 @@ public record NetworkConfig(
             ),
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
-            // trusted checkpoint: recent finalized mainnet block root from Lighthouse checkpoint sync
-            Bytes.fromHexString("18008fc7d07235279fc2631a1c985e580dba2e785d123bedd21c57832d11ddc1").toArrayUnsafe(),
+            // trusted checkpoint: recent finalized mainnet block root (slot 13870176, 2026-03-11)
+            Bytes.fromHexString("18c3d9b80a42584f42d16e057e6e3b711289c6f7b6d089cc27699aa1adf7de05").toArrayUnsafe(),
             // current fork version: Electra (0x05000000)
             new byte[]{0x05, 0x00, 0x00, 0x00},
             // CL peer multiaddrs: known light-client-serving peers (nimbus, lodestar, lighthouse)
