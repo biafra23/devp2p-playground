@@ -230,6 +230,9 @@ public class CommandHandler {
         Bytes address = Bytes.fromHexString(hex);
         Bytes32 accountHash = Hash.keccak256(address);
         try {
+            // Use peer's fresh state root to avoid pruning issues —
+            // peers prune state beyond ~128 blocks, so a beacon-finalized root
+            // (6+ min old) is usually too stale for them to serve.
             AccountRangeMessage.DecodeResult result =
                 connector.requestAccount(address).get(30, TimeUnit.SECONDS);
             AccountRangeMessage.AccountData found = result.accounts().stream()
@@ -244,10 +247,12 @@ public class CommandHandler {
             proofSb.append("]");
             String proofJson = proofSb.toString();
 
-            // Attempt beacon-verified proof verification
+            // Verify proof against the peer's state root (should always pass if proof is non-empty)
+            // and against the beacon-verified state root (passes only if roots coincide)
             String verificationJson = buildVerificationJson(address.toArrayUnsafe(), result.proof(),
                     found != null ? found.nonce() : -1,
-                    found != null ? found.balance().toString() : null);
+                    found != null ? found.balance().toString() : null,
+                    result.stateRoot());
 
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
@@ -330,20 +335,43 @@ public class CommandHandler {
     // -------------------------------------------------------------------------
 
     private String buildVerificationJson(byte[] address, List<Bytes> proofNodes,
-                                          long nonce, String balance) {
-        byte[] trustedStateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
-        if (trustedStateRoot == null) {
-            return "{\"stateRootVerified\":false,\"proofValid\":null,\"reason\":\"beacon not synced\"}";
-        }
-        String stateRootHex = "0x" + bytesToHex(trustedStateRoot);
-        long beaconSlot = beaconSyncState.getFinalizedSlot();
-
+                                          long nonce, String balance,
+                                          Bytes32 peerStateRoot) {
         List<byte[]> proofBytes = proofNodes.stream().map(Bytes::toArrayUnsafe).toList();
-        boolean proofValid = MerklePatriciaVerifier.verify(trustedStateRoot, address, proofBytes, nonce, balance);
-        return "{\"stateRootVerified\":true"
-                + ",\"proofValid\":" + proofValid
-                + ",\"stateRoot\":\"" + stateRootHex + "\""
-                + ",\"beaconSlot\":" + beaconSlot + "}";
+
+        // Verify against the peer's state root (the root the proof was actually built for)
+        boolean peerProofValid = false;
+        String peerStateRootHex = null;
+        if (peerStateRoot != null && !proofBytes.isEmpty()) {
+            peerProofValid = MerklePatriciaVerifier.verify(
+                    peerStateRoot.toArrayUnsafe(), address, proofBytes, nonce, balance);
+            peerStateRootHex = peerStateRoot.toHexString();
+        }
+
+        // Verify against the beacon-verified state root
+        byte[] trustedStateRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+        boolean beaconProofValid = false;
+        String beaconStateRootHex = null;
+        long beaconSlot = beaconSyncState.getFinalizedSlot();
+        if (trustedStateRoot != null && !proofBytes.isEmpty()) {
+            beaconProofValid = MerklePatriciaVerifier.verify(
+                    trustedStateRoot, address, proofBytes, nonce, balance);
+            beaconStateRootHex = "0x" + bytesToHex(trustedStateRoot);
+        }
+
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"peerProofValid\":").append(peerProofValid);
+        if (peerStateRootHex != null) {
+            sb.append(",\"peerStateRoot\":\"").append(peerStateRootHex).append("\"");
+        }
+        sb.append(",\"beaconProofValid\":").append(beaconProofValid);
+        if (beaconStateRootHex != null) {
+            sb.append(",\"beaconStateRoot\":\"").append(beaconStateRootHex).append("\"");
+        }
+        sb.append(",\"beaconSynced\":").append(trustedStateRoot != null);
+        sb.append(",\"beaconSlot\":").append(beaconSlot);
+        sb.append("}");
+        return sb.toString();
     }
 
     private static String bytesToHex(byte[] bytes) {

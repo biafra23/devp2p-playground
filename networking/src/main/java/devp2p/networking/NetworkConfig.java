@@ -95,9 +95,9 @@ public record NetworkConfig(
             new byte[]{0x05, 0x00, 0x00, 0x00},
             // CL peer multiaddrs: local Lighthouse (public IP), then bootstrap ENRs
             prependLocal(
-                    "/ip4/188.68.32.16/tcp/9100/p2p/16Uiu2HAm5AH9YsNjHqLsQofyd1WUBVxyPY5cPC8Sec3gVwJPU7wD",
+                    "/ip4/127.0.0.1/tcp/9100/p2p/16Uiu2HAm4xKf6UtiNS9SutU6S5gXxRFueism7xHVZXhc6WzWzuRw",
                     enrsToMultiaddrs(MAINNET_CL_BOOTSTRAP_ENRS)),
-            "http://172.17.0.1:5052"
+            "http://localhost:5052"
     );
 
     public static final NetworkConfig SEPOLIA = new NetworkConfig(

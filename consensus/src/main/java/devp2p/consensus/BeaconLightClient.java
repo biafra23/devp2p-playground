@@ -123,8 +123,13 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 0: discover peers from beacon API before attempting connections
         discoverPeersFromBeaconApi();
 
-        // Phase 1: try seeding from a finality update (single attempt)
-        seedFromFinalityUpdate();
+        // Phase 1: try beacon HTTP API first (fast, no P2P overhead)
+        seedFromBeaconApi();
+
+        // Phase 1b: fall back to P2P seeding if HTTP API unavailable
+        if (!syncState.isSynced()) {
+            seedFromFinalityUpdate();
+        }
 
         // Phase 2: steady-state poll loop — one slot = 12 seconds.
         // If not yet synced, each cycle disconnects stale connections and retries.
@@ -300,17 +305,90 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * Fetch finality update from the local beacon node's HTTP API and seed sync state.
+     * This is a fallback when P2P-based seeding fails (e.g. peer returns empty response).
+     */
+    private void seedFromBeaconApi() {
+        if (beaconApiUrl == null || beaconApiUrl.isEmpty()) return;
+        try {
+            log.info("[beacon] Attempting seed from beacon HTTP API: {}", beaconApiUrl);
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(beaconApiUrl + "/eth/v1/beacon/light_client/finality_update"))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                log.warn("[beacon] Beacon API finality update returned status {}", response.statusCode());
+                return;
+            }
+
+            String body = response.body();
+
+            // Extract finalized_header.execution.state_root from JSON
+            Pattern stateRootPattern = Pattern.compile(
+                    "\"finalized_header\"\\s*:\\s*\\{.*?\"execution\"\\s*:\\s*\\{.*?\"state_root\"\\s*:\\s*\"(0x[0-9a-fA-F]{64})\"",
+                    Pattern.DOTALL);
+            Matcher srMatcher = stateRootPattern.matcher(body);
+            if (!srMatcher.find()) {
+                log.warn("[beacon] Could not extract execution state root from beacon API response");
+                return;
+            }
+            String stateRootHex = srMatcher.group(1);
+            byte[] executionStateRoot = hexToBytes(stateRootHex);
+
+            // Extract finalized_header.beacon.slot
+            Pattern slotPattern = Pattern.compile(
+                    "\"finalized_header\"\\s*:\\s*\\{\\s*\"beacon\"\\s*:\\s*\\{.*?\"slot\"\\s*:\\s*\"(\\d+)\"",
+                    Pattern.DOTALL);
+            Matcher slotMatcher = slotPattern.matcher(body);
+            if (!slotMatcher.find()) {
+                log.warn("[beacon] Could not extract finalized slot from beacon API response");
+                return;
+            }
+            long finalizedSlot = Long.parseLong(slotMatcher.group(1));
+
+            // Extract signature_slot
+            Pattern sigSlotPattern = Pattern.compile("\"signature_slot\"\\s*:\\s*\"(\\d+)\"");
+            Matcher sigSlotMatcher = sigSlotPattern.matcher(body);
+            long signatureSlot = sigSlotMatcher.find() ? Long.parseLong(sigSlotMatcher.group(1)) : finalizedSlot + 1;
+
+            syncState.update(finalizedSlot, executionStateRoot, signatureSlot);
+            log.info("[beacon] Seeded from beacon HTTP API, finalizedSlot={}, stateRoot={}",
+                    finalizedSlot, stateRootHex);
+
+        } catch (Exception e) {
+            log.warn("[beacon] Beacon API finality seed failed: {}", e.getMessage());
+        }
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        String clean = hex.startsWith("0x") ? hex.substring(2) : hex;
+        byte[] bytes = new byte[clean.length() / 2];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) Integer.parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+    }
+
+    /**
      * Poll for a finality update from each peer in order. Stops at the first
      * successfully applied update. Logs debug-level failures for individual peers.
      */
     private void pollFinalityUpdate() {
         if (!store.isInitialized() && !syncState.isSynced()) {
-            // Not bootstrapped and no seed yet — discover new peers, disconnect stale, retry
+            // Not bootstrapped and no seed yet — try HTTP API first, then P2P
             discoverPeersFromBeaconApi();
-            for (String peer : List.copyOf(clPeerMultiaddrs)) {
-                p2pService.disconnectPeer(peer);
+            seedFromBeaconApi();
+            if (!syncState.isSynced()) {
+                for (String peer : List.copyOf(clPeerMultiaddrs)) {
+                    p2pService.disconnectPeer(peer);
+                }
+                seedFromFinalityUpdate();
             }
-            seedFromFinalityUpdate();
             return;
         }
 

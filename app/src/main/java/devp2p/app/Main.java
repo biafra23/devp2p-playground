@@ -66,8 +66,7 @@ public final class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
 
-    private static final int UDP_PORT = 30303;
-    private static final int TCP_PORT = 30303;
+    private static final int DEFAULT_PORT = 30303;
     private static final long BACKOFF_INCOMPATIBLE_MS = 10 * 60 * 1000L; // 10 min for wrong-chain peers
     private static final long BACKOFF_TRANSIENT_MS = 30 * 1000L; // 30s for transient failures (too many peers, etc.)
 
@@ -91,12 +90,15 @@ public final class Main {
     }
 
     public static void main(String[] args) throws Exception {
-        // Parse --network flag from anywhere in args
+        // Parse --network and --port flags from anywhere in args
         String networkName = "mainnet";
+        int port = DEFAULT_PORT;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
                 networkName = args[++i];
+            } else if ("--port".equals(args[i]) && i + 1 < args.length) {
+                port = Integer.parseInt(args[++i]);
             } else {
                 remaining.add(args[i]);
             }
@@ -134,7 +136,7 @@ public final class Main {
         } else {
             // ── Daemon mode ──────────────────────────────────────────────────
             NetworkConfig network = NetworkConfig.byName(networkName);
-            runDaemon(socketPath, lockPath, network);
+            runDaemon(socketPath, lockPath, network, port);
         }
     }
 
@@ -142,7 +144,7 @@ public final class Main {
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network) throws Exception {
+    private static void runDaemon(Path socketPath, Path lockPath, NetworkConfig network, int port) throws Exception {
         log.info("=== devp2p Playground Daemon ({}) ===", network.name());
         log.info("IPC socket: {}", socketPath);
 
@@ -172,7 +174,7 @@ public final class Main {
         Set<String> attempted = ConcurrentHashMap.newKeySet();
         Map<String, Long> backoff = new ConcurrentHashMap<>();
         Set<String> blacklistedNodeIds = ConcurrentHashMap.newKeySet();
-        RLPxConnector connector = new RLPxConnector(nodeKey, TCP_PORT, network, headers -> {
+        RLPxConnector connector = new RLPxConnector(nodeKey, port, network, headers -> {
             if (!headers.isEmpty()) {
                 log.info("\n=== BLOCK HEADERS RECEIVED ===");
                 for (BlockHeadersMessage.VerifiedHeader vh : headers) {
@@ -246,11 +248,11 @@ public final class Main {
         });
 
         try {
-            discV4.start(UDP_PORT);
+            discV4.start(port);
         } catch (Exception e) {
             Throwable cause = e instanceof BindException ? e : e.getCause();
             if (cause instanceof BindException) {
-                System.err.println("Cannot bind UDP port " + UDP_PORT + ": " + cause.getMessage());
+                System.err.println("Cannot bind UDP port " + port + ": " + cause.getMessage());
                 System.err.println("Is another instance already running?");
             } else {
                 System.err.println("Failed to start discovery: " + e.getMessage());
@@ -260,7 +262,7 @@ public final class Main {
             System.exit(1);
             return;
         }
-        log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", UDP_PORT);
+        log.info("[daemon] discv4 started on UDP port {}. Waiting for peers...", port);
 
         // 7. Beacon light client (consensus layer, runs on virtual thread)
         BeaconSyncState beaconSyncState = new BeaconSyncState();

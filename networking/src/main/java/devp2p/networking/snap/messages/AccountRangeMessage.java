@@ -45,7 +45,19 @@ public final class AccountRangeMessage {
         Bytes32 codeHash
     ) {}
 
-    public record DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof) {}
+    public record DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof,
+                                   Bytes32 stateRoot) {
+
+        /** Create a DecodeResult without a state root (decoded from wire). */
+        public DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof) {
+            this(requestId, accounts, proof, null);
+        }
+
+        /** Return a copy with the given state root attached. */
+        public DecodeResult withStateRoot(Bytes32 root) {
+            return new DecodeResult(requestId, accounts, proof, root);
+        }
+    }
 
     /**
      * Extract just the request ID from the raw RLP without fully decoding.

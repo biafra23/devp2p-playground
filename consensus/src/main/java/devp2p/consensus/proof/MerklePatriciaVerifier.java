@@ -34,6 +34,8 @@ import java.util.List;
  */
 public class MerklePatriciaVerifier {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(MerklePatriciaVerifier.class);
+
     private MerklePatriciaVerifier() {}
 
     /**
@@ -67,6 +69,8 @@ public class MerklePatriciaVerifier {
             // Verify this node's hash matches what we expect
             byte[] nodeHash = keccak256(nodeRlp);
             if (!Arrays.equals(nodeHash, expectedNodeHash)) {
+                log.debug("[proof] Node {} hash mismatch: expected={} got={} nodeLen={}",
+                    i, hex(expectedNodeHash), hex(nodeHash), nodeRlp.length);
                 return false; // hash mismatch in proof chain
             }
 
@@ -175,6 +179,8 @@ public class MerklePatriciaVerifier {
 
         // If we've iterated through all nodes without returning true from a leaf,
         // the proof is incomplete
+        log.debug("[proof] Proof incomplete: iterated all {} nodes without finding leaf (nibbleOffset={})",
+            proofNodes.size(), nibbleOffset);
         return false;
     }
 
@@ -450,5 +456,13 @@ public class MerklePatriciaVerifier {
      */
     private static byte[] keccak256(byte[] input) {
         return Hash.keccak256(Bytes.wrap(input)).toArrayUnsafe();
+    }
+
+    private static String hex(byte[] bytes) {
+        if (bytes == null) return "null";
+        StringBuilder sb = new StringBuilder("0x");
+        for (int i = 0; i < Math.min(bytes.length, 8); i++) sb.append(String.format("%02x", bytes[i]));
+        if (bytes.length > 8) sb.append("...");
+        return sb.toString();
     }
 }

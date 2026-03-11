@@ -25,6 +25,11 @@ tasks.register<JavaExec>("run") {
         appArgs.add("--network")
         appArgs.add(networkArg)
     }
+    val portArg = project.findProperty("port") as String?
+    if (portArg != null) {
+        appArgs.add("--port")
+        appArgs.add(portArg)
+    }
     val cmdArgs = (project.findProperty("args") as String?)
         ?.split("\\s+".toRegex())
         ?.filter { it.isNotEmpty() }

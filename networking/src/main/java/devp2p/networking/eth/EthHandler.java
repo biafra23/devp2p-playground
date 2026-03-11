@@ -554,6 +554,22 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * @return future completing with the AccountRange decode result, or null if not READY
      */
     public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
+            org.apache.tuweni.bytes.Bytes address,
+            org.apache.tuweni.bytes.Bytes32 explicitStateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        org.apache.tuweni.bytes.Bytes32 accountHash =
+            org.apache.tuweni.crypto.Hash.keccak256(address);
+
+        log.info("[snap] Using explicit stateRoot={} for account query", explicitStateRoot.toShortHexString());
+        return sendGetAccountRange(ctx, accountHash, explicitStateRoot)
+            .orTimeout(10, TimeUnit.SECONDS);
+    }
+
+    public CompletableFuture<AccountRangeMessage.DecodeResult> requestAccountAsync(
             org.apache.tuweni.bytes.Bytes address) {
         ChannelHandlerContext ctx = readyCtx;
         if (ctx == null || state != State.READY) return null;
@@ -590,7 +606,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 .orTimeout(10, TimeUnit.SECONDS)
                 .whenComplete((r, ex) -> {
                     if (ex != null) result.completeExceptionally(ex);
-                    else result.complete(r);
+                    else result.complete(r.withStateRoot(freshStateRoot));
                 });
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed: {}", remoteAddress, ex.getMessage());
