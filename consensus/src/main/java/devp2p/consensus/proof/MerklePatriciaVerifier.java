@@ -56,11 +56,46 @@ public class MerklePatriciaVerifier {
         if (stateRoot == null || stateRoot.length != 32) return false;
         if (address == null || address.length != 20) return false;
 
-        // The key path is keccak256(address), as 64 nibbles
-        byte[] keyHash = keccak256(address); // 32 bytes = 64 nibbles
-        byte[] nibbles = toNibbles(keyHash);  // 64 nibbles
+        byte[] keyHash = keccak256(address);
+        byte[] leafValue = traverseProof(stateRoot, keyHash, proofNodes);
+        if (leafValue == null) return false;
+        return verifyAccountValue(leafValue, expectedNonce, expectedBalance);
+    }
 
-        byte[] expectedNodeHash = stateRoot;
+    /**
+     * Verify a storage proof against an account's storage root.
+     *
+     * <p>The storage trie uses the same Merkle-Patricia structure as the account trie,
+     * but is rooted at the account's {@code storageRoot} instead of the block's {@code stateRoot}.
+     * The key path is {@code keccak256(storageSlotKey)} where {@code storageSlotKey} is
+     * the 32-byte storage key (e.g. {@code keccak256(abi.encode(address, uint256(slot)))} for mappings).
+     *
+     * @param storageRoot    32-byte storage root from the account
+     * @param storageSlotKey 32-byte storage slot key (pre-computed, NOT hashed yet)
+     * @param proofNodes     list of RLP-encoded trie nodes forming the proof path
+     * @return the raw storage value bytes, or null if the proof is invalid or the slot is empty
+     */
+    public static byte[] verifyStorageProof(byte[] storageRoot, byte[] storageSlotKey,
+                                             List<byte[]> proofNodes) {
+        if (proofNodes == null || proofNodes.isEmpty()) return null;
+        if (storageRoot == null || storageRoot.length != 32) return null;
+        if (storageSlotKey == null || storageSlotKey.length != 32) return null;
+
+        byte[] keyHash = keccak256(storageSlotKey);
+        return traverseProof(storageRoot, keyHash, proofNodes);
+    }
+
+    /**
+     * Traverse a Merkle-Patricia trie proof from root to leaf.
+     *
+     * @param root       32-byte expected root hash
+     * @param keyHash    32-byte keccak256 of the key (address or storage slot)
+     * @param proofNodes list of RLP-encoded trie nodes
+     * @return the raw leaf value bytes, or null if the proof is invalid
+     */
+    private static byte[] traverseProof(byte[] root, byte[] keyHash, List<byte[]> proofNodes) {
+        byte[] nibbles = toNibbles(keyHash);
+        byte[] expectedNodeHash = root;
         int nibbleOffset = 0;
 
         for (int i = 0; i < proofNodes.size(); i++) {
@@ -71,26 +106,23 @@ public class MerklePatriciaVerifier {
             if (!Arrays.equals(nodeHash, expectedNodeHash)) {
                 log.debug("[proof] Node {} hash mismatch: expected={} got={} nodeLen={}",
                     i, hex(expectedNodeHash), hex(nodeHash), nodeRlp.length);
-                return false; // hash mismatch in proof chain
+                return null; // hash mismatch in proof chain
             }
 
             // Decode the RLP node
             List<byte[]> items = decodeRlpList(nodeRlp);
-            if (items == null) return false;
+            if (items == null) return null;
 
             if (items.size() == 17) {
                 // Branch node
                 if (nibbleOffset >= nibbles.length) {
-                    // We've consumed all key nibbles — the value is in items[16]
-                    // For account proofs the leaf value shouldn't be here; this is unusual
-                    return false;
+                    return null;
                 }
                 int nibble = nibbles[nibbleOffset] & 0xFF;
                 byte[] childRef = items.get(nibble);
 
                 if (childRef == null || childRef.length == 0) {
-                    // No child in this branch — account doesn't exist
-                    return false;
+                    return null;
                 }
 
                 nibbleOffset++;
@@ -98,90 +130,72 @@ public class MerklePatriciaVerifier {
                 if (i == proofNodes.size() - 1) {
                     // Last node — if the child ref is a leaf embedded inline, handle it
                     if (childRef.length < 32) {
-                        // Inline node: childRef is the RLP of a leaf node
                         List<byte[]> leafItems = decodeRlpList(childRef);
-                        if (leafItems == null || leafItems.size() != 2) return false;
-                        return verifyLeaf(leafItems, nibbles, nibbleOffset,
-                                expectedNonce, expectedBalance);
+                        if (leafItems == null || leafItems.size() != 2) return null;
+                        return verifyLeafAndExtract(leafItems, nibbles, nibbleOffset);
                     }
-                    // Otherwise: we'd need one more node in the proof, but the list ended
-                    return false;
+                    return null;
                 } else {
-                    // Follow the child reference into the next proof node
                     if (childRef.length == 32) {
                         expectedNodeHash = childRef;
                     } else {
-                        // Inline / embedded node: verify the next proof node IS this child
-                        // (The next node's hash should equal keccak(childRef) only if >=32 bytes;
-                        // for inline nodes, the RLP is embedded directly — the next proof node
-                        // should match childRef exactly)
                         if (!Arrays.equals(proofNodes.get(i + 1), childRef)) {
-                            return false;
+                            return null;
                         }
                         expectedNodeHash = keccak256(childRef);
                     }
                 }
 
             } else if (items.size() == 2) {
-                // Extension or leaf node
                 byte[] encodedPath = items.get(0);
                 byte[] value = items.get(1);
 
-                if (encodedPath == null || encodedPath.length == 0) return false;
+                if (encodedPath == null || encodedPath.length == 0) return null;
 
                 int firstHalfByte = (encodedPath[0] & 0xFF) >> 4;
                 boolean isLeaf = (firstHalfByte == 2) || (firstHalfByte == 3);
                 boolean isOdd = (firstHalfByte & 1) == 1;
 
-                // Decode the nibbles embedded in this node's compact-encoded path
                 byte[] nodeNibbles = compactToNibbles(encodedPath, isOdd);
 
-                // Verify the path nibbles match our key's current position
                 if (nibbleOffset + nodeNibbles.length > nibbles.length) {
-                    return false; // path in proof is longer than remaining key
+                    return null;
                 }
                 for (int j = 0; j < nodeNibbles.length; j++) {
                     if (nibbles[nibbleOffset + j] != nodeNibbles[j]) {
-                        return false; // path mismatch
+                        return null;
                     }
                 }
                 nibbleOffset += nodeNibbles.length;
 
                 if (isLeaf) {
-                    // Verify we've consumed exactly all key nibbles
                     if (nibbleOffset != nibbles.length) {
-                        return false; // remaining key doesn't match
+                        return null;
                     }
-                    // value is the RLP-encoded account
-                    return verifyAccountValue(value, expectedNonce, expectedBalance);
+                    return value;
 
                 } else {
-                    // Extension node — follow the reference to the next node
                     if (i == proofNodes.size() - 1) {
-                        return false; // extension at end of proof — missing next node
+                        return null;
                     }
 
                     if (value.length == 32) {
                         expectedNodeHash = value;
                     } else {
-                        // Inline child
                         if (!Arrays.equals(proofNodes.get(i + 1), value)) {
-                            return false;
+                            return null;
                         }
                         expectedNodeHash = keccak256(value);
                     }
                 }
             } else {
-                // Neither 2-item nor 17-item — invalid node structure
-                return false;
+                return null;
             }
         }
 
-        // If we've iterated through all nodes without returning true from a leaf,
-        // the proof is incomplete
         log.debug("[proof] Proof incomplete: iterated all {} nodes without finding leaf (nibbleOffset={})",
             proofNodes.size(), nibbleOffset);
-        return false;
+        return null;
     }
 
     // -------------------------------------------------------------------------
@@ -189,29 +203,28 @@ public class MerklePatriciaVerifier {
     // -------------------------------------------------------------------------
 
     /**
-     * Verify a leaf node: check path matches remaining nibbles, then decode the account.
+     * Verify a leaf node path matches remaining nibbles, and extract the value.
      */
-    private static boolean verifyLeaf(List<byte[]> leafItems, byte[] nibbles, int nibbleOffset,
-                                       long expectedNonce, String expectedBalance) {
+    private static byte[] verifyLeafAndExtract(List<byte[]> leafItems, byte[] nibbles, int nibbleOffset) {
         byte[] encodedPath = leafItems.get(0);
         byte[] value = leafItems.get(1);
 
-        if (encodedPath == null || encodedPath.length == 0) return false;
+        if (encodedPath == null || encodedPath.length == 0) return null;
 
         int firstHalfByte = (encodedPath[0] & 0xFF) >> 4;
         boolean isLeaf = (firstHalfByte == 2) || (firstHalfByte == 3);
-        if (!isLeaf) return false;
+        if (!isLeaf) return null;
 
         boolean isOdd = (firstHalfByte & 1) == 1;
         byte[] nodeNibbles = compactToNibbles(encodedPath, isOdd);
 
         // Verify path matches remaining nibbles
-        if (nibbleOffset + nodeNibbles.length != nibbles.length) return false;
+        if (nibbleOffset + nodeNibbles.length != nibbles.length) return null;
         for (int j = 0; j < nodeNibbles.length; j++) {
-            if (nibbles[nibbleOffset + j] != nodeNibbles[j]) return false;
+            if (nibbles[nibbleOffset + j] != nodeNibbles[j]) return null;
         }
 
-        return verifyAccountValue(value, expectedNonce, expectedBalance);
+        return value;
     }
 
     /**

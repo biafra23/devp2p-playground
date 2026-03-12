@@ -639,29 +639,38 @@ public class BeaconP2PService implements AutoCloseable {
                     }
 
                     if (channelFullyClosed) {
-                        // Channel already inactive — all buffered data has been delivered.
-                        // Complete immediately (ctx.executor().schedule() is unreliable on
-                        // inactive channels).
-                        if (responseBuffer.size() > 0) {
-                            log.debug("[beacon-p2p] Completing response (channel closed): {} bytes",
-                                    responseBuffer.size());
-                            responseFuture.complete(responseBuffer.toByteArray());
-                        }
+                        // Channel is inactive but buffered data is still being delivered
+                        // in multiple batches (e.g., 1+4+3+10 bytes, then 25680 bytes
+                        // arriving ~40ms later). Use a short delay to accumulate all
+                        // buffered reads before completing.
+                        var prevClosed = completionTimer;
+                        if (prevClosed != null) prevClosed.cancel(false);
+                        completionTimer = ctx.executor().schedule(() -> {
+                            if (!responseFuture.isDone() && responseBuffer.size() > 0) {
+                                log.debug("[beacon-p2p] Completing response (post-close timer): {} bytes",
+                                        responseBuffer.size());
+                                responseFuture.complete(responseBuffer.toByteArray());
+                            }
+                        }, 150, java.util.concurrent.TimeUnit.MILLISECONDS);
                         super.channelReadComplete(ctx);
                         return;
                     }
 
-                    // Reset the completion timer — complete 200ms after the last
-                    // read batch arrives (we can't predict compressed size).
+                    // Don't use a short timer — large responses (e.g. bootstrap ~25KB)
+                    // can arrive in multiple TCP segments spaced >200ms apart, which
+                    // would cause premature completion with truncated data.
+                    // Instead, rely on channelInactive (stream close) to complete.
+                    // Use a long safety timer (5s) only as a fallback for muxer
+                    // implementations that don't reliably fire channelInactive.
                     var prev = completionTimer;
                     if (prev != null) prev.cancel(false);
                     completionTimer = ctx.executor().schedule(() -> {
                         if (!responseFuture.isDone() && responseBuffer.size() > 0) {
-                            log.debug("[beacon-p2p] Completing response (timer): {} bytes",
+                            log.debug("[beacon-p2p] Completing response (safety timer): {} bytes",
                                     responseBuffer.size());
                             responseFuture.complete(responseBuffer.toByteArray());
                         }
-                    }, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    }, 5000, java.util.concurrent.TimeUnit.MILLISECONDS);
                     super.channelReadComplete(ctx);
                 }
 
@@ -669,13 +678,16 @@ public class BeaconP2PService implements AutoCloseable {
                 public void channelInactive(ChannelHandlerContext ctx) throws Exception {
                     log.debug("[beacon-p2p] channelInactive fired, buffer size={}, dataReceived={}, writeClosedOnly={}",
                             responseBuffer.size(), dataReceived, writeClosedOnly);
-                    if (writeClosedOnly) {
+                    if (writeClosedOnly && !dataReceived) {
                         // This channelInactive is from our closeWrite(), not a full close.
                         // Ignore it — data may still arrive on the read side.
+                        // Only ignore if no data received yet — if data already arrived,
+                        // the remote has responded and this is a real close.
                         writeClosedOnly = false;
                         super.channelInactive(ctx);
                         return;
                     }
+                    writeClosedOnly = false;
                     // Mark channel as fully closed — any subsequent channelRead0
                     // calls are delivering buffered data and should complete immediately.
                     channelFullyClosed = true;

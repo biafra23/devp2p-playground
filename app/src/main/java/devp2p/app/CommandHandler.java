@@ -11,6 +11,7 @@ import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
 import devp2p.networking.rlpx.RLPxConnector;
 import devp2p.networking.snap.messages.AccountRangeMessage;
+import devp2p.networking.snap.messages.StorageRangesMessage;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
@@ -70,6 +71,7 @@ public class CommandHandler {
                 case "get-headers"   -> handleGetHeaders(jsonLine);
                 case "get-block"     -> handleGetBlock(jsonLine);
                 case "get-account"   -> handleGetAccount(jsonLine);
+                case "get-storage"   -> handleGetStorage(jsonLine);
                 case "dial"          -> handleDial(jsonLine);
                 case "stop"          -> handleStop();
                 case "beacon-status" -> handleBeaconStatus();
@@ -161,10 +163,10 @@ public class CommandHandler {
                 first = false;
                 BlockHeader h = vh.header();
                 sb.append("{\"number\":").append(h.number)
-                  .append(",\"hash\":\"0x").append(vh.hash().toHexString()).append("\"")
-                  .append(",\"parentHash\":\"0x").append(h.parentHash.toHexString()).append("\"")
-                  .append(",\"stateRoot\":\"0x").append(h.stateRoot.toHexString()).append("\"")
-                  .append(",\"transactionsRoot\":\"0x").append(h.transactionsRoot.toHexString()).append("\"")
+                  .append(",\"hash\":\"").append(vh.hash().toHexString()).append("\"")
+                  .append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"")
+                  .append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"")
+                  .append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"")
                   .append(",\"timestamp\":").append(h.timestamp)
                   .append(",\"gasUsed\":").append(h.gasUsed)
                   .append(",\"gasLimit\":").append(h.gasLimit);
@@ -210,10 +212,10 @@ public class CommandHandler {
             StringBuilder sb = new StringBuilder();
             sb.append("{\"ok\":true,\"block\":{");
             sb.append("\"number\":").append(h.number);
-            sb.append(",\"hash\":\"0x").append(vh.hash().toHexString()).append("\"");
-            sb.append(",\"parentHash\":\"0x").append(h.parentHash.toHexString()).append("\"");
-            sb.append(",\"stateRoot\":\"0x").append(h.stateRoot.toHexString()).append("\"");
-            sb.append(",\"transactionsRoot\":\"0x").append(h.transactionsRoot.toHexString()).append("\"");
+            sb.append(",\"hash\":\"").append(vh.hash().toHexString()).append("\"");
+            sb.append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"");
+            sb.append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"");
+            sb.append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"");
             sb.append(",\"timestamp\":").append(h.timestamp);
             sb.append(",\"gasUsed\":").append(h.gasUsed);
             sb.append(",\"gasLimit\":").append(h.gasLimit);
@@ -253,7 +255,7 @@ public class CommandHandler {
             StringBuilder proofSb = new StringBuilder("[");
             for (int i = 0; i < result.proof().size(); i++) {
                 if (i > 0) proofSb.append(",");
-                proofSb.append("\"0x").append(result.proof().get(i).toHexString()).append("\"");
+                proofSb.append("\"").append(result.proof().get(i).toHexString()).append("\"");
             }
             proofSb.append("]");
             String proofJson = proofSb.toString();
@@ -263,7 +265,7 @@ public class CommandHandler {
             String verificationJson = buildVerificationJson(address.toArrayUnsafe(), result.proof(),
                     found != null ? found.nonce() : -1,
                     found != null ? found.balance().toString() : null,
-                    result.stateRoot());
+                    result.stateRoot(), result.blockNumber());
 
             if (found == null) {
                 return "{\"ok\":true,\"exists\":false"
@@ -274,13 +276,205 @@ public class CommandHandler {
             }
             return "{\"ok\":true,\"exists\":true"
                 + ",\"address\":\"" + addr + "\""
-                + ",\"accountHash\":\"0x" + found.accountHash().toHexString() + "\""
+                + ",\"accountHash\":\"" + found.accountHash().toHexString() + "\""
                 + ",\"nonce\":" + found.nonce()
                 + ",\"balance\":\"" + found.balance() + "\""
-                + ",\"storageRoot\":\"0x" + found.storageRoot().toHexString() + "\""
-                + ",\"codeHash\":\"0x" + found.codeHash().toHexString() + "\""
+                + ",\"storageRoot\":\"" + found.storageRoot().toHexString() + "\""
+                + ",\"codeHash\":\"" + found.codeHash().toHexString() + "\""
                 + ",\"proof\":" + proofJson
                 + ",\"verification\":" + verificationJson + "}";
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            return jsonError(msg);
+        }
+    }
+
+    private String handleGetStorage(String jsonLine) {
+        String addr = extractString(jsonLine, "address");
+        String slotStr = extractString(jsonLine, "slot");
+        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
+        if (hex.length() != 40) {
+            return jsonError("address must be a 20-byte hex string (40 hex chars)");
+        }
+        Bytes contractAddress = Bytes.fromHexString(hex);
+
+        // Parse slot number
+        long slotNumber;
+        try {
+            slotNumber = Long.parseLong(slotStr);
+        } catch (NumberFormatException e) {
+            return jsonError("slot must be a number");
+        }
+
+        // Check if a holder address is provided (for ERC-20 mapping lookups)
+        String holderAddr = null;
+        try { holderAddr = extractString(jsonLine, "holder"); } catch (Exception ignored) {}
+
+        // Compute the storage key
+        byte[] storageSlotKey;
+        if (holderAddr != null) {
+            // ERC-20 mapping: keccak256(abi.encode(holderAddress, uint256(slot)))
+            String holderHex = (holderAddr.startsWith("0x") || holderAddr.startsWith("0X"))
+                    ? holderAddr.substring(2) : holderAddr;
+            if (holderHex.length() != 40) {
+                return jsonError("holder must be a 20-byte hex string (40 hex chars)");
+            }
+            byte[] holderBytes = Bytes.fromHexString(holderHex).toArrayUnsafe();
+            byte[] encoded = new byte[64];
+            // Left-pad holder address to 32 bytes
+            System.arraycopy(holderBytes, 0, encoded, 12, 20);
+            // uint256(slot) as 32 bytes big-endian
+            encoded[63] = (byte) (slotNumber);
+            encoded[62] = (byte) (slotNumber >>> 8);
+            encoded[61] = (byte) (slotNumber >>> 16);
+            encoded[60] = (byte) (slotNumber >>> 24);
+            encoded[59] = (byte) (slotNumber >>> 32);
+            encoded[58] = (byte) (slotNumber >>> 40);
+            encoded[57] = (byte) (slotNumber >>> 48);
+            encoded[56] = (byte) (slotNumber >>> 56);
+            storageSlotKey = Hash.keccak256(Bytes.wrap(encoded)).toArrayUnsafe();
+        } else {
+            // Direct slot access: key = uint256(slot) as 32 bytes big-endian
+            byte[] slotBytes = new byte[32];
+            slotBytes[31] = (byte) (slotNumber);
+            slotBytes[30] = (byte) (slotNumber >>> 8);
+            slotBytes[29] = (byte) (slotNumber >>> 16);
+            slotBytes[28] = (byte) (slotNumber >>> 24);
+            slotBytes[27] = (byte) (slotNumber >>> 32);
+            slotBytes[26] = (byte) (slotNumber >>> 40);
+            slotBytes[25] = (byte) (slotNumber >>> 48);
+            slotBytes[24] = (byte) (slotNumber >>> 56);
+            storageSlotKey = slotBytes;
+        }
+
+        Bytes32 storageKeyHash = Hash.keccak256(Bytes.wrap(storageSlotKey));
+
+        try {
+            // Step 1: fetch the account to get storageRoot
+            // Use peer's fresh state root to avoid pruning issues —
+            // peers prune state beyond ~128 blocks, so a beacon-finalized root
+            // (6+ min old) is usually too stale for them to serve.
+            Bytes32 accountHash = Hash.keccak256(contractAddress);
+            AccountRangeMessage.DecodeResult accountResult =
+                connector.requestAccount(contractAddress).get(30, TimeUnit.SECONDS);
+            AccountRangeMessage.AccountData account = accountResult.accounts().stream()
+                .filter(a -> a.accountHash().equals(accountHash))
+                .findFirst().orElse(null);
+            if (account == null) {
+                return jsonError("Contract account not found");
+            }
+            Bytes32 storageRoot = account.storageRoot();
+
+            // Step 2: fetch storage slot using the same peer state root for consistency
+            Bytes32 snapStateRoot = accountResult.stateRoot();
+            StorageRangesMessage.DecodeResult storageResult =
+                connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
+                    .get(30, TimeUnit.SECONDS);
+
+            // Find matching slot
+            StorageRangesMessage.StorageData found = storageResult.slots().stream()
+                .filter(s -> s.slotHash().equals(storageKeyHash))
+                .findFirst().orElse(null);
+
+            // Build proof array
+            StringBuilder proofSb = new StringBuilder("[");
+            for (int i = 0; i < storageResult.proof().size(); i++) {
+                if (i > 0) proofSb.append(",");
+                proofSb.append("\"").append(storageResult.proof().get(i).toHexString()).append("\"");
+            }
+            proofSb.append("]");
+
+            // Verify storage proof against storageRoot
+            boolean storageProofValid = false;
+            if (!storageResult.proof().isEmpty()) {
+                List<byte[]> proofBytes = storageResult.proof().stream()
+                    .map(Bytes::toArrayUnsafe).toList();
+                byte[] leafValue = MerklePatriciaVerifier.verifyStorageProof(
+                    storageRoot.toArrayUnsafe(), storageSlotKey, proofBytes);
+                storageProofValid = (leafValue != null);
+            }
+
+            // Verify account's state root against beacon state
+            boolean beaconChainVerified = false;
+            boolean blsVerified = false;
+            long matchedSlot = -1;
+            String verifyMethod = null;
+            Bytes32 usedStateRoot = accountResult.stateRoot();
+            if (usedStateRoot != null) {
+                BeaconSyncState.SlottedStateRoot match =
+                    beaconSyncState.findStateRoot(usedStateRoot.toArrayUnsafe());
+                if (match != null) {
+                    beaconChainVerified = true;
+                    matchedSlot = match.slot();
+                    blsVerified = match.blsVerified();
+                    verifyMethod = "stateRootMatch";
+                }
+            }
+
+            // Header chain verification fallback
+            long peerBlockNumber = accountResult.blockNumber();
+            if (!beaconChainVerified && storageProofValid && beaconSyncState.isSynced()
+                    && peerBlockNumber > 0 && usedStateRoot != null) {
+                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+                byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+                if (finalizedBlockNum > 0 && beaconRoot != null
+                        && peerBlockNumber > finalizedBlockNum) {
+                    try {
+                        boolean chainValid = verifyHeaderChainBatched(
+                                finalizedBlockNum, peerBlockNumber, beaconRoot,
+                                usedStateRoot.toArrayUnsafe());
+                        if (chainValid) {
+                            beaconChainVerified = true;
+                            matchedSlot = beaconSyncState.getFinalizedSlot();
+                            blsVerified = true;
+                            verifyMethod = "headerChain";
+                        }
+                    } catch (Exception e) {
+                        log.debug("[verify] Header chain verification failed: {}", e.getMessage());
+                    }
+                }
+            }
+
+            String valueHex = found != null ? found.slotValue().toHexString() : null;
+            java.math.BigInteger valueInt = null;
+            if (found != null && !found.slotValue().isEmpty()) {
+                valueInt = new java.math.BigInteger(1, found.slotValue().toArrayUnsafe());
+            }
+
+            StringBuilder sb = new StringBuilder("{\"ok\":true");
+            sb.append(",\"address\":\"").append(addr).append("\"");
+            sb.append(",\"slot\":").append(slotNumber);
+            if (holderAddr != null) {
+                sb.append(",\"holder\":\"").append(holderAddr).append("\"");
+            }
+            sb.append(",\"storageKey\":\"0x").append(bytesToHex(storageSlotKey)).append("\"");
+            sb.append(",\"storageKeyHash\":\"").append(storageKeyHash.toHexString()).append("\"");
+            if (found != null) {
+                sb.append(",\"exists\":true");
+                sb.append(",\"value\":\"").append(valueHex).append("\"");
+                if (valueInt != null) {
+                    sb.append(",\"valueDecimal\":\"").append(valueInt).append("\"");
+                }
+            } else {
+                sb.append(",\"exists\":false");
+                sb.append(",\"slotsReturned\":").append(storageResult.slots().size());
+            }
+            sb.append(",\"storageRoot\":\"").append(storageRoot.toHexString()).append("\"");
+            sb.append(",\"proof\":").append(proofSb);
+            sb.append(",\"verification\":{");
+            sb.append("\"storageProofValid\":").append(storageProofValid);
+            sb.append(",\"beaconSynced\":").append(beaconSyncState.isSynced());
+            sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
+            if (beaconChainVerified) {
+                sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
+                sb.append(",\"blsVerified\":").append(blsVerified);
+                if (verifyMethod != null) {
+                    sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
+                }
+            }
+            sb.append("}}");
+            return sb.toString();
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
@@ -305,6 +499,7 @@ public class CommandHandler {
                 + ",\"optimisticSlot\":" + optimisticSlot
                 + ",\"syncCommitteePeriod\":" + period
                 + ",\"executionStateRoot\":" + stateRootHex
+                + ",\"executionBlockNumber\":" + beaconSyncState.getExecutionBlockNumber()
                 + ",\"knownStateRoots\":" + beaconSyncState.getKnownStateRootCount()
                 + ",\"peers\":" + peersJson + "}";
     }
@@ -377,7 +572,7 @@ public class CommandHandler {
 
     private String buildVerificationJson(byte[] address, List<Bytes> proofNodes,
                                           long nonce, String balance,
-                                          Bytes32 peerStateRoot) {
+                                          Bytes32 peerStateRoot, long peerBlockNumber) {
         List<byte[]> proofBytes = proofNodes.stream().map(Bytes::toArrayUnsafe).toList();
 
         // Verify against the peer's state root (the root the proof was actually built for)
@@ -390,14 +585,10 @@ public class CommandHandler {
         }
 
         // Check if the peer's state root matches any beacon-attested block.
-        // This bridges the gap between the finalized root (which is ~13 min old
-        // and usually too stale to match the peer's current state) and the peer's
-        // fresh state root — by checking it against the rolling window of
-        // execution state roots seen in recent beacon headers (both finalized
-        // and attested/optimistic).
         boolean beaconChainVerified = false;
         boolean blsVerified = false;
         long matchedSlot = -1;
+        String verifyMethod = null;
         if (peerStateRoot != null) {
             BeaconSyncState.SlottedStateRoot match =
                     beaconSyncState.findStateRoot(peerStateRoot.toArrayUnsafe());
@@ -405,6 +596,33 @@ public class CommandHandler {
                 beaconChainVerified = true;
                 matchedSlot = match.slot();
                 blsVerified = match.blsVerified();
+                verifyMethod = "stateRootMatch";
+            }
+        }
+
+        // Header chain verification fallback: request block headers from the
+        // beacon-finalized block to the peer's block and verify the hash chain.
+        if (!beaconChainVerified && peerProofValid && beaconSyncState.isSynced()
+                && peerBlockNumber > 0) {
+            long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+            byte[] beaconRoot = beaconSyncState.getVerifiedExecutionStateRoot();
+            log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
+                    peerBlockNumber, finalizedBlockNum,
+                    peerBlockNumber > finalizedBlockNum ? peerBlockNumber - finalizedBlockNum : "N/A");
+            if (finalizedBlockNum > 0 && beaconRoot != null && peerBlockNumber > finalizedBlockNum) {
+                try {
+                    boolean chainValid = verifyHeaderChainBatched(
+                            finalizedBlockNum, peerBlockNumber, beaconRoot,
+                            peerStateRoot.toArrayUnsafe());
+                    if (chainValid) {
+                        beaconChainVerified = true;
+                        matchedSlot = beaconSyncState.getFinalizedSlot();
+                        blsVerified = true;
+                        verifyMethod = "headerChain";
+                    }
+                } catch (Exception e) {
+                    log.info("[verify] Header chain verification failed: {}", e.getMessage());
+                }
             }
         }
 
@@ -418,9 +636,77 @@ public class CommandHandler {
         if (beaconChainVerified) {
             sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
             sb.append(",\"blsVerified\":").append(blsVerified);
+            if (verifyMethod != null) {
+                sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
+            }
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * Verify a chain of consecutive block headers.
+     * Checks that:
+     * 1. The first header's state root matches the beacon-finalized root
+     * 2. Each header's hash equals the next header's parentHash
+     * 3. The last header's state root matches the peer's state root
+     */
+    private static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
+                                              byte[] expectedFirstStateRoot,
+                                              byte[] expectedLastStateRoot) {
+        if (headers.isEmpty()) return false;
+
+        // Check first header's state root matches beacon-finalized root
+        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
+        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
+
+        // Check last header's state root matches peer's state root
+        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
+        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
+
+        // Verify hash chain: each header's hash must equal the next header's parentHash
+        for (int i = 0; i < headers.size() - 1; i++) {
+            Bytes32 currentHash = headers.get(i).hash();
+            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
+            if (!currentHash.equals(nextParent)) {
+                log.info("[verify] Hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
+                        i, headers.get(i).header().number, currentHash.toShortHexString(),
+                        headers.get(i + 1).header().number, nextParent.toShortHexString());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Fetch headers in batches from a single peer and verify the full chain.
+     * Uses RLPxConnector.requestBlockHeadersBatched to ensure all batches
+     * come from the same peer, preventing cross-peer discontinuities.
+     */
+    private boolean verifyHeaderChainBatched(long finalizedBlock, long peerBlock,
+                                              byte[] beaconStateRoot, byte[] peerStateRoot)
+            throws Exception {
+        int total = (int) (peerBlock - finalizedBlock + 1);
+        if (total < 2 || total > 8192) {
+            log.info("[verify] Header chain gap {} blocks — out of range [2, 8192]", total);
+            return false;
+        }
+
+        log.info("[verify] Fetching {} headers from block #{} to #{}", total, finalizedBlock, peerBlock);
+        List<BlockHeadersMessage.VerifiedHeader> allHeaders =
+                connector.requestBlockHeadersBatched(finalizedBlock, total)
+                        .get(60, TimeUnit.SECONDS);
+
+        boolean valid = verifyHeaderChain(allHeaders, beaconStateRoot, peerStateRoot);
+        log.info("[verify] Full header chain ({} blocks) valid: {}", total, valid);
+        if (!valid && !allHeaders.isEmpty()) {
+            byte[] firstSR = allHeaders.get(0).header().stateRoot.toArrayUnsafe();
+            byte[] lastSR = allHeaders.get(allHeaders.size() - 1).header().stateRoot.toArrayUnsafe();
+            log.info("[verify] firstStateRoot match={}, lastStateRoot match={}",
+                    java.util.Arrays.equals(firstSR, beaconStateRoot),
+                    java.util.Arrays.equals(lastSR, peerStateRoot));
+        }
+        return valid;
     }
 
     private static String bytesToHex(byte[] bytes) {

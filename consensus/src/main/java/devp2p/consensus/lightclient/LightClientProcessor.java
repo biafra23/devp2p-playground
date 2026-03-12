@@ -4,6 +4,8 @@ import devp2p.consensus.ssz.SszUtil;
 import devp2p.consensus.types.LightClientFinalityUpdate;
 import devp2p.consensus.types.LightClientUpdate;
 import devp2p.consensus.types.SyncCommittee;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Processes light client updates against a {@link LightClientStore}.
@@ -12,6 +14,8 @@ import devp2p.consensus.types.SyncCommittee;
  * advancing the finalized and optimistic headers in the store.
  */
 public class LightClientProcessor {
+
+    private static final Logger log = LoggerFactory.getLogger(LightClientProcessor.class);
 
     private final LightClientStore store;
     private final byte[] forkVersion;
@@ -39,8 +43,17 @@ public class LightClientProcessor {
     public boolean processFinalityUpdate(LightClientFinalityUpdate update) {
         SyncCommittee committee = store.getCurrentSyncCommittee();
         if (committee == null) {
+            log.debug("[lc-processor] Finality update rejected: no current sync committee");
             return false;
         }
+
+        long attestedSlot = update.attestedHeader().beacon().slot();
+        long finalizedSlot = update.finalizedHeader().beacon().slot();
+        int participation = update.syncAggregate().countParticipants();
+        log.debug("[lc-processor] Processing finality update: attestedSlot={}, finalizedSlot={}, " +
+                "signatureSlot={}, participation={}/512, finalityBranchLen={}",
+                attestedSlot, finalizedSlot, update.signatureSlot(),
+                participation, update.finalityBranch().length);
 
         // Verify sync aggregate over attested header
         if (!SyncCommitteeVerifier.verify(
@@ -49,26 +62,38 @@ public class LightClientProcessor {
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
+            log.debug("[lc-processor] Finality update rejected: BLS verification failed " +
+                    "(attestedSlot={}, forkVersion={}, participation={})",
+                    attestedSlot, bytesToHex(forkVersion), participation);
             return false;
         }
 
-        // Verify finality branch: proves finalizedHeader.beacon is finalized in attestedHeader's state
+        // Verify finality branch: proves finalizedHeader.beacon is finalized in attestedHeader's state.
+        // Branch length is fork-dependent (6 pre-Electra, 7 post-Electra).
+        int finalityDepth = update.finalityBranch().length;
+        int finalityGindex = BeaconChainSpec.finalizedRootGindex(finalityDepth);
         if (!SszUtil.verifyMerkleBranch(
                 update.finalizedHeader().beacon().hashTreeRoot(),
                 update.finalityBranch(),
-                BeaconChainSpec.FINALIZED_ROOT_DEPTH,
-                BeaconChainSpec.FINALIZED_ROOT_GINDEX,
+                finalityDepth,
+                finalityGindex,
                 update.attestedHeader().beacon().stateRoot())) {
+            log.debug("[lc-processor] Finality update rejected: Merkle branch invalid " +
+                    "(depth={}, gindex={}, finalizedSlot={})",
+                    finalityDepth, finalityGindex, finalizedSlot);
             return false;
         }
 
-        long finalizedSlot = update.finalizedHeader().beacon().slot();
+        long oldFinalizedSlot = store.getFinalizedSlot();
         store.updateFinalized(update.finalizedHeader(), finalizedSlot);
         store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
 
-        // Rotate sync committee if we crossed a period boundary
-        store.applyNextSyncCommitteeWhenPeriodChanges(finalizedSlot);
+        // Rotate sync committee if we crossed a period boundary.
+        // Pass the OLD finalized slot so the period comparison is correct
+        // (updateFinalized may have already advanced this.finalizedSlot).
+        store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
 
+        log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }
 
@@ -102,12 +127,14 @@ public class LightClientProcessor {
             return false;
         }
 
-        // Verify finality branch
+        // Verify finality branch (depth is fork-dependent)
+        int finalityDepth = update.finalityBranch().length;
+        int finalityGindex = BeaconChainSpec.finalizedRootGindex(finalityDepth);
         if (!SszUtil.verifyMerkleBranch(
                 update.finalizedHeader().beacon().hashTreeRoot(),
                 update.finalityBranch(),
-                BeaconChainSpec.FINALIZED_ROOT_DEPTH,
-                BeaconChainSpec.FINALIZED_ROOT_GINDEX,
+                finalityDepth,
+                finalityGindex,
                 update.attestedHeader().beacon().stateRoot())) {
             return false;
         }
@@ -116,28 +143,39 @@ public class LightClientProcessor {
         SyncCommittee nextSyncCommittee = update.nextSyncCommittee();
         if (nextSyncCommittee != null && store.getNextSyncCommittee() == null) {
             // Verify the next sync committee branch against the attested state
+            // Branch depth is fork-dependent (5 pre-Electra, 6 post-Electra)
+            int scDepth = update.nextSyncCommitteeBranch().length;
+            int scGindex = BeaconChainSpec.syncCommitteeGindex(scDepth);
             if (!SszUtil.verifyMerkleBranch(
                     nextSyncCommittee.hashTreeRoot(),
                     update.nextSyncCommitteeBranch(),
-                    BeaconChainSpec.CURRENT_SYNC_COMMITTEE_DEPTH,
-                    BeaconChainSpec.CURRENT_SYNC_COMMITTEE_GINDEX,
+                    scDepth,
+                    scGindex,
                     update.attestedHeader().beacon().stateRoot())) {
                 return false;
             }
             store.updateNextSyncCommittee(nextSyncCommittee);
         }
 
+        long oldFinalizedSlot = store.getFinalizedSlot();
         long finalizedSlot = update.finalizedHeader().beacon().slot();
         store.updateFinalized(update.finalizedHeader(), finalizedSlot);
         store.updateOptimistic(update.attestedHeader(), update.signatureSlot());
 
-        // Rotate sync committee if we crossed a period boundary
-        store.applyNextSyncCommitteeWhenPeriodChanges(finalizedSlot);
+        // Rotate sync committee if we crossed a period boundary.
+        // Pass the OLD finalized slot so the period comparison is correct.
+        store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot);
 
         return true;
     }
 
     public LightClientStore getStore() {
         return store;
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 }

@@ -107,6 +107,8 @@ public final class BlockHeader {
             if (!reader.isComplete()) blobGasUsed = reader.readLong();
             if (!reader.isComplete()) excessBlobGas = reader.readLong();
             if (!reader.isComplete()) parentBeaconRoot = Bytes32.wrap(reader.readValue());
+            // EIP-7685 (Prague/Electra): requestsHash — skip if present
+            if (!reader.isComplete()) reader.readValue();
 
             return new BlockHeader(parentHash, ommersHash, beneficiary,
                     stateRoot, txRoot, rcptRoot, logsBloom, difficulty,

@@ -46,16 +46,16 @@ public final class AccountRangeMessage {
     ) {}
 
     public record DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof,
-                                   Bytes32 stateRoot) {
+                                   Bytes32 stateRoot, long blockNumber) {
 
         /** Create a DecodeResult without a state root (decoded from wire). */
         public DecodeResult(long requestId, List<AccountData> accounts, List<Bytes> proof) {
-            this(requestId, accounts, proof, null);
+            this(requestId, accounts, proof, null, 0);
         }
 
-        /** Return a copy with the given state root attached. */
-        public DecodeResult withStateRoot(Bytes32 root) {
-            return new DecodeResult(requestId, accounts, proof, root);
+        /** Return a copy with the given state root and block number attached. */
+        public DecodeResult withStateRoot(Bytes32 root, long blockNum) {
+            return new DecodeResult(requestId, accounts, proof, root, blockNum);
         }
     }
 

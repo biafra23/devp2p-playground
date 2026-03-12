@@ -9,6 +9,7 @@ import devp2p.consensus.types.BeaconBlockParser;
 import devp2p.consensus.types.LightClientBootstrap;
 import devp2p.consensus.types.LightClientFinalityUpdate;
 import devp2p.consensus.types.LightClientHeader;
+import devp2p.consensus.types.LightClientUpdate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,6 +23,7 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -148,8 +150,17 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 0: discover peers from beacon API before attempting connections
         discoverPeersFromBeaconApi();
 
+        // Pre-connect to peers and query Identify to learn protocol support.
+        // This lets bootstrap() prioritize peers advertising light_client protocols.
+        preConnectAndIdentify();
+
         // Phase 1: bootstrap with BLS verification (strongest trust)
         bootstrap();
+
+        // Phase 1b: catch up sync committee if bootstrap is from an older period
+        if (store.isInitialized()) {
+            catchUpSyncCommittee();
+        }
 
         // Phase 2: fall back to seeding without BLS if bootstrap failed
         if (!store.isInitialized()) {
@@ -235,51 +246,267 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
+     * Pre-connect to all peers and run Identify to discover protocol support.
+     * Waits up to 8 seconds for connections + Identify to complete.
+     * This ensures bootstrap() can prioritize light-client-capable peers.
+     */
+    private void preConnectAndIdentify() {
+        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        if (peers.isEmpty()) return;
+
+        log.info("[beacon] Pre-connecting to {} peer(s) for Identify...", peers.size());
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (String peer : peers) {
+            if (!running) return;
+            futures.add(p2pService.queryIdentify(peer));
+        }
+
+        // Wait for all to complete (or timeout)
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(8, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // Some peers may have timed out — that's fine
+        }
+
+        // Log summary of light client support
+        List<BeaconP2PService.PeerInfo> connected = p2pService.getConnectedPeers();
+        long lcCount = connected.stream().filter(BeaconP2PService.PeerInfo::supportsLightClient).count();
+        log.info("[beacon] Identify complete: {}/{} connected peers support light_client",
+                lcCount, connected.size());
+        for (BeaconP2PService.PeerInfo pi : connected) {
+            if (pi.supportsLightClient()) {
+                log.info("[beacon]   LC peer: {} agent={}", pi.peerId(), pi.agentVersion());
+            }
+        }
+    }
+
+    /**
+     * Attempt to bootstrap from the beacon HTTP API.
+     * Uses GET /eth/v1/beacon/light_client/bootstrap/{block_root} with SSZ encoding.
+     * Returns true if bootstrap succeeded.
+     */
+    private boolean bootstrapFromBeaconApi() {
+        if (beaconApiUrl == null || beaconApiUrl.isEmpty()) return false;
+        try {
+            String rootHex = "0x" + bytesToHex(checkpointRoot);
+            String url = beaconApiUrl + "/eth/v1/beacon/light_client/bootstrap/" + rootHex;
+            log.info("[beacon] Attempting HTTP bootstrap from {}", url);
+
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(15))
+                    .header("Accept", "application/octet-stream")
+                    .GET()
+                    .build();
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            if (response.statusCode() != 200) {
+                log.warn("[beacon] HTTP bootstrap returned status {} from {}", response.statusCode(), url);
+                return false;
+            }
+
+            byte[] ssz = response.body();
+            log.info("[beacon] HTTP bootstrap received {} bytes", ssz.length);
+
+            LightClientBootstrap bootstrap = LightClientBootstrap.decode(ssz);
+
+            int branchDepth = bootstrap.currentSyncCommitteeBranch().length;
+            int gindex = BeaconChainSpec.syncCommitteeGindex(branchDepth);
+            boolean branchValid = SszUtil.verifyMerkleBranch(
+                    bootstrap.currentSyncCommittee().hashTreeRoot(),
+                    bootstrap.currentSyncCommitteeBranch(),
+                    branchDepth,
+                    gindex,
+                    bootstrap.header().beacon().stateRoot());
+
+            if (!branchValid) {
+                log.warn("[beacon] HTTP bootstrap sync committee branch invalid (depth={}, gindex={})",
+                        branchDepth, gindex);
+                return false;
+            }
+
+            store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
+            updateSyncState();
+            log.info("[beacon] HTTP bootstrap complete, slot={}", bootstrap.header().beacon().slot());
+            return true;
+
+        } catch (Exception e) {
+            Throwable root = e;
+            while (root.getCause() != null) root = root.getCause();
+            log.warn("[beacon] HTTP bootstrap failed: {} ({})", root.getMessage(),
+                    root.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
      * Attempt to bootstrap from each peer in order. Stops at the first success.
+     * Tries HTTP API first, then falls back to P2P peers.
      * Logs a warning if all peers fail.
      */
     private void bootstrap() {
-        log.info("[beacon] Attempting bootstrap from {} peer(s)", clPeerMultiaddrs.size());
-        for (int i = 0; i < clPeerMultiaddrs.size(); i++) {
-            String peer = clPeerMultiaddrs.get(i);
+        // Try HTTP API first — much more reliable than P2P
+        if (bootstrapFromBeaconApi()) return;
+
+        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        log.info("[beacon] Attempting parallel bootstrap from {} peer(s)", peers.size());
+
+        // Fire bootstrap requests to ALL peers in parallel — first valid response wins.
+        // This avoids the 5+ minute sequential timeout cascade (18 peers × 30s each).
+        CompletableFuture<byte[]> winnerFuture = new CompletableFuture<>();
+        java.util.concurrent.atomic.AtomicInteger remaining =
+                new java.util.concurrent.atomic.AtomicInteger(peers.size());
+
+        for (String peer : peers) {
             if (!running) return;
-            log.info("[beacon] Trying bootstrap peer {}/{}: {}", i + 1, clPeerMultiaddrs.size(), peer);
+            p2pService.requestBootstrap(peer, checkpointRoot)
+                    .whenComplete((response, ex) -> {
+                        if (ex != null) {
+                            Throwable root = ex;
+                            while (root.getCause() != null) root = root.getCause();
+                            String msg = root.getMessage() != null ? root.getMessage()
+                                    : root.getClass().getSimpleName();
+                            log.debug("[beacon] Bootstrap failed from {}: {} ({})",
+                                    peer, msg, root.getClass().getSimpleName());
+                            if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                winnerFuture.completeExceptionally(
+                                        new RuntimeException("All peers failed bootstrap"));
+                            }
+                            return;
+                        }
+                        log.info("[beacon] Bootstrap response: {} bytes from {}", response.length, peer);
+                        try {
+                            LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
+
+                            int bDepth = bootstrap.currentSyncCommitteeBranch().length;
+                            int bGindex = BeaconChainSpec.syncCommitteeGindex(bDepth);
+                            boolean branchValid = SszUtil.verifyMerkleBranch(
+                                    bootstrap.currentSyncCommittee().hashTreeRoot(),
+                                    bootstrap.currentSyncCommitteeBranch(),
+                                    bDepth,
+                                    bGindex,
+                                    bootstrap.header().beacon().stateRoot());
+
+                            if (!branchValid) {
+                                log.warn("[beacon] Bootstrap sync committee branch invalid from {}", peer);
+                                if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                    winnerFuture.completeExceptionally(
+                                            new RuntimeException("All peers failed bootstrap"));
+                                }
+                                return;
+                            }
+
+                            // First valid bootstrap wins — initialize store BEFORE completing
+                            // the future so that catchUpSyncCommittee() sees the initialized state.
+                            synchronized (store) {
+                                if (!winnerFuture.isDone()) {
+                                    store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
+                                    updateSyncState();
+                                    winnerFuture.complete(response);
+                                    notifyPeerSuccess(peer);
+                                    log.info("[beacon] Bootstrap complete from {}, slot={}",
+                                            peer, bootstrap.header().beacon().slot());
+                                }
+                            }
+                        } catch (Exception e) {
+                            log.warn("[beacon] Bootstrap decode failed from {}: {}", peer, e.getMessage());
+                            if (remaining.decrementAndGet() == 0 && !winnerFuture.isDone()) {
+                                winnerFuture.completeExceptionally(e);
+                            }
+                        }
+                    });
+        }
+
+        // Wait for first success or all failures — max 30 seconds total
+        try {
+            winnerFuture.get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            Throwable root = e;
+            while (root.getCause() != null) root = root.getCause();
+            log.warn("[beacon] Could not bootstrap from any peer: {} — will retry on next sync cycle",
+                    root.getMessage());
+        }
+    }
+
+    /**
+     * After bootstrap, the store's sync committee may be from an older period than the
+     * current chain head. Fetch LightClientUpdates via updates_by_range to obtain the
+     * nextSyncCommittee for each intermediate period and rotate until we reach the
+     * current period.
+     */
+    private void catchUpSyncCommittee() {
+        long bootstrapSlot = store.getFinalizedSlot();
+        long bootstrapPeriod = BeaconChainSpec.computeSyncCommitteePeriod(bootstrapSlot);
+
+        // Estimate current period from wall clock:
+        // Genesis time for mainnet = 1606824023
+        // Each slot = 12s, each period = 8192 slots
+        long now = System.currentTimeMillis() / 1000;
+        long genesisTime = 1606824023L;
+        long currentSlotEstimate = (now - genesisTime) / 12;
+        long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
+
+        if (currentPeriod <= bootstrapPeriod) {
+            log.info("[beacon] Sync committee is current (period {}), no catch-up needed", bootstrapPeriod);
+            return;
+        }
+
+        long periodsToFetch = currentPeriod - bootstrapPeriod;
+        log.info("[beacon] Sync committee catch-up: bootstrap period={}, current period={}, fetching {} update(s)",
+                bootstrapPeriod, currentPeriod, periodsToFetch);
+
+        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        for (String peer : peers) {
+            if (!running) return;
             try {
-                byte[] response = p2pService
-                        .requestBootstrap(peer, checkpointRoot)
-                        .get(15, TimeUnit.SECONDS);
+                List<byte[]> responses = p2pService
+                        .requestUpdatesByRange(peer, bootstrapPeriod, (int) Math.min(periodsToFetch, 128))
+                        .get(30, TimeUnit.SECONDS);
 
-                LightClientBootstrap bootstrap = LightClientBootstrap.decode(response);
-
-                // Verify the sync committee branch proves currentSyncCommittee is in the header's state
-                boolean branchValid = SszUtil.verifyMerkleBranch(
-                        bootstrap.currentSyncCommittee().hashTreeRoot(),
-                        bootstrap.currentSyncCommitteeBranch(),
-                        BeaconChainSpec.CURRENT_SYNC_COMMITTEE_DEPTH,
-                        BeaconChainSpec.CURRENT_SYNC_COMMITTEE_GINDEX,
-                        bootstrap.header().beacon().stateRoot());
-
-                if (!branchValid) {
-                    log.warn("[beacon] Bootstrap sync committee branch invalid from peer {}", peer);
+                if (responses.isEmpty()) {
+                    log.debug("[beacon] No updates returned from {} for period range {}-{}",
+                            peer, bootstrapPeriod, bootstrapPeriod + periodsToFetch - 1);
                     continue;
                 }
 
-                store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
-                updateSyncState();
-                notifyPeerSuccess(peer);
-                log.info("[beacon] Bootstrap complete from {}, slot={}",
-                        peer, bootstrap.header().beacon().slot());
-                return;
+                int applied = 0;
+                for (byte[] responseSsz : responses) {
+                    try {
+                        LightClientUpdate update = LightClientUpdate.decode(responseSsz);
+                        if (processor.processUpdate(update)) {
+                            applied++;
+                            updateSyncState();
+                        } else {
+                            log.debug("[beacon] Catch-up update not applied (slot={})",
+                                    update.finalizedHeader().beacon().slot());
+                        }
+                    } catch (Exception e) {
+                        log.debug("[beacon] Failed to decode/process catch-up update: {}", e.getMessage());
+                    }
+                }
 
-            } catch (Throwable e) {
+                if (applied > 0) {
+                    // Force-rotate if wall clock says we're past the period boundary.
+                    // Catch-up updates store nextSyncCommittee but their finalized slots
+                    // may not cross the boundary (finality lags attestation).
+                    store.forceRotateIfPastPeriod(currentSlotEstimate);
+
+                    long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(store.getFinalizedSlot());
+                    notifyPeerSuccess(peer);
+                    log.info("[beacon] Sync committee catch-up: applied {} update(s), now at period {} (slot {})",
+                            applied, newPeriod, store.getFinalizedSlot());
+                    return;
+                }
+            } catch (Exception e) {
                 Throwable root = e;
                 while (root.getCause() != null) root = root.getCause();
-                String msg = root.getMessage() != null ? root.getMessage()
-                        : root.getClass().getSimpleName();
-                log.warn("[beacon] Bootstrap failed from {}: {} ({})", peer, msg, root.getClass().getSimpleName());
+                log.debug("[beacon] Catch-up updates_by_range failed from {}: {}", peer, root.getMessage());
             }
         }
-        log.warn("[beacon] Could not bootstrap from any peer — will retry on next sync cycle");
+        log.warn("[beacon] Could not catch up sync committee from any peer");
     }
 
     /**
@@ -320,15 +547,23 @@ public class BeaconLightClient implements AutoCloseable {
                 }
 
                 // Seed the sync state directly (trusted peer, no BLS verification)
-                syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot());
+                long execBlockNum = finalizedHeader.execution().blockNumber();
+                syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot(), execBlockNum);
                 syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
                 // Also record the attested header's execution state root
+                long attestedSlot = update.attestedHeader().beacon().slot();
                 byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
                 if (attestedRoot != null && attestedRoot.length == 32) {
-                    syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
+                    syncState.recordStateRoot(attestedSlot, attestedRoot, false);
                 }
+                // Fill intermediate blocks between finalized and attested to cover recent state roots
+                byte[] attestedBlockRoot = update.attestedHeader().beacon().hashTreeRoot();
+                log.info("[beacon] Seeded: finalizedSlot={}, attestedSlot={}, signatureSlot={}, filling {} slots",
+                        finalizedSlot, attestedSlot, update.signatureSlot(), attestedSlot - finalizedSlot);
+                fillChainStateRoots(peer, false, finalizedSlot, attestedSlot, attestedBlockRoot);
                 notifyPeerSuccess(peer);
-                log.info("[beacon] Seeded from finality update via {}, finalizedSlot={}", peer, finalizedSlot);
+                log.info("[beacon] Seeded from finality update via {}, finalizedSlot={}, knownRoots={}",
+                        peer, finalizedSlot, syncState.getKnownStateRootCount());
                 return;
 
             } catch (Exception e) {
@@ -393,7 +628,14 @@ public class BeaconLightClient implements AutoCloseable {
             Matcher sigSlotMatcher = sigSlotPattern.matcher(body);
             long signatureSlot = sigSlotMatcher.find() ? Long.parseLong(sigSlotMatcher.group(1)) : finalizedSlot + 1;
 
-            syncState.update(finalizedSlot, executionStateRoot, signatureSlot);
+            // Extract finalized execution block_number
+            Pattern blockNumPattern = Pattern.compile(
+                    "\"finalized_header\"\\s*:\\s*\\{.*?\"execution\"\\s*:\\s*\\{.*?\"block_number\"\\s*:\\s*\"(\\d+)\"",
+                    Pattern.DOTALL);
+            Matcher blockNumMatcher = blockNumPattern.matcher(body);
+            long execBlockNum = blockNumMatcher.find() ? Long.parseLong(blockNumMatcher.group(1)) : 0;
+
+            syncState.update(finalizedSlot, executionStateRoot, signatureSlot, execBlockNum);
             syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
 
             // Also extract attested_header execution state root if present
@@ -435,20 +677,29 @@ public class BeaconLightClient implements AutoCloseable {
      * successfully applied update. Logs debug-level failures for individual peers.
      */
     private void pollFinalityUpdate() {
-        if (!store.isInitialized() && !syncState.isSynced()) {
-            // Not bootstrapped and no seed yet — try bootstrap first, then fall back
+        if (!store.isInitialized()) {
+            // Not bootstrapped yet — try bootstrap, then fall back to seeding
             discoverPeersFromBeaconApi();
-            for (String peer : List.copyOf(clPeerMultiaddrs)) {
-                p2pService.disconnectPeer(peer);
+            if (!syncState.isSynced()) {
+                // First time: disconnect stale peers to force fresh connections
+                for (String peer : List.copyOf(clPeerMultiaddrs)) {
+                    p2pService.disconnectPeer(peer);
+                }
             }
             bootstrap();
-            if (!store.isInitialized()) {
+            if (!store.isInitialized() && !syncState.isSynced()) {
                 seedFromBeaconApi();
                 if (!syncState.isSynced()) {
                     seedFromFinalityUpdate();
                 }
             }
-            return;
+            if (!store.isInitialized()) {
+                // Seeded but not bootstrapped — still poll for finality updates below,
+                // and retry bootstrap on the next cycle
+                log.debug("[beacon] Bootstrap pending, continuing with seeded mode");
+            } else {
+                return;
+            }
         }
 
         for (String peer : List.copyOf(clPeerMultiaddrs)) {
@@ -477,13 +728,20 @@ public class BeaconLightClient implements AutoCloseable {
                         long slot = fh.beacon().slot();
                         syncState.recordStateRoot(slot, sr, false);
                         // Also record the attested header's execution state root
+                        long attestedSlot = update.attestedHeader().beacon().slot();
                         byte[] attestedRoot = update.attestedHeader().execution().stateRoot();
                         if (attestedRoot != null && attestedRoot.length == 32) {
-                            syncState.recordStateRoot(update.attestedHeader().beacon().slot(), attestedRoot, false);
+                            syncState.recordStateRoot(attestedSlot, attestedRoot, false);
                         }
+                        // Fill intermediate blocks to cover recent state roots
+                        byte[] attestedBlockRoot = update.attestedHeader().beacon().hashTreeRoot();
+                        log.debug("[beacon] Seeded poll: finalizedSlot={}, attestedSlot={}, filling {} slots",
+                                slot, attestedSlot, attestedSlot - slot);
+                        fillChainStateRoots(peer, false, slot, attestedSlot, attestedBlockRoot);
                         notifyPeerSuccess(peer);
                         if (slot > syncState.getFinalizedSlot()) {
-                            syncState.update(slot, sr, update.signatureSlot());
+                            long execBlockNum = fh.execution().blockNumber();
+                            syncState.update(slot, sr, update.signatureSlot(), execBlockNum);
                             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
                         }
                         return;
@@ -512,7 +770,8 @@ public class BeaconLightClient implements AutoCloseable {
         LightClientHeader finalizedHeader = store.getFinalizedHeader();
         if (finalizedHeader != null) {
             byte[] stateRoot = finalizedHeader.execution().stateRoot();
-            syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot());
+            long execBlockNum = finalizedHeader.execution().blockNumber();
+            syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(), execBlockNum);
             syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
         }
         LightClientHeader optimisticHeader = store.getOptimisticHeader();
@@ -541,10 +800,29 @@ public class BeaconLightClient implements AutoCloseable {
     private void fillChainStateRoots(String peer, boolean blsVerified) {
         long finalizedSlot = store.getFinalizedSlot();
         long optimisticSlot = store.getOptimisticSlot();
-        if (optimisticSlot <= finalizedSlot + 1) return; // nothing to fill
+        LightClientHeader attestedHeader = store.getOptimisticHeader();
+        byte[] attestedBlockRoot = attestedHeader != null
+                ? attestedHeader.beacon().hashTreeRoot() : null;
+        fillChainStateRoots(peer, blsVerified, finalizedSlot, optimisticSlot, attestedBlockRoot);
+    }
+
+    /**
+     * Fill execution state roots for blocks between finalizedSlot and attestedSlot.
+     * Works in both bootstrapped and seeded mode by accepting explicit parameters.
+     *
+     * @param peer               the CL peer multiaddr to fetch blocks from
+     * @param blsVerified        true if the finality update was BLS-verified
+     * @param finalizedSlot      the finalized slot (start of range)
+     * @param attestedSlot       the attested/optimistic slot (end of range)
+     * @param attestedBlockRoot  hash tree root of the attested beacon block header (for chain verification), or null
+     */
+    private void fillChainStateRoots(String peer, boolean blsVerified,
+                                      long finalizedSlot, long attestedSlot,
+                                      byte[] attestedBlockRoot) {
+        if (attestedSlot <= finalizedSlot + 1) return; // nothing to fill
 
         long startSlot = finalizedSlot + 1;
-        long count = optimisticSlot - finalizedSlot; // includes the attested slot
+        long count = attestedSlot - finalizedSlot; // includes the attested slot
 
         try {
             List<byte[]> blockSszList = p2pService
@@ -553,7 +831,7 @@ public class BeaconLightClient implements AutoCloseable {
 
             if (blockSszList.isEmpty()) {
                 log.debug("[beacon] Chain fill: no blocks returned for slots {}-{}",
-                        startSlot, optimisticSlot);
+                        startSlot, attestedSlot);
                 return;
             }
 
@@ -573,9 +851,7 @@ public class BeaconLightClient implements AutoCloseable {
             // Verify hash chain: walk from newest to oldest.
             // The attested header's blockHeaderRoot should match the last block,
             // and each block's parentRoot should match the previous block's headerRoot.
-            LightClientHeader attestedHeader = store.getOptimisticHeader();
-            byte[] expectedHash = attestedHeader != null
-                    ? attestedHeader.beacon().hashTreeRoot() : null;
+            byte[] expectedHash = attestedBlockRoot;
 
             int verified = 0;
             // Process blocks in reverse (newest first) to verify chain from attested header

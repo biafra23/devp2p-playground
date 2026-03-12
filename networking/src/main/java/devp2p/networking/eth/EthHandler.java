@@ -7,6 +7,8 @@ import devp2p.networking.eth.messages.*;
 import devp2p.networking.rlpx.RLPxHandler;
 import devp2p.networking.snap.messages.AccountRangeMessage;
 import devp2p.networking.snap.messages.GetAccountRangeMessage;
+import devp2p.networking.snap.messages.GetStorageRangesMessage;
+import devp2p.networking.snap.messages.StorageRangesMessage;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.slf4j.Logger;
@@ -52,8 +54,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
     // snap/1 message codes depend on negotiated eth version:
     //   eth/67-68: protocol length 17, snap base = 0x10 + 17 = 0x21
     //   eth/69:    protocol length 18 (adds BlockRangeUpdate at 0x11), snap base = 0x10 + 18 = 0x22
-    private int snapGetAccountRange = 0x21; // updated after Hello negotiation
-    private int snapAccountRange    = 0x22;
+    private int snapGetAccountRange  = 0x21; // updated after Hello negotiation
+    private int snapAccountRange     = 0x22;
+    private int snapGetStorageRanges = 0x23;
+    private int snapStorageRanges    = 0x24;
 
     public enum State { AWAITING_HELLO, AWAITING_STATUS, READY }
     private volatile State state = State.AWAITING_HELLO;
@@ -81,6 +85,8 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingBodyRequests = new ConcurrentHashMap<>();
     private final ConcurrentMap<Long, CompletableFuture<AccountRangeMessage.DecodeResult>>
             pendingSnapRequests = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, CompletableFuture<StorageRangesMessage.DecodeResult>>
+            pendingStorageRequests = new ConcurrentHashMap<>();
 
 
     // Cache received headers so we can serve them back to peers (by block number)
@@ -169,6 +175,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             pendingSnapRequests.values().forEach(f -> f.completeExceptionally(cause));
             pendingSnapRequests.clear();
         }
+        if (!pendingStorageRequests.isEmpty()) {
+            pendingStorageRequests.values().forEach(f -> f.completeExceptionally(cause));
+            pendingStorageRequests.clear();
+        }
         super.channelInactive(ctx);
     }
 
@@ -209,8 +219,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             // eth/69 adds BlockRangeUpdate (0x11), making protocol length 18 instead of 17
             int ethProtocolLength = negotiatedEthVersion >= 69 ? 18 : 17;
             int snapBase = 0x10 + ethProtocolLength; // p2p base (16) + eth length
-            snapGetAccountRange = snapBase;
-            snapAccountRange = snapBase + 1;
+            snapGetAccountRange  = snapBase;
+            snapAccountRange     = snapBase + 1;
+            snapGetStorageRanges = snapBase + 2;
+            snapStorageRanges    = snapBase + 3;
             log.info("[eth] snap base offset: 0x{} (eth length={})",
                 Integer.toHexString(snapBase), ethProtocolLength);
             snapNegotiated = hello.capabilities.stream()
@@ -415,6 +427,10 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                     handleSnapAccountRange(msg);
                 } else if (msg.code() == snapGetAccountRange) {
                     handleSnapGetAccountRange(ctx, msg);
+                } else if (msg.code() == snapStorageRanges) {
+                    handleSnapStorageRanges(msg);
+                } else if (msg.code() == snapGetStorageRanges) {
+                    handleSnapGetStorageRanges(ctx, msg);
                 } else {
                     log.debug("[eth] Unhandled message 0x{} ({} bytes) from {}",
                         Integer.toHexString(msg.code()), msg.payload().length, remoteAddress);
@@ -457,6 +473,40 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
             log.debug("[snap] Responded with empty AccountRange (reqId={})", snapReqId);
         } catch (Exception e) {
             log.debug("[snap] Failed to respond to GetAccountRange: {}", e.getMessage());
+        }
+    }
+
+    private void handleSnapStorageRanges(RLPxHandler.RLPxMessage msg) {
+        long snapReqId = -1;
+        try {
+            snapReqId = StorageRangesMessage.extractRequestId(msg.payload());
+        } catch (Exception ignored) {}
+        try {
+            StorageRangesMessage.DecodeResult decoded = StorageRangesMessage.decode(msg.payload());
+            log.info("[snap] StorageRanges: {} slots (reqId={})",
+                decoded.slots().size(), decoded.requestId());
+            CompletableFuture<StorageRangesMessage.DecodeResult> f =
+                pendingStorageRequests.remove(decoded.requestId());
+            if (f != null) f.complete(decoded);
+        } catch (Exception e) {
+            log.error("[snap] Failed to decode StorageRanges (reqId={}): {}",
+                snapReqId, e.getMessage());
+            if (snapReqId >= 0) {
+                CompletableFuture<StorageRangesMessage.DecodeResult> f =
+                    pendingStorageRequests.remove(snapReqId);
+                if (f != null) f.completeExceptionally(e);
+            }
+        }
+    }
+
+    private void handleSnapGetStorageRanges(ChannelHandlerContext ctx, RLPxHandler.RLPxMessage msg) {
+        try {
+            long snapReqId = StorageRangesMessage.extractRequestId(msg.payload());
+            byte[] emptyResponse = StorageRangesMessage.encodeEmpty(snapReqId);
+            rlpxHandler.sendMessage(ctx, snapStorageRanges, emptyResponse);
+            log.debug("[snap] Responded with empty StorageRanges (reqId={})", snapReqId);
+        } catch (Exception e) {
+            log.debug("[snap] Failed to respond to GetStorageRanges: {}", e.getMessage());
         }
     }
 
@@ -599,14 +649,25 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                 result.completeExceptionally(new RuntimeException("No header returned for state root"));
                 return;
             }
+            long blockNum = headers.get(0).header().number;
+            // Reject obviously stale headers. We use a static minimum rather than
+            // chainHead because chainHead can be poisoned by malicious peers.
+            // Mainnet is ~24.6M as of March 2026; 20M gives ample margin.
+            if (blockNum < 20_000_000) {
+                log.warn("[snap] Peer {} returned stale header (block #{}), skipping",
+                        remoteAddress, blockNum);
+                result.completeExceptionally(new RuntimeException(
+                    "Peer returned stale header (block #" + blockNum + ")"));
+                return;
+            }
             org.apache.tuweni.bytes.Bytes32 freshStateRoot = headers.get(0).header().stateRoot;
             log.info("[snap] Using fresh stateRoot={} from block #{}", freshStateRoot.toShortHexString(),
-                headers.get(0).header().number);
+                blockNum);
             sendGetAccountRange(ctx, accountHash, freshStateRoot)
                 .orTimeout(10, TimeUnit.SECONDS)
                 .whenComplete((r, ex) -> {
                     if (ex != null) result.completeExceptionally(ex);
-                    else result.complete(r.withStateRoot(freshStateRoot));
+                    else result.complete(r.withStateRoot(freshStateRoot, blockNum));
                 });
         }).exceptionally(ex -> {
             log.warn("[snap] Header fetch from {} failed: {}", remoteAddress, ex.getMessage());
@@ -630,6 +691,110 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
         log.info("[snap] GetAccountRange reqId={} accountHash={} stateRoot={}",
             reqId, accountHash.toShortHexString(), stateRoot.toShortHexString());
         rlpxHandler.sendMessage(ctx, snapGetAccountRange, payload);
+        return future;
+    }
+
+    /**
+     * Fetch storage slots for a contract from the snap/1 storage trie.
+     *
+     * <p>Fetches a fresh block header from this peer to get a non-pruned state root,
+     * then sends GetStorageRanges for the given account and storage key.
+     *
+     * @param contractAddress 20-byte contract address
+     * @param storageKeyHash  32-byte keccak256(storageSlotKey) — the trie key
+     * @return future completing with the StorageRanges decode result, or null if not READY
+     */
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorageAsync(
+            org.apache.tuweni.bytes.Bytes contractAddress,
+            org.apache.tuweni.bytes.Bytes32 storageKeyHash) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        org.apache.tuweni.bytes.Bytes32 accountHash =
+            org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
+
+        // Fetch fresh header for non-pruned state root
+        CompletableFuture<StorageRangesMessage.DecodeResult> result = new CompletableFuture<>();
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> headerFut = new CompletableFuture<>();
+        pendingRequests.put(reqId, headerFut);
+        org.apache.tuweni.bytes.Bytes32 hash = peerBestBlockHash;
+        if (hash == null) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No best block hash from peer"));
+        }
+        byte[] headerPayload = GetBlockHeadersMessage.encodeByHash(reqId, hash, 1, 0, false);
+        log.info("[snap] Fetching fresh header for storage query from peer {}", remoteAddress);
+        rlpxHandler.sendMessage(ctx, ETH_GET_BLOCK_HEADERS, headerPayload);
+
+        headerFut.orTimeout(5, TimeUnit.SECONDS).thenAccept(headers -> {
+            if (headers.isEmpty()) {
+                result.completeExceptionally(new RuntimeException("No header returned for state root"));
+                return;
+            }
+            long blockNum = headers.get(0).header().number;
+            if (blockNum < 1_000_000) {
+                log.warn("[snap] Peer {} returned stale header (block #{}), skipping for storage query",
+                    remoteAddress, blockNum);
+                result.completeExceptionally(new RuntimeException(
+                    "Peer returned stale header (block #" + blockNum + ")"));
+                return;
+            }
+            org.apache.tuweni.bytes.Bytes32 freshStateRoot = headers.get(0).header().stateRoot;
+            log.info("[snap] Using fresh stateRoot={} for storage query from block #{}",
+                freshStateRoot.toShortHexString(), blockNum);
+            sendGetStorageRanges(ctx, accountHash, storageKeyHash, freshStateRoot)
+                .orTimeout(10, TimeUnit.SECONDS)
+                .whenComplete((r, ex) -> {
+                    if (ex != null) result.completeExceptionally(ex);
+                    else result.complete(r);
+                });
+        }).exceptionally(ex -> {
+            log.warn("[snap] Header fetch from {} failed for storage query: {}", remoteAddress, ex.getMessage());
+            pendingRequests.remove(reqId);
+            result.completeExceptionally(ex);
+            return null;
+        });
+        return result;
+    }
+
+    /**
+     * Fetch storage slots with an explicit state root.
+     */
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorageAsync(
+            org.apache.tuweni.bytes.Bytes contractAddress,
+            org.apache.tuweni.bytes.Bytes32 storageKeyHash,
+            org.apache.tuweni.bytes.Bytes32 explicitStateRoot) {
+        ChannelHandlerContext ctx = readyCtx;
+        if (ctx == null || state != State.READY) return null;
+        if (!snapNegotiated) return CompletableFuture.failedFuture(
+            new UnsupportedOperationException("snap/1 not negotiated with this peer"));
+
+        org.apache.tuweni.bytes.Bytes32 accountHash =
+            org.apache.tuweni.crypto.Hash.keccak256(contractAddress);
+
+        return sendGetStorageRanges(ctx, accountHash, storageKeyHash, explicitStateRoot)
+            .orTimeout(10, TimeUnit.SECONDS);
+    }
+
+    private CompletableFuture<StorageRangesMessage.DecodeResult> sendGetStorageRanges(
+            ChannelHandlerContext ctx,
+            org.apache.tuweni.bytes.Bytes32 accountHash,
+            org.apache.tuweni.bytes.Bytes32 storageKeyHash,
+            org.apache.tuweni.bytes.Bytes32 stateRoot) {
+        long reqId = requestId.getAndIncrement();
+        CompletableFuture<StorageRangesMessage.DecodeResult> future = new CompletableFuture<>();
+        pendingStorageRequests.put(reqId, future);
+        org.apache.tuweni.bytes.Bytes32 limitHash = org.apache.tuweni.bytes.Bytes32.fromHexString(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        byte[] payload = GetStorageRangesMessage.encode(
+            reqId, stateRoot, accountHash, storageKeyHash, limitHash, 128 * 1024L);
+        log.info("[snap] GetStorageRanges reqId={} accountHash={} slotHash={} stateRoot={}",
+            reqId, accountHash.toShortHexString(), storageKeyHash.toShortHexString(),
+            stateRoot.toShortHexString());
+        rlpxHandler.sendMessage(ctx, snapGetStorageRanges, payload);
         return future;
     }
 

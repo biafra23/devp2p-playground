@@ -60,3 +60,11 @@ Three Gradle modules (Java 21):
 - Concurrent collections (`ConcurrentHashMap.newKeySet()`) for shared mutable state
 - IPC uses JSON-Lines over Unix domain sockets with Java 21 virtual threads
 - Network configs (genesis hash, fork ID, bootnodes) live in `NetworkConfig`
+
+## Trust
+
+- Peer trusted is never an option everything has to be cryptographycally verified
+- The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+
+## Data sources
+- the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production

@@ -69,18 +69,41 @@ public class LightClientStore {
     }
 
     /**
-     * If {@code newSlot} crosses a sync committee period boundary relative to the current
-     * finalized slot, rotate nextSyncCommittee → currentSyncCommittee.
+     * If {@code newFinalizedSlot} crosses a sync committee period boundary relative to
+     * {@code oldFinalizedSlot}, rotate nextSyncCommittee → currentSyncCommittee.
      *
-     * @param newSlot the slot that was just finalized
+     * <p>The caller must pass the finalized slot <b>before</b> {@link #updateFinalized}
+     * was called, so the period comparison is correct.
+     *
+     * @param oldFinalizedSlot the finalized slot before the current update
+     * @param newFinalizedSlot the newly finalized slot
      */
-    public synchronized void applyNextSyncCommitteeWhenPeriodChanges(long newSlot) {
+    public synchronized void applyNextSyncCommitteeWhenPeriodChanges(long oldFinalizedSlot, long newFinalizedSlot) {
         if (nextSyncCommittee == null) {
             return;
         }
-        long currentPeriod = BeaconChainSpec.computeSyncCommitteePeriod(finalizedSlot);
-        long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(newSlot);
-        if (newPeriod > currentPeriod) {
+        long oldPeriod = BeaconChainSpec.computeSyncCommitteePeriod(oldFinalizedSlot);
+        long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(newFinalizedSlot);
+        if (newPeriod > oldPeriod) {
+            currentSyncCommittee = nextSyncCommittee;
+            nextSyncCommittee = null;
+        }
+    }
+
+    /**
+     * Force-rotate the sync committee if the wall clock indicates we are past the
+     * boundary. Used during catch-up when finality hasn't crossed the boundary yet
+     * but we know from wall clock that the next period's committee should be active.
+     *
+     * @param currentSlotEstimate estimated current slot from wall clock
+     */
+    public synchronized void forceRotateIfPastPeriod(long currentSlotEstimate) {
+        if (nextSyncCommittee == null) {
+            return;
+        }
+        long storePeriod = BeaconChainSpec.computeSyncCommitteePeriod(finalizedSlot);
+        long wallPeriod = BeaconChainSpec.computeSyncCommitteePeriod(currentSlotEstimate);
+        if (wallPeriod > storePeriod) {
             currentSyncCommittee = nextSyncCommittee;
             nextSyncCommittee = null;
         }

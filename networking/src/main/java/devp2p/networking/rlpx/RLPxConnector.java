@@ -7,6 +7,7 @@ import devp2p.networking.eth.EthHandler;
 import devp2p.networking.eth.messages.BlockBodiesMessage;
 import devp2p.networking.eth.messages.BlockHeadersMessage;
 import devp2p.networking.snap.messages.AccountRangeMessage;
+import devp2p.networking.snap.messages.StorageRangesMessage;
 import org.apache.tuweni.bytes.Bytes32;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
@@ -158,6 +159,62 @@ public final class RLPxConnector implements AutoCloseable {
     }
 
     /**
+     * Request a large range of block headers in batches from the same peer.
+     * Each batch is up to 1024 headers; the results are concatenated.
+     * Tries each ready peer in turn until one succeeds.
+     */
+    public CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> requestBlockHeadersBatched(
+            long startBlock, int totalCount) {
+        List<EthHandler> readyPeers = new java.util.ArrayList<>();
+        for (EthHandler h : activeHandlers) {
+            if (h.isReady()) readyPeers.add(h);
+        }
+        if (readyPeers.isEmpty()) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("No active peer with completed eth handshake"));
+        }
+        return tryBatchedPeer(readyPeers, 0, startBlock, totalCount);
+    }
+
+    private CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> tryBatchedPeer(
+            List<EthHandler> peers, int peerIndex, long startBlock, int totalCount) {
+        if (peerIndex >= peers.size()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "All " + peers.size() + " peers failed to serve batched headers"));
+        }
+        EthHandler handler = peers.get(peerIndex);
+        log.info("[rlpx] Batched header request: block={}, count={}, peer={} ({}/{})",
+                startBlock, totalCount, handler.getRemoteAddress(), peerIndex + 1, peers.size());
+        return fetchBatch(handler, startBlock, totalCount, new java.util.ArrayList<>(totalCount))
+                .exceptionallyCompose(ex -> {
+                    log.warn("[rlpx] Batched request failed on peer {}: {}, trying next",
+                            handler.getRemoteAddress(), ex.getMessage());
+                    return tryBatchedPeer(peers, peerIndex + 1, startBlock, totalCount);
+                });
+    }
+
+    private CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> fetchBatch(
+            EthHandler handler, long startBlock, int remaining,
+            List<BlockHeadersMessage.VerifiedHeader> accumulated) {
+        if (remaining <= 0) return CompletableFuture.completedFuture(accumulated);
+        int count = Math.min(remaining, 1024);
+        CompletableFuture<List<BlockHeadersMessage.VerifiedHeader>> future =
+                handler.requestBlockHeadersAsync(startBlock, count);
+        if (future == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Peer disconnected during batched header fetch"));
+        }
+        return future.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS).thenCompose(batch -> {
+            if (batch.size() != count) {
+                return CompletableFuture.failedFuture(new RuntimeException(
+                        "Expected " + count + " headers, got " + batch.size()));
+            }
+            accumulated.addAll(batch);
+            return fetchBatch(handler, startBlock + count, remaining - count, accumulated);
+        });
+    }
+
+    /**
      * Request block bodies from any active READY peer.
      *
      * @return a future that completes with the bodies, or a failed future if no peer is available
@@ -227,6 +284,57 @@ public final class RLPxConnector implements AutoCloseable {
                 handler.getRemoteAddress(), ex.getMessage());
             // Don't permanently mark as failed — disconnects and timeouts are usually transient
             return trySnapPeer(address, stateRoot, peers, index + 1);
+        });
+    }
+
+    /**
+     * Fetch storage slots for a contract via snap/1 from any active snap peer.
+     * Automatically retries with the next snap peer if the first one fails.
+     *
+     * @param contractAddress 20-byte contract address
+     * @param storageKeyHash  32-byte keccak256(storageSlotKey) — the trie key
+     * @return future completing with the StorageRanges result
+     */
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorage(
+            Bytes contractAddress, Bytes32 storageKeyHash) {
+        return requestStorage(contractAddress, storageKeyHash, null);
+    }
+
+    public CompletableFuture<StorageRangesMessage.DecodeResult> requestStorage(
+            Bytes contractAddress, Bytes32 storageKeyHash, Bytes32 stateRoot) {
+        List<EthHandler> snapPeers = new ArrayList<>();
+        for (EthHandler handler : activeHandlers) {
+            if (handler.isReady() && handler.isSnapNegotiated() && !handler.isSnapServingFailed()) {
+                snapPeers.add(handler);
+            }
+        }
+        if (snapPeers.isEmpty()) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("No active peer with snap/1 support"));
+        }
+        return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, snapPeers, 0);
+    }
+
+    private CompletableFuture<StorageRangesMessage.DecodeResult> trySnapStoragePeer(
+            Bytes contractAddress, Bytes32 storageKeyHash, Bytes32 stateRoot,
+            List<EthHandler> peers, int index) {
+        if (index >= peers.size()) {
+            return CompletableFuture.failedFuture(
+                new IllegalStateException("All " + peers.size() + " snap peers failed to serve storage data"));
+        }
+        EthHandler handler = peers.get(index);
+        CompletableFuture<StorageRangesMessage.DecodeResult> future = stateRoot != null
+            ? handler.requestStorageAsync(contractAddress, storageKeyHash, stateRoot)
+            : handler.requestStorageAsync(contractAddress, storageKeyHash);
+        if (future == null) {
+            return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
+        }
+        log.info("[rlpx] Routed snap GetStorageRanges for {} to peer {} ({}/{})",
+            storageKeyHash.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
+        return future.exceptionallyCompose(ex -> {
+            log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
+                handler.getRemoteAddress(), ex.getMessage());
+            return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
         });
     }
 

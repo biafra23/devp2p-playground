@@ -18,14 +18,15 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class BeaconSyncState {
 
-    private record State(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {}
+    private record State(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
+                          long executionBlockNumber) {}
 
     /** A beacon-attested (slot, executionStateRoot) pair with verification status. */
     public record SlottedStateRoot(long slot, byte[] stateRoot, boolean blsVerified) {}
 
     private static final int MAX_KNOWN_ROOTS = 256;
 
-    private final AtomicReference<State> state = new AtomicReference<>(new State(0, null, 0));
+    private final AtomicReference<State> state = new AtomicReference<>(new State(0, null, 0, 0));
 
     /** Rolling window of recently seen execution state roots from beacon headers. */
     private final ConcurrentLinkedDeque<SlottedStateRoot> knownStateRoots = new ConcurrentLinkedDeque<>();
@@ -38,7 +39,15 @@ public class BeaconSyncState {
      * @param optimisticSlot      the latest optimistic (attested) slot
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {
-        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot));
+        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, 0));
+    }
+
+    /**
+     * Update the beacon sync state atomically, including the execution block number.
+     */
+    public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
+                       long executionBlockNumber) {
+        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, executionBlockNumber));
     }
 
     /**
@@ -60,6 +69,13 @@ public class BeaconSyncState {
      */
     public long getOptimisticSlot() {
         return state.get().optimisticSlot();
+    }
+
+    /**
+     * Returns the execution-layer block number of the finalized execution payload, or 0.
+     */
+    public long getExecutionBlockNumber() {
+        return state.get().executionBlockNumber();
     }
 
     /**

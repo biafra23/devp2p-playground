@@ -10,24 +10,24 @@ import java.util.Arrays;
  * Fields (in order):
  *   attestedHeader           — LightClientHeader (variable)
  *   nextSyncCommittee        — SyncCommittee (24624B, fixed inline)
- *   nextSyncCommitteeBranch  — Vector[Bytes32, 5] (160B, fixed inline)
+ *   nextSyncCommitteeBranch  — Vector[Bytes32, 5 or 6] (fork-dependent)
  *   finalizedHeader          — LightClientHeader (variable)
- *   finalityBranch           — Vector[Bytes32, 6] (192B, fixed inline)
+ *   finalityBranch           — Vector[Bytes32, 6 or 7] (fork-dependent)
  *   syncAggregate            — SyncAggregate (160B, fixed inline)
  *   signatureSlot            — uint64 (8B, fixed inline)
  *
  * SSZ fixed part (variable fields contribute 4B offsets):
  *   4B  offset to attestedHeader
  *   24624B  nextSyncCommittee
- *   160B  nextSyncCommitteeBranch
+ *   N*32B  nextSyncCommitteeBranch (N=5 pre-Electra, 6 post-Electra)
  *   4B  offset to finalizedHeader
- *   192B  finalityBranch
+ *   M*32B  finalityBranch (M=6 pre-Electra, 7 post-Electra)
  *   160B  syncAggregate
  *   8B  signatureSlot
- *   Total fixed: 4 + 24624 + 160 + 4 + 192 + 160 + 8 = 25152 bytes
  */
 public final class LightClientUpdate {
 
+    /** Minimum fixed size (pre-Electra). */
     public static final int FIXED_SIZE =
             4                           // attestedHeader offset
             + SyncCommittee.ENCODED_SIZE  // nextSyncCommittee = 24624
@@ -39,9 +39,9 @@ public final class LightClientUpdate {
 
     private final LightClientHeader attestedHeader;
     private final SyncCommittee nextSyncCommittee;
-    private final byte[][] nextSyncCommitteeBranch; // 5 x 32
+    private final byte[][] nextSyncCommitteeBranch;
     private final LightClientHeader finalizedHeader;
-    private final byte[][] finalityBranch;           // 6 x 32
+    private final byte[][] finalityBranch;
     private final SyncAggregate syncAggregate;
     private final long signatureSlot;
 
@@ -66,15 +66,8 @@ public final class LightClientUpdate {
     /**
      * Decode a LightClientUpdate from SSZ bytes.
      *
-     * Fixed layout (bytes):
-     *   [0..4)        offset to attestedHeader
-     *   [4..24628)    nextSyncCommittee
-     *   [24628..24788) nextSyncCommitteeBranch (5*32)
-     *   [24788..24792) offset to finalizedHeader
-     *   [24792..24984) finalityBranch (6*32)
-     *   [24984..25144) syncAggregate (160)
-     *   [25144..25152) signatureSlot (8)
-     *   variable: attestedHeader at offset0, finalizedHeader at offset1
+     * The branch lengths are fork-dependent. We derive them from the
+     * attestedHeaderOffset (which equals the fixed part size).
      */
     public static LightClientUpdate decode(byte[] ssz) {
         if (ssz.length < FIXED_SIZE) {
@@ -84,42 +77,57 @@ public final class LightClientUpdate {
 
         ByteBuffer buf = ByteBuffer.wrap(ssz).order(ByteOrder.LITTLE_ENDIAN);
 
-        // offset to attestedHeader
+        // Read attestedHeaderOffset to determine the actual fixed part size
         int attestedHeaderOffset = buf.getInt();  // pos 4
+
+        // Derive branch sizes from the fixed part.
+        // fixedSize = 4 + 24624 + scBranch + 4 + finBranch + 160 + 8
+        // where scBranch = scNodes*32, finBranch = finNodes*32
+        // Pre-Electra: scNodes=5, finNodes=6 → fixed=25152
+        // Post-Electra: scNodes=6, finNodes=7 → fixed=25216
+        int totalBranchBytes = attestedHeaderOffset - 4 - SyncCommittee.ENCODED_SIZE - 4 - 160 - 8;
+        int scBranchNodes, finBranchNodes;
+        if (totalBranchBytes == 5 * 32 + 6 * 32) {
+            scBranchNodes = 5; finBranchNodes = 6;  // pre-Electra
+        } else if (totalBranchBytes == 6 * 32 + 7 * 32) {
+            scBranchNodes = 6; finBranchNodes = 7;  // post-Electra
+        } else {
+            // Fall back to pre-Electra
+            scBranchNodes = 5; finBranchNodes = 6;
+        }
 
         // nextSyncCommittee (24624B)
         byte[] nextSyncCommitteeBytes = new byte[SyncCommittee.ENCODED_SIZE];
-        buf.get(nextSyncCommitteeBytes);  // pos 24628
+        buf.get(nextSyncCommitteeBytes);
         SyncCommittee nextSyncCommittee = SyncCommittee.decode(nextSyncCommitteeBytes);
 
-        // nextSyncCommitteeBranch (5 * 32B = 160B)
-        byte[][] nextSyncCommitteeBranch = new byte[5][32];
-        for (int i = 0; i < 5; i++) {
-            buf.get(nextSyncCommitteeBranch[i]);  // pos 24788
+        // nextSyncCommitteeBranch
+        byte[][] nextSyncCommitteeBranch = new byte[scBranchNodes][32];
+        for (int i = 0; i < scBranchNodes; i++) {
+            buf.get(nextSyncCommitteeBranch[i]);
         }
 
         // offset to finalizedHeader
-        int finalizedHeaderOffset = buf.getInt();  // pos 24792
+        int finalizedHeaderOffset = buf.getInt();
 
-        // finalityBranch (6 * 32B = 192B)
-        byte[][] finalityBranch = new byte[6][32];
-        for (int i = 0; i < 6; i++) {
-            buf.get(finalityBranch[i]);  // pos 24984
+        // finalityBranch
+        byte[][] finalityBranch = new byte[finBranchNodes][32];
+        for (int i = 0; i < finBranchNodes; i++) {
+            buf.get(finalityBranch[i]);
         }
 
         // syncAggregate (160B)
         byte[] syncAggregateBytes = new byte[160];
-        buf.get(syncAggregateBytes);  // pos 25144
+        buf.get(syncAggregateBytes);
         SyncAggregate syncAggregate = SyncAggregate.decode(syncAggregateBytes);
 
         // signatureSlot (8B)
-        long signatureSlot = buf.getLong();  // pos 25152
+        long signatureSlot = buf.getLong();
 
         // Decode variable-length attestedHeader
-        if (attestedHeaderOffset < FIXED_SIZE || attestedHeaderOffset > ssz.length) {
+        if (attestedHeaderOffset > ssz.length) {
             throw new IllegalArgumentException("Invalid attestedHeader offset: " + attestedHeaderOffset);
         }
-        // attestedHeader ends where finalizedHeader begins (or end of ssz if same)
         byte[] attestedHeaderBytes;
         if (finalizedHeaderOffset > attestedHeaderOffset && finalizedHeaderOffset <= ssz.length) {
             attestedHeaderBytes = Arrays.copyOfRange(ssz, attestedHeaderOffset, finalizedHeaderOffset);
@@ -129,7 +137,7 @@ public final class LightClientUpdate {
         LightClientHeader attestedHeader = LightClientHeader.decode(attestedHeaderBytes);
 
         // Decode variable-length finalizedHeader
-        if (finalizedHeaderOffset < FIXED_SIZE || finalizedHeaderOffset > ssz.length) {
+        if (finalizedHeaderOffset > ssz.length) {
             throw new IllegalArgumentException("Invalid finalizedHeader offset: " + finalizedHeaderOffset);
         }
         byte[] finalizedHeaderBytes = Arrays.copyOfRange(ssz, finalizedHeaderOffset, ssz.length);

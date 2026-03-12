@@ -96,11 +96,18 @@ public final class BlockHeadersMessage {
                 long blobGasUsed = -1;
                 long excessBlobGas = -1;
                 Bytes32 parentBeaconRoot = null;
+                Bytes32 requestsHash = null;  // EIP-7685 (Prague/Electra)
                 if (!headerReader.isComplete()) baseFee = headerReader.readBigInteger();
                 if (!headerReader.isComplete()) withdrawalsRoot = Bytes32.wrap(headerReader.readValue());
                 if (!headerReader.isComplete()) blobGasUsed = headerReader.readLong();
                 if (!headerReader.isComplete()) excessBlobGas = headerReader.readLong();
                 if (!headerReader.isComplete()) parentBeaconRoot = Bytes32.wrap(headerReader.readValue());
+                if (!headerReader.isComplete()) requestsHash = Bytes32.wrap(headerReader.readValue());
+                // Capture any future unknown fields as raw values
+                java.util.List<Bytes> unknownFields = new java.util.ArrayList<>();
+                while (!headerReader.isComplete()) {
+                    unknownFields.add(headerReader.readValue());
+                }
 
                 // Re-encode to get the canonical RLP for hashing
                 final java.math.BigInteger fBaseFee = baseFee;
@@ -108,6 +115,8 @@ public final class BlockHeadersMessage {
                 final long fBGU = blobGasUsed;
                 final long fEBG = excessBlobGas;
                 final Bytes32 fPBR = parentBeaconRoot;
+                final Bytes32 fRH = requestsHash;
+                final java.util.List<Bytes> fExtra = unknownFields;
                 rawHolder[0] = RLP.encodeList(w -> {
                     w.writeValue(parentHash); w.writeValue(ommersHash);
                     w.writeValue(beneficiary); w.writeValue(stateRoot);
@@ -122,6 +131,8 @@ public final class BlockHeadersMessage {
                     if (fBGU >= 0) w.writeLong(fBGU);
                     if (fEBG >= 0) w.writeLong(fEBG);
                     if (fPBR != null) w.writeValue(fPBR);
+                    if (fRH != null) w.writeValue(fRH);
+                    for (Bytes extra : fExtra) w.writeValue(extra);
                 });
                 return null;
             });
