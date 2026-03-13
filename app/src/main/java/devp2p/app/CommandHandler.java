@@ -541,8 +541,7 @@ public class CommandHandler {
             int atIdx = rest.indexOf('@');
             if (atIdx < 0) return jsonError("Invalid enode format: missing @");
             String pubKeyHex = rest.substring(0, atIdx);
-            String hostPort = rest.split("\\?")[0].substring(atIdx + 1); // strip query params
-            hostPort = rest.substring(atIdx + 1).split("\\?")[0];
+            String hostPort = rest.substring(atIdx + 1).split("\\?")[0]; // strip query params
             int colonIdx = hostPort.lastIndexOf(':');
             if (colonIdx < 0) return jsonError("Invalid enode format: missing port");
             String host = hostPort.substring(0, colonIdx);
