@@ -331,7 +331,15 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Routed snap GetStorageRanges for {} to peer {} ({}/{})",
             storageKeyHash.toShortHexString(), handler.getRemoteAddress(), index + 1, peers.size());
-        return future.exceptionallyCompose(ex -> {
+        return future.thenCompose(result -> {
+            if (result.slots().isEmpty() && result.proof().isEmpty()) {
+                log.warn("[rlpx] Peer {} returned empty storage response, trying next peer",
+                    handler.getRemoteAddress());
+                handler.markSnapServingFailed();
+                return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
+            }
+            return CompletableFuture.completedFuture(result);
+        }).exceptionallyCompose(ex -> {
             log.warn("[rlpx] Snap storage request failed on peer {}: {}, trying next peer",
                 handler.getRemoteAddress(), ex.getMessage());
             return trySnapStoragePeer(contractAddress, storageKeyHash, stateRoot, peers, index + 1);
