@@ -22,7 +22,7 @@ A from-scratch Ethereum devp2p implementation in Java 21. Connects to the Ethere
 
 ## Run
 
-The application operates in two modes: **daemon** and **client**. The daemon discovers peers, maintains connections, and listens for commands on a Unix domain socket (`/tmp/devp2p.sock`). The client sends a single command to the running daemon and exits.
+The application operates in two modes: **daemon** and **client**. The daemon discovers peers, maintains connections, and listens for commands on a Unix domain socket (`/tmp/ethp2p.sock`). The client sends a single command to the running daemon and exits.
 
 ### Start the daemon
 
