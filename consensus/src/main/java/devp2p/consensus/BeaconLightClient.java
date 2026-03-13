@@ -160,6 +160,8 @@ public class BeaconLightClient implements AutoCloseable {
         // Phase 1b: catch up sync committee if bootstrap is from an older period
         if (store.isInitialized()) {
             catchUpSyncCommittee();
+            // Fill state roots immediately so verification works before the first finality update
+            fillChainStateRootsFromAnyPeer(true);
         }
 
         // Phase 2: fall back to seeding without BLS if bootstrap failed
@@ -784,6 +786,24 @@ public class BeaconLightClient implements AutoCloseable {
     // -------------------------------------------------------------------------
     // Chain fill: fetch intermediate blocks and verify hash chain
     // -------------------------------------------------------------------------
+
+    /**
+     * Try to fill chain state roots from any available peer.
+     * Used after bootstrap to populate the state root window immediately.
+     *
+     * @param blsVerified true if the bootstrap was BLS-verified
+     */
+    private void fillChainStateRootsFromAnyPeer(boolean blsVerified) {
+        for (String peer : List.copyOf(clPeerMultiaddrs)) {
+            if (!running) return;
+            try {
+                fillChainStateRoots(peer, blsVerified);
+                return; // success
+            } catch (Exception e) {
+                log.debug("[beacon] Post-bootstrap chain fill failed from {}: {}", peer, e.getMessage());
+            }
+        }
+    }
 
     /**
      * After a successful finality update, fetch all beacon blocks between the

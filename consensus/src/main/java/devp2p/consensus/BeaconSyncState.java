@@ -24,7 +24,7 @@ public class BeaconSyncState {
     /** A beacon-attested (slot, executionStateRoot) pair with verification status. */
     public record SlottedStateRoot(long slot, byte[] stateRoot, boolean blsVerified) {}
 
-    private static final int MAX_KNOWN_ROOTS = 256;
+    private static final int MAX_KNOWN_ROOTS = 8192;
 
     private final AtomicReference<State> state = new AtomicReference<>(new State(0, null, 0, 0));
 
