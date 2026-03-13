@@ -125,25 +125,9 @@ public final class EciesCodec {
         byte[] macKey = Arrays.copyOfRange(keyMaterial, KEY_SIZE, KEY_SIZE + MAC_KEY_SIZE);
 
         // Verify MAC = HMAC-SHA256(SHA-256(macKey), IV || ciphertext [|| aad])
-        byte[] macInputWithAad = aad.length > 0 ? concat(iv, ciphertext, aad) : concat(iv, ciphertext);
-        byte[] macInputNoAad = concat(iv, ciphertext);
-        byte[] expectedMacWithAad = hmacSha256(sha256(macKey), macInputWithAad);
-        byte[] expectedMacNoAad = hmacSha256(sha256(macKey), macInputNoAad);
-        byte[] expectedMac;
-        if (Arrays.equals(mac, expectedMacWithAad)) {
-            expectedMac = expectedMacWithAad;
-        } else if (Arrays.equals(mac, expectedMacNoAad)) {
-            System.err.println("ECIES DEBUG: MAC matched WITHOUT AAD — test vector does not use auth-size as AAD!");
-            expectedMac = expectedMacNoAad;
-        } else {
-            System.err.printf("ECIES DEBUG: shared=%s%n", bytesToHex(shared));
-            System.err.printf("ECIES DEBUG: keyMat=%s%n", bytesToHex(keyMaterial));
-            System.err.printf("ECIES DEBUG: macKey=%s sha256(macKey)=%s%n",
-                bytesToHex(macKey), bytesToHex(sha256(macKey)));
-            System.err.printf("ECIES DEBUG: iv=%s%n", bytesToHex(iv));
-            System.err.printf("ECIES DEBUG: mac(wire)=%s%n", bytesToHex(mac));
-            System.err.printf("ECIES DEBUG: mac(withAad)=%s%n", bytesToHex(expectedMacWithAad));
-            System.err.printf("ECIES DEBUG: mac(noAad)=%s%n", bytesToHex(expectedMacNoAad));
+        byte[] macInput = aad.length > 0 ? concat(iv, ciphertext, aad) : concat(iv, ciphertext);
+        byte[] expectedMac = hmacSha256(sha256(macKey), macInput);
+        if (!Arrays.equals(mac, expectedMac)) {
             throw new IllegalArgumentException("ECIES MAC verification failed");
         }
 

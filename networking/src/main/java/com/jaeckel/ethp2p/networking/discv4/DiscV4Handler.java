@@ -83,9 +83,6 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
             sender, tcpPort, nodeId, System.currentTimeMillis());
         table.add(entry);
         onPeerDiscovered.accept(entry);
-        // Send FindNode to get more peers
-        Bytes findNode = Packet.encodeFindNode(nodeKey, nodeKey.publicKeyBytes());
-        sendPacket(ctx, findNode, sender);
     }
 
     private void handlePong(ChannelHandlerContext ctx, Packet.Parsed p, InetSocketAddress sender) {

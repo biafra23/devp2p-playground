@@ -14,7 +14,10 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -90,9 +93,20 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
 
 
     // Cache received headers so we can serve them back to peers (by block number)
-    private final ConcurrentMap<Long, byte[]> headerCache = new ConcurrentHashMap<>();
+    private static final int MAX_CACHE_ENTRIES = 10_000;
+    private final Map<Long, byte[]> headerCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<Long, byte[]> eldest) {
+                    return size() > MAX_CACHE_ENTRIES;
+                }
+            });
     // Cache by block hash hex string for hash-based lookups
-    private final ConcurrentMap<String, byte[]> hashCache = new ConcurrentHashMap<>();
+    private final Map<String, byte[]> hashCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+                    return size() > MAX_CACHE_ENTRIES;
+                }
+            });
 
     private RLPxHandler rlpxHandler; // reference to the RLPx layer for sending
     private volatile ChannelHandlerContext readyCtx; // stored when state reaches READY
@@ -322,7 +336,7 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
                                 hashHolder[0] = start.toShortHexString();
                                 fullHashHolder[0] = start.toHexString();
                             }
-                            countHolder[0] = r.readInt();
+                            countHolder[0] = Math.min(r.readInt(), 1024);
                             return null;
                         });
                         return null;

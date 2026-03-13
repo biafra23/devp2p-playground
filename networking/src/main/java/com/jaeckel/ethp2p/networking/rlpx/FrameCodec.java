@@ -41,6 +41,8 @@ import java.util.Arrays;
  */
 public final class FrameCodec {
 
+    public static final int MAX_FRAME_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+
     private final StreamCipher encryptCipher;  // AES-256-CTR for outgoing
     private final StreamCipher decryptCipher;  // AES-256-CTR for incoming
 
@@ -149,7 +151,11 @@ public final class FrameCodec {
         // Decrypt header
         byte[] header = new byte[16];
         decryptCipher.processBytes(encHeader, 0, 16, header, 0);
-        return ((header[0] & 0xFF) << 16) | ((header[1] & 0xFF) << 8) | (header[2] & 0xFF);
+        int bodyLen = ((header[0] & 0xFF) << 16) | ((header[1] & 0xFF) << 8) | (header[2] & 0xFF);
+        if (bodyLen > MAX_FRAME_BODY_SIZE) {
+            throw new IllegalStateException("Frame body size " + bodyLen + " exceeds maximum " + MAX_FRAME_BODY_SIZE);
+        }
+        return bodyLen;
     }
 
     /** Decode frame body: verifies MAC, returns decoded message. */
