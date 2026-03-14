@@ -83,9 +83,6 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
             sender, tcpPort, nodeId, System.currentTimeMillis());
         table.add(entry);
         onPeerDiscovered.accept(entry);
-        // Send FindNode to get more peers
-        Bytes findNode = Packet.encodeFindNode(nodeKey, nodeKey.publicKeyBytes());
-        sendPacket(ctx, findNode, sender);
     }
 
     private void handlePong(ChannelHandlerContext ctx, Packet.Parsed p, InetSocketAddress sender) {
@@ -100,7 +97,7 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
             onPeerDiscovered.accept(entry);
             // NOTE: Do NOT send FindNode here. go-ethereum requires "LastPongReceived"
             // from us before answering FindNode. We must first respond to the bootnode's
-            // return Ping (handlePing sends FindNode after the Pong response).
+            // return Ping before initiating any FindNode requests.
         } else {
             log.debug("[discv4] Unsolicited/mismatched pong from {}", sender);
         }

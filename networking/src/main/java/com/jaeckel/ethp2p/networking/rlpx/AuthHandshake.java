@@ -36,6 +36,7 @@ import java.security.SecureRandom;
  */
 public final class AuthHandshake {
 
+    private static final SecureRandom RNG = new SecureRandom();
     private static final X9ECParameters CURVE_PARAMS = SECNamedCurves.getByName("secp256k1");
     private static final ECDomainParameters CURVE = new ECDomainParameters(
         CURVE_PARAMS.getCurve(), CURVE_PARAMS.getG(), CURVE_PARAMS.getN(), CURVE_PARAMS.getH());
@@ -96,8 +97,8 @@ public final class AuthHandshake {
 
         // EIP-8: RLP encode the auth body. Random padding goes INSIDE the list
         // as a trailing byte-string element (go-ethereum's rlp:"tail" consumes it).
-        byte[] padding = new byte[100 + new java.security.SecureRandom().nextInt(200)];
-        new java.security.SecureRandom().nextBytes(padding);
+        byte[] padding = new byte[100 + RNG.nextInt(200)];
+        RNG.nextBytes(padding);
         Bytes authBody = org.apache.tuweni.rlp.RLP.encodeList(writer -> {
             writer.writeValue(Bytes.wrap(sigBytes));
             writer.writeValue(Bytes.wrap(pubkeyBytes));
@@ -224,7 +225,7 @@ public final class AuthHandshake {
 
     private static Bytes32 randomBytes32() {
         byte[] b = new byte[32];
-        new SecureRandom().nextBytes(b);
+        RNG.nextBytes(b);
         return Bytes32.wrap(b);
     }
 }
