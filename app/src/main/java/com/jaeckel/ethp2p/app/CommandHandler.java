@@ -188,9 +188,9 @@ public class CommandHandler {
         long blockNumber = extractLong(jsonLine, "blockNumber");
 
         try {
-            // Step 1: fetch the header
+            // Step 1: fetch the header (use batched path which retries across peers)
             List<BlockHeadersMessage.VerifiedHeader> headers =
-                    connector.requestBlockHeaders(blockNumber, 1)
+                    connector.requestBlockHeadersBatched(blockNumber, 1)
                              .get(30, TimeUnit.SECONDS);
             if (headers.isEmpty()) {
                 return jsonError("No header returned for block " + blockNumber);
@@ -208,7 +208,10 @@ public class CommandHandler {
             }
             BlockBodiesMessage.BlockBody body = bodies.get(0);
 
-            // Step 3: combine into JSON response
+            // Step 3: verify block against beacon chain
+            String verificationJson = buildBlockVerificationJson(h, blockNumber);
+
+            // Step 4: combine into JSON response
             StringBuilder sb = new StringBuilder();
             sb.append("{\"ok\":true,\"block\":{");
             sb.append("\"number\":").append(h.number);
@@ -216,6 +219,7 @@ public class CommandHandler {
             sb.append(",\"parentHash\":\"").append(h.parentHash.toHexString()).append("\"");
             sb.append(",\"stateRoot\":\"").append(h.stateRoot.toHexString()).append("\"");
             sb.append(",\"transactionsRoot\":\"").append(h.transactionsRoot.toHexString()).append("\"");
+            sb.append(",\"receiptsRoot\":\"").append(h.receiptsRoot.toHexString()).append("\"");
             sb.append(",\"timestamp\":").append(h.timestamp);
             sb.append(",\"gasUsed\":").append(h.gasUsed);
             sb.append(",\"gasLimit\":").append(h.gasLimit);
@@ -225,13 +229,186 @@ public class CommandHandler {
             sb.append(",\"transactionCount\":").append(body.transactions().size());
             sb.append(",\"uncleCount\":").append(body.uncleCount());
             sb.append(",\"withdrawalCount\":").append(body.withdrawalCount());
-            sb.append("}}");
+            sb.append("},\"verification\":").append(verificationJson).append("}");
             return sb.toString();
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
             return jsonError(msg);
         }
+    }
+
+    /**
+     * Build beacon chain verification JSON for a block header.
+     *
+     * Verification strategy:
+     * 1. State root match — check if the block's stateRoot matches a beacon-attested root
+     * 2. Header chain anchored to beacon block hash — the beacon chain's ExecutionPayloadHeader
+     *    contains a block_hash field verified by sync committee BLS signatures. We fetch the
+     *    finalized block header from the peer, verify its keccak256(RLP) matches the beacon-
+     *    attested block hash, then walk the parent-hash chain to/from the requested block.
+     *    Each link in the chain is pinned by the previous header's keccak256 hash, so forging
+     *    any header would require a keccak256 preimage attack.
+     */
+    /** The Merge block — first PoS block on mainnet (Sep 15 2022). */
+    private static final long MERGE_BLOCK = 15_537_394L;
+    private static final int MAX_HEADER_CHAIN_GAP = 8192;
+
+    private String buildBlockVerificationJson(BlockHeader header, long blockNumber) {
+        boolean beaconChainVerified = false;
+        boolean blsVerified = false;
+        long matchedSlot = -1;
+        String verifyMethod = null;
+        String failReason = null;
+
+        // Pre-merge blocks cannot be verified via beacon chain
+        if (blockNumber < MERGE_BLOCK) {
+            failReason = "preMergeBlock";
+        } else {
+            // Strategy 1: direct state root match against beacon-attested roots
+            byte[] blockStateRoot = header.stateRoot.toArrayUnsafe();
+            BeaconSyncState.SlottedStateRoot match = beaconSyncState.findStateRoot(blockStateRoot);
+            if (match != null) {
+                beaconChainVerified = true;
+                matchedSlot = match.slot();
+                blsVerified = match.blsVerified();
+                verifyMethod = "stateRootMatch";
+            }
+
+            // Strategy 2: header chain anchored to beacon-attested block hash
+            if (!beaconChainVerified && beaconSyncState.isSynced()) {
+                long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+                byte[] beaconBlockHash = beaconSyncState.getExecutionBlockHash();
+                long gap = Math.abs(blockNumber - finalizedBlockNum);
+                log.info("[verify-block] headerChain: block={}, finalizedBlock={}, gap={}",
+                        blockNumber, finalizedBlockNum, gap);
+                if (finalizedBlockNum <= 0 || beaconBlockHash == null || beaconBlockHash.length != 32) {
+                    failReason = "beaconBlockHashUnavailable";
+                } else if (gap > MAX_HEADER_CHAIN_GAP && blockNumber != finalizedBlockNum) {
+                    failReason = "headerChainGapTooLarge";
+                } else {
+                    try {
+                        boolean chainValid;
+                        if (blockNumber == finalizedBlockNum) {
+                            chainValid = verifyBlockHashAgainstBeacon(
+                                    finalizedBlockNum, beaconBlockHash, blockStateRoot);
+                        } else if (blockNumber > finalizedBlockNum) {
+                            chainValid = verifyBlockChainFromBeacon(
+                                    finalizedBlockNum, blockNumber, beaconBlockHash);
+                        } else {
+                            chainValid = verifyBlockChainFromBeacon(
+                                    blockNumber, finalizedBlockNum, beaconBlockHash);
+                        }
+                        if (chainValid) {
+                            beaconChainVerified = true;
+                            matchedSlot = beaconSyncState.getFinalizedSlot();
+                            blsVerified = true;
+                            verifyMethod = "headerChain";
+                        } else {
+                            failReason = "headerChainInvalid";
+                        }
+                    } catch (Exception e) {
+                        log.info("[verify-block] Header chain verification failed: {}", e.getMessage());
+                        failReason = "headerChainError";
+                    }
+                }
+            } else if (!beaconChainVerified && !beaconSyncState.isSynced()) {
+                failReason = "beaconNotSynced";
+            }
+        }
+
+        StringBuilder sb = new StringBuilder("{");
+        sb.append("\"beaconSynced\":").append(beaconSyncState.isSynced());
+        sb.append(",\"beaconChainVerified\":").append(beaconChainVerified);
+        if (beaconChainVerified) {
+            sb.append(",\"matchedBeaconSlot\":").append(matchedSlot);
+            sb.append(",\"blsVerified\":").append(blsVerified);
+            if (verifyMethod != null) {
+                sb.append(",\"verifyMethod\":\"").append(verifyMethod).append("\"");
+            }
+        }
+        if (!beaconChainVerified && failReason != null) {
+            sb.append(",\"failReason\":\"").append(failReason).append("\"");
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /**
+     * Verify a single block by checking its hash against the beacon-attested block hash.
+     * Used when the requested block IS the finalized block.
+     */
+    private boolean verifyBlockHashAgainstBeacon(long blockNumber, byte[] beaconBlockHash,
+                                                  byte[] expectedStateRoot) throws Exception {
+        List<BlockHeadersMessage.VerifiedHeader> headers =
+                connector.requestBlockHeaders(blockNumber, 1).get(30, TimeUnit.SECONDS);
+        if (headers.isEmpty()) return false;
+        BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
+        // VerifiedHeader.hash() is keccak256(rawRLP) computed locally — compare to beacon anchor
+        if (!java.util.Arrays.equals(vh.hash().toArrayUnsafe(), beaconBlockHash)) {
+            log.info("[verify-block] Finalized block hash mismatch: peer={} beacon={}",
+                    vh.hash().toShortHexString(), Bytes32.wrap(beaconBlockHash).toShortHexString());
+            return false;
+        }
+        // Also confirm stateRoot matches what the requested block header has
+        return java.util.Arrays.equals(vh.header().stateRoot.toArrayUnsafe(), expectedStateRoot);
+    }
+
+    /**
+     * Verify a chain of blocks anchored to the beacon-attested block hash.
+     *
+     * Fetches headers from startBlock to endBlock. The header at finalizedBlockNum
+     * must have keccak256(RLP) == beaconBlockHash (the sync-committee-verified anchor).
+     * All other headers are verified via parent-hash chaining from that anchor.
+     */
+    private boolean verifyBlockChainFromBeacon(long startBlock, long endBlock,
+                                                byte[] beaconBlockHash) throws Exception {
+        long finalizedBlockNum = beaconSyncState.getExecutionBlockNumber();
+        int total = (int) (endBlock - startBlock + 1);
+        if (total < 2 || total > MAX_HEADER_CHAIN_GAP) {
+            log.info("[verify-block] Block chain gap {} — out of range [2, {}]", total, MAX_HEADER_CHAIN_GAP);
+            return false;
+        }
+
+        log.info("[verify-block] Fetching {} headers from block #{} to #{}", total, startBlock, endBlock);
+        List<BlockHeadersMessage.VerifiedHeader> allHeaders =
+                connector.requestBlockHeadersBatched(startBlock, total)
+                        .get(120, TimeUnit.SECONDS);
+        if (allHeaders.size() != total) {
+            log.info("[verify-block] Expected {} headers, got {}", total, allHeaders.size());
+            return false;
+        }
+
+        // Find the finalized block within the chain and verify its hash against beacon
+        int anchorIndex = (int) (finalizedBlockNum - startBlock);
+        if (anchorIndex < 0 || anchorIndex >= allHeaders.size()) {
+            log.info("[verify-block] Finalized block #{} not in range [{}, {}]",
+                    finalizedBlockNum, startBlock, endBlock);
+            return false;
+        }
+        BlockHeadersMessage.VerifiedHeader anchorHeader = allHeaders.get(anchorIndex);
+        if (!java.util.Arrays.equals(anchorHeader.hash().toArrayUnsafe(), beaconBlockHash)) {
+            log.info("[verify-block] Anchor block hash mismatch at #{}: peer={} beacon={}",
+                    finalizedBlockNum, anchorHeader.hash().toShortHexString(),
+                    Bytes32.wrap(beaconBlockHash).toShortHexString());
+            return false;
+        }
+
+        // Verify parent-hash chain continuity across all headers
+        for (int i = 0; i < allHeaders.size() - 1; i++) {
+            Bytes32 currentHash = allHeaders.get(i).hash();
+            Bytes32 nextParent = allHeaders.get(i + 1).header().parentHash;
+            if (!currentHash.equals(nextParent)) {
+                log.info("[verify-block] Hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
+                        i, allHeaders.get(i).header().number, currentHash.toShortHexString(),
+                        allHeaders.get(i + 1).header().number, nextParent.toShortHexString());
+                return false;
+            }
+        }
+
+        log.info("[verify-block] Block chain verified: {} headers anchored at finalized block #{}",
+                total, finalizedBlockNum);
+        return true;
     }
 
     private String handleGetAccount(String jsonLine) {

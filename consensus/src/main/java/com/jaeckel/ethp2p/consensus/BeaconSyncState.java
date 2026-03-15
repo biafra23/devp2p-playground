@@ -19,14 +19,14 @@ import java.util.concurrent.atomic.AtomicReference;
 public class BeaconSyncState {
 
     private record State(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
-                          long executionBlockNumber) {}
+                          long executionBlockNumber, byte[] executionBlockHash) {}
 
     /** A beacon-attested (slot, executionStateRoot) pair with verification status. */
     public record SlottedStateRoot(long slot, byte[] stateRoot, boolean blsVerified) {}
 
     private static final int MAX_KNOWN_ROOTS = 8192;
 
-    private final AtomicReference<State> state = new AtomicReference<>(new State(0, null, 0, 0));
+    private final AtomicReference<State> state = new AtomicReference<>(new State(0, null, 0, 0, null));
 
     /** Rolling window of recently seen execution state roots from beacon headers. */
     private final ConcurrentLinkedDeque<SlottedStateRoot> knownStateRoots = new ConcurrentLinkedDeque<>();
@@ -39,7 +39,7 @@ public class BeaconSyncState {
      * @param optimisticSlot      the latest optimistic (attested) slot
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {
-        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, 0));
+        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, 0, null));
     }
 
     /**
@@ -47,7 +47,16 @@ public class BeaconSyncState {
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
                        long executionBlockNumber) {
-        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, executionBlockNumber));
+        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot, executionBlockNumber, null));
+    }
+
+    /**
+     * Update the beacon sync state atomically, including execution block number and block hash.
+     */
+    public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot,
+                       long executionBlockNumber, byte[] executionBlockHash) {
+        state.set(new State(finalizedSlot, executionStateRoot, optimisticSlot,
+                executionBlockNumber, executionBlockHash != null ? executionBlockHash.clone() : null));
     }
 
     /**
@@ -76,6 +85,13 @@ public class BeaconSyncState {
      */
     public long getExecutionBlockNumber() {
         return state.get().executionBlockNumber();
+    }
+
+    /**
+     * Returns the beacon-verified execution block hash of the finalized payload, or null.
+     */
+    public byte[] getExecutionBlockHash() {
+        return state.get().executionBlockHash();
     }
 
     /**

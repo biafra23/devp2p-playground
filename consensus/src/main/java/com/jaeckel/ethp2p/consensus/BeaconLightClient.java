@@ -558,7 +558,8 @@ public class BeaconLightClient implements AutoCloseable {
 
                 // Seed the sync state directly (trusted peer, no BLS verification)
                 long execBlockNum = finalizedHeader.execution().blockNumber();
-                syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot(), execBlockNum);
+                byte[] execBlockHash = finalizedHeader.execution().blockHash();
+                syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot(), execBlockNum, execBlockHash);
                 syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
                 // Also record the attested header's execution state root
                 long attestedSlot = update.attestedHeader().beacon().slot();
@@ -645,7 +646,14 @@ public class BeaconLightClient implements AutoCloseable {
             Matcher blockNumMatcher = blockNumPattern.matcher(body);
             long execBlockNum = blockNumMatcher.find() ? Long.parseLong(blockNumMatcher.group(1)) : 0;
 
-            syncState.update(finalizedSlot, executionStateRoot, signatureSlot, execBlockNum);
+            // Extract finalized execution block_hash
+            Pattern blockHashPattern = Pattern.compile(
+                    "\"finalized_header\"\\s*:\\s*\\{.*?\"execution\"\\s*:\\s*\\{.*?\"block_hash\"\\s*:\\s*\"(0x[0-9a-fA-F]{64})\"",
+                    Pattern.DOTALL);
+            Matcher blockHashMatcher = blockHashPattern.matcher(body);
+            byte[] execBlockHash = blockHashMatcher.find() ? hexToBytes(blockHashMatcher.group(1)) : null;
+
+            syncState.update(finalizedSlot, executionStateRoot, signatureSlot, execBlockNum, execBlockHash);
             syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
 
             // Also extract attested_header execution state root if present
@@ -751,7 +759,8 @@ public class BeaconLightClient implements AutoCloseable {
                         notifyPeerSuccess(peer);
                         if (slot > syncState.getFinalizedSlot()) {
                             long execBlockNum = fh.execution().blockNumber();
-                            syncState.update(slot, sr, update.signatureSlot(), execBlockNum);
+                            byte[] execBlockHash = fh.execution().blockHash();
+                            syncState.update(slot, sr, update.signatureSlot(), execBlockNum, execBlockHash);
                             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", peer, slot);
                         }
                         return;
@@ -781,7 +790,8 @@ public class BeaconLightClient implements AutoCloseable {
         if (finalizedHeader != null) {
             byte[] stateRoot = finalizedHeader.execution().stateRoot();
             long execBlockNum = finalizedHeader.execution().blockNumber();
-            syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(), execBlockNum);
+            byte[] execBlockHash = finalizedHeader.execution().blockHash();
+            syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(), execBlockNum, execBlockHash);
             syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
         }
         LightClientHeader optimisticHeader = store.getOptimisticHeader();

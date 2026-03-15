@@ -119,6 +119,54 @@ Returns beacon chain light client sync state.
 ./gradlew :app:run -Pargs="get-block 21000000"
 ```
 
+Returns block header and body data with beacon chain verification.
+
+**Block fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `number` | long | Block number |
+| `hash` | string | Block hash (keccak256 of RLP-encoded header) |
+| `parentHash` | string | Parent block hash |
+| `stateRoot` | string | State trie root after executing this block |
+| `transactionsRoot` | string | Transactions trie root |
+| `receiptsRoot` | string | Receipts trie root |
+| `timestamp` | long | Block timestamp (Unix seconds) |
+| `gasUsed` | long | Total gas used by all transactions |
+| `gasLimit` | long | Block gas limit |
+| `baseFeePerGas` | string | EIP-1559 base fee (post-London only) |
+| `transactionCount` | int | Number of transactions in the block |
+| `uncleCount` | int | Number of uncle blocks (always 0 post-Merge) |
+| `withdrawalCount` | int | Number of validator withdrawals (post-Shanghai) |
+
+**Verification fields** (in the `verification` object):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `beaconSynced` | boolean | Whether the beacon light client has synced |
+| `beaconChainVerified` | boolean | Whether the block is verified against the beacon chain |
+| `verifyMethod` | string | `"stateRootMatch"` or `"headerChain"` (only when `beaconChainVerified=true`) |
+| `matchedBeaconSlot` | long | Beacon slot trust anchor (only when `beaconChainVerified=true`) |
+| `blsVerified` | boolean | Whether the trust anchor has BLS verification (only when `beaconChainVerified=true`) |
+| `failReason` | string | Why verification failed (only when `beaconChainVerified=false`, see below) |
+
+**`failReason` values:**
+
+| Value | Description |
+|-------|-------------|
+| `preMergeBlock` | Block is before The Merge (block 15,537,394). Pre-merge blocks cannot be verified via the beacon chain. |
+| `headerChainGapTooLarge` | The block is more than 8,192 blocks away from the beacon-finalized block. |
+| `beaconNotSynced` | The beacon light client has not synced yet. |
+| `beaconBlockHashUnavailable` | The beacon state does not have a finalized block hash to anchor against. |
+| `headerChainInvalid` | A header chain was fetched but failed validation (hash mismatch or discontinuity). |
+| `headerChainError` | An error occurred while fetching or verifying the header chain. |
+
+**Block verification model:**
+
+Block verification works differently from account/storage verification. Account and storage queries have two layers of protection: a Merkle-Patricia proof (binding data to a state root) and beacon chain linkage (proving the state root is canonical). Block verification has only the beacon chain linkage layer -- there is no Merkle proof for block inclusion.
+
+The verification anchors to the beacon chain's `ExecutionPayloadHeader.block_hash`, which is verified by sync committee BLS signatures. The finalized block header is fetched from a peer, and its locally-computed `keccak256(RLP)` is compared against this beacon-attested hash. From that anchor, a parent-hash chain is walked to or from the requested block. Each link is pinned by the previous header's keccak256 hash, making forgery require a preimage attack.
+
 ### Get account
 
 ```bash
@@ -249,6 +297,19 @@ The only trust anchors are **sync committee BLS signatures** and the embedded hi
 3. The peer's state root is then linked to the beacon-finalized state root via one of:
    - **Direct match** -- the peer's state root matches a known beacon-attested root
    - **Header chain verification** -- block headers are fetched in batches from the beacon-finalized block to the peer's block, verifying: (a) the first header's state root matches the beacon root, (b) consecutive parent hash chain integrity, (c) the last header's state root matches the peer's root
+
+### Verification limitations
+
+Block verification (`get-block`) currently has the following limitations:
+
+- **Pre-merge blocks (before block 15,537,394)** cannot be verified. The beacon chain only exists post-Merge, so there is no sync committee anchor for proof-of-work era blocks.
+- **Post-merge blocks more than 8,192 blocks from the finalized block** cannot be verified via header chain. This covers roughly 27 hours of blocks at 12-second slots.
+- **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
+
+**Roadmap — historical block verification:**
+
+- **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator) (EIP-2935). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
+- **Post-merge historical blocks**: Implement the [Bellatrix-era historical roots accumulator](https://github.com/ethereum/annotated-spec/blob/master/phase0/beacon-chain.md#historical-roots). The beacon chain stores `historical_roots` (batches of 8,192 slots) and `historical_summaries` (post-Capella) that cover all post-merge execution payloads. By walking the beacon state's historical records, any post-merge block hash can be verified without an 8,192-block proximity constraint.
 
 ### Sync modes
 
