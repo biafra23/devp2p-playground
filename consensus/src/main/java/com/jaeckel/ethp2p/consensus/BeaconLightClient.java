@@ -253,7 +253,7 @@ public class BeaconLightClient implements AutoCloseable {
      * This ensures bootstrap() can prioritize light-client-capable peers.
      */
     private void preConnectAndIdentify() {
-        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        List<String> peers = copyPeers();
         if (peers.isEmpty()) return;
 
         log.info("[beacon] Pre-connecting to {} peer(s) for Identify...", peers.size());
@@ -353,7 +353,7 @@ public class BeaconLightClient implements AutoCloseable {
         // Try HTTP API first — much more reliable than P2P
         if (bootstrapFromBeaconApi()) return;
 
-        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        List<String> peers = copyPeers();
         log.info("[beacon] Attempting parallel bootstrap from {} peer(s)", peers.size());
 
         // Fire bootstrap requests to ALL peers in parallel — first valid response wins.
@@ -403,15 +403,19 @@ public class BeaconLightClient implements AutoCloseable {
 
                             // First valid bootstrap wins — initialize store BEFORE completing
                             // the future so that catchUpSyncCommittee() sees the initialized state.
+                            String successPeer = null;
                             synchronized (store) {
                                 if (!winnerFuture.isDone()) {
                                     store.initialize(bootstrap.header(), bootstrap.currentSyncCommittee());
                                     updateSyncState();
                                     winnerFuture.complete(response);
-                                    notifyPeerSuccess(peer);
+                                    successPeer = peer;
                                     log.info("[beacon] Bootstrap complete from {}, slot={}",
                                             peer, bootstrap.header().beacon().slot());
                                 }
+                            }
+                            if (successPeer != null) {
+                                notifyPeerSuccess(successPeer);
                             }
                         } catch (Exception e) {
                             log.warn("[beacon] Bootstrap decode failed from {}: {}", peer, e.getMessage());
@@ -460,7 +464,7 @@ public class BeaconLightClient implements AutoCloseable {
         log.info("[beacon] Sync committee catch-up: bootstrap period={}, current period={}, fetching {} update(s)",
                 bootstrapPeriod, currentPeriod, periodsToFetch);
 
-        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        List<String> peers = copyPeers();
         for (String peer : peers) {
             if (!running) return;
             try {
@@ -517,7 +521,7 @@ public class BeaconLightClient implements AutoCloseable {
      * This trusts the local beacon node but allows the state root to be used immediately.
      */
     private void seedFromFinalityUpdate() {
-        List<String> peers = List.copyOf(clPeerMultiaddrs);
+        List<String> peers = copyPeers();
         log.info("[beacon] Attempting to seed from finality update ({} peer(s))", peers.size());
 
         // Diagnostic: query first peer's supported protocols via Identify
@@ -684,7 +688,7 @@ public class BeaconLightClient implements AutoCloseable {
             discoverPeersFromBeaconApi();
             if (!syncState.isSynced()) {
                 // First time: disconnect stale peers to force fresh connections
-                for (String peer : List.copyOf(clPeerMultiaddrs)) {
+                for (String peer : copyPeers()) {
                     p2pService.disconnectPeer(peer);
                 }
             }
@@ -704,7 +708,7 @@ public class BeaconLightClient implements AutoCloseable {
             }
         }
 
-        for (String peer : List.copyOf(clPeerMultiaddrs)) {
+        for (String peer : copyPeers()) {
             if (!running) return;
             try {
                 byte[] response = p2pService
@@ -794,7 +798,7 @@ public class BeaconLightClient implements AutoCloseable {
      * @param blsVerified true if the bootstrap was BLS-verified
      */
     private void fillChainStateRootsFromAnyPeer(boolean blsVerified) {
-        for (String peer : List.copyOf(clPeerMultiaddrs)) {
+        for (String peer : copyPeers()) {
             if (!running) return;
             try {
                 fillChainStateRoots(peer, blsVerified);
@@ -903,6 +907,13 @@ public class BeaconLightClient implements AutoCloseable {
 
         } catch (Exception e) {
             log.debug("[beacon] Chain fill failed from {}: {}", peer, e.getMessage());
+        }
+    }
+
+    /** Thread-safe snapshot of the peer list. */
+    private List<String> copyPeers() {
+        synchronized (clPeerMultiaddrs) {
+            return List.copyOf(clPeerMultiaddrs);
         }
     }
 
