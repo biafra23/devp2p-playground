@@ -76,9 +76,11 @@ public final class EciesCodec {
         RNG.nextBytes(iv);
         byte[] ciphertext = aesCtr(plaintext.toArrayUnsafe(), encKey, iv, true);
 
-        // 5. MAC = HMAC-SHA256(SHA-256(macKey), IV || ciphertext [|| aad (auth-size as S2)])
+        // 5. MAC = HMAC-SHA256(SHA-256(macKey), IV || ciphertext || aad)
         // devp2p spec: d = MAC(sha256(k_M), iv || c || s2)
-        byte[] macInput = aad.length > 0 ? concat(iv, ciphertext, aad) : concat(iv, ciphertext);
+        // Always include aad in MAC input (even if empty) so that messages encrypted
+        // with AAD cannot be verified without it and vice versa.
+        byte[] macInput = concat(iv, ciphertext, aad);
         byte[] mac = hmacSha256(sha256(macKey), macInput);
 
         // 6. Assemble: ephemeral-pubkey(65) || IV(16) || ciphertext || MAC(32)
@@ -124,8 +126,8 @@ public final class EciesCodec {
         byte[] encKey = Arrays.copyOf(keyMaterial, KEY_SIZE);
         byte[] macKey = Arrays.copyOfRange(keyMaterial, KEY_SIZE, KEY_SIZE + MAC_KEY_SIZE);
 
-        // Verify MAC = HMAC-SHA256(SHA-256(macKey), IV || ciphertext [|| aad])
-        byte[] macInput = aad.length > 0 ? concat(iv, ciphertext, aad) : concat(iv, ciphertext);
+        // Verify MAC = HMAC-SHA256(SHA-256(macKey), IV || ciphertext || aad)
+        byte[] macInput = concat(iv, ciphertext, aad);
         byte[] expectedMac = hmacSha256(sha256(macKey), macInput);
         if (!Arrays.equals(mac, expectedMac)) {
             throw new IllegalArgumentException("ECIES MAC verification failed");

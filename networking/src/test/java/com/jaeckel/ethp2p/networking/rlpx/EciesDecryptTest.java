@@ -79,6 +79,26 @@ class EciesDecryptTest {
     }
 
     @Test
+    void decryptWithWrongAadFails() {
+        SECP256K1.KeyPair recipient = SECP256K1.KeyPair.random();
+        Bytes pt = Bytes.wrap("Secret message".getBytes());
+
+        // Encrypt WITH AAD
+        byte[] aad = new byte[]{0x01, (byte) 0xB3};
+        Bytes encrypted = EciesCodec.encrypt(pt, recipient.publicKey(), aad);
+
+        // Decrypt with WRONG AAD must fail
+        byte[] wrongAad = new byte[]{0x02, (byte) 0x00};
+        assertThrows(IllegalArgumentException.class,
+            () -> EciesCodec.decrypt(encrypted, recipient.secretKey(), wrongAad),
+            "Decrypting with wrong AAD must fail MAC verification");
+
+        // Decrypt with correct AAD must succeed
+        Bytes decrypted = EciesCodec.decrypt(encrypted, recipient.secretKey(), aad);
+        assertEquals(pt, decrypted);
+    }
+
+    @Test
     void decryptAuth1Legacy() {
         // Auth₁ is legacy format: no size prefix, just raw ECIES blob starting with 0x04
         SECP256K1.SecretKey privB = SECP256K1.SecretKey.fromBytes(Bytes32.fromHexString(STATIC_B));

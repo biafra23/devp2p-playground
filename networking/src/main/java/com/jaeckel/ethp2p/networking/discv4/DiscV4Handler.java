@@ -11,9 +11,11 @@ import org.apache.tuweni.crypto.Hash;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -32,6 +34,11 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
 
     // Track pending ping → expected pong hash
     private final ConcurrentHashMap<InetSocketAddress, Bytes32> pendingPings = new ConcurrentHashMap<>();
+
+    // Per-IP ping rate limiting: max PING_RATE_LIMIT pings per PING_RATE_WINDOW_MS
+    private static final int PING_RATE_LIMIT = 5;
+    private static final long PING_RATE_WINDOW_MS = 10_000; // 10 seconds
+    private final ConcurrentHashMap<InetAddress, long[]> pingTimestamps = new ConcurrentHashMap<>();
 
     public DiscV4Handler(NodeKey nodeKey, KademliaTable table,
                          Consumer<KademliaTable.Entry> onPeerDiscovered) {
@@ -65,8 +72,40 @@ public final class DiscV4Handler extends SimpleChannelInboundHandler<DatagramPac
         }
     }
 
+    /**
+     * Returns true if the given address has exceeded the ping rate limit.
+     * Uses a sliding-window ring buffer of timestamps per IP.
+     */
+    private boolean isPingRateLimited(InetAddress addr) {
+        long now = System.currentTimeMillis();
+        long[] ring = pingTimestamps.computeIfAbsent(addr, k -> new long[PING_RATE_LIMIT]);
+        synchronized (ring) {
+            // Count recent pings within the window
+            int recent = 0;
+            int oldestIdx = 0;
+            for (int i = 0; i < ring.length; i++) {
+                if (now - ring[i] < PING_RATE_WINDOW_MS) {
+                    recent++;
+                } else if (ring[i] < ring[oldestIdx]) {
+                    oldestIdx = i;
+                }
+            }
+            if (recent >= PING_RATE_LIMIT) {
+                return true; // rate exceeded, don't record
+            }
+            ring[oldestIdx] = now; // record this ping
+            return false;
+        }
+    }
+
     private void handlePing(ChannelHandlerContext ctx, Packet.Parsed p, InetSocketAddress sender) {
         log.debug("[discv4] Ping from {}", sender);
+
+        if (isPingRateLimited(sender.getAddress())) {
+            log.debug("[discv4] Rate-limited ping from {}", sender);
+            return;
+        }
+
         // Respond with Pong
         InetSocketAddress localAddr = (InetSocketAddress) ctx.channel().localAddress();
         Bytes pong = Packet.encodePong(nodeKey, sender, p.hash());
