@@ -1,6 +1,6 @@
 # devp2p Playground
 
-A from-scratch Ethereum devp2p implementation in Java 21. Connects to the Ethereum mainnet (or testnets) using the devp2p protocol stack: discv4 peer discovery, RLPx encrypted transport, and eth/67-69 sub-protocol. Includes a beacon chain light client for consensus-layer state root verification and snap/1 support for account and storage lookups with Merkle proofs and cryptographic verification back to beacon chain finality.
+An Ethereum devp2p implementation in Java 21 based on tuweni libraries. Connects to the Ethereum mainnet (or testnets) using the devp2p protocol stack: discv4 peer discovery, RLPx encrypted transport, and eth/67-69 sub-protocol. Includes a beacon chain light client for consensus-layer state root verification and snap/1 support for account and storage lookups with Merkle proofs and cryptographic verification back to beacon chain finality.
 
 ## Requirements
 
