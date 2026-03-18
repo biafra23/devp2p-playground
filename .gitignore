@@ -28,3 +28,5 @@ app/peers.cache
 *.cache
 app/devp2p.log
 app/devlibp2p.log
+.gradle-home/
+app/cacheDir/

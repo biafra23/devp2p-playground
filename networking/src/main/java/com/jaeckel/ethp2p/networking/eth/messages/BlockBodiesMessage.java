@@ -62,14 +62,17 @@ public final class BlockBodiesMessage {
                 bodyReader.readList(txReader -> {
                     while (!txReader.isComplete()) {
                         if (txReader.nextIsList()) {
-                            // Legacy transaction: RLP list — read and discard inner structure
+                            // Legacy transaction: re-encode to capture raw RLP bytes
+                            List<Bytes> fields = new ArrayList<>();
                             txReader.readList(legacyReader -> {
-                                legacyReader.readRemaining();
+                                while (!legacyReader.isComplete()) {
+                                    fields.add(legacyReader.readValue());
+                                }
                                 return null;
                             });
-                            txs.add(Bytes.EMPTY); // placeholder — we only need the count
+                            txs.add(RLP.encodeList(w -> fields.forEach(w::writeValue)));
                         } else {
-                            txs.add(txReader.readValue());
+                            txs.add(txReader.readValue()); // typed tx (EIP-2718)
                         }
                     }
                     return null;

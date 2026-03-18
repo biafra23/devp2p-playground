@@ -4,6 +4,7 @@ dependencies {
     implementation(project(":consensus"))
     implementation(libs.tuweni.bytes)
     implementation(libs.tuweni.crypto)
+    implementation(libs.trueblocks.kotlin)
     implementation(libs.slf4j.api)
     runtimeOnly(libs.logback.classic)
 }

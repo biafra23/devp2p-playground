@@ -56,9 +56,12 @@ public class DaemonClient {
             writer.write(json);
             writer.newLine();
             writer.flush();
+            channel.shutdownOutput();
 
-            String response = reader.readLine();
-            System.out.println(response);
+            String response;
+            while ((response = reader.readLine()) != null) {
+                System.out.println(response);
+            }
         }
     }
 
@@ -105,6 +108,10 @@ public class DaemonClient {
             case "dial" -> {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: dial <enode://pubkey@host:port>");
                 yield "{\"cmd\":\"dial\",\"enode\":\"" + args[1] + "\"}";
+            }
+            case "get-transactions" -> {
+                if (args.length < 2) throw new IllegalArgumentException("Usage: get-transactions <0xAddress>");
+                yield "{\"cmd\":\"get-transactions\",\"address\":\"" + args[1] + "\"}";
             }
             default -> "{\"cmd\":\"" + cmd + "\"}";
         };

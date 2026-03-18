@@ -80,10 +80,12 @@ public class DaemonServer {
             while ((line = reader.readLine()) != null) {
                 line = line.strip();
                 if (line.isEmpty()) continue;
-                String response = handler.handle(line);
-                writer.write(response);
-                writer.newLine();
-                writer.flush();
+                if (!handler.handleStreaming(line, writer)) {
+                    String response = handler.handle(line);
+                    writer.write(response);
+                    writer.newLine();
+                    writer.flush();
+                }
             }
         } catch (Exception e) {
             log.debug("[daemon] Client disconnected: {}", e.getMessage());

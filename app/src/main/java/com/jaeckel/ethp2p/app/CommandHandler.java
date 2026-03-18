@@ -17,7 +17,19 @@ import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.jaeckel.trueblocks.AppearanceRecord;
+import com.jaeckel.trueblocks.Bloom;
+import com.jaeckel.trueblocks.Chunk;
+import com.jaeckel.trueblocks.IndexParser;
+import com.jaeckel.trueblocks.IpfsHttpClient;
+import com.jaeckel.trueblocks.ManifestResponse;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -80,6 +92,179 @@ public class CommandHandler {
         } catch (Exception e) {
             log.warn("[ipc] Error handling command '{}': {}", jsonLine, e.getMessage());
             return jsonError(e.getMessage());
+        }
+    }
+
+    /**
+     * Try to handle a command that streams multiple JSON lines back to the client.
+     * Returns true if the command was handled (streaming), false if it should fall back to single-response.
+     */
+    public boolean handleStreaming(String jsonLine, BufferedWriter writer) {
+        try {
+            String cmd = extractString(jsonLine, "cmd");
+            if ("get-transactions".equals(cmd)) {
+                handleGetTransactions(jsonLine, writer);
+                return true;
+            }
+        } catch (Exception e) {
+            try {
+                writer.write(jsonError(e.getMessage()));
+                writer.newLine();
+                writer.flush();
+            } catch (IOException ignored) {}
+            return true;
+        }
+        return false;
+    }
+
+    /** Reflective access to Kotlin UInt-typed getters on AppearanceRecord. */
+    private static final Method GET_BLOCK_NUMBER;
+    private static final Method GET_TX_INDEX;
+    static {
+        try {
+            GET_BLOCK_NUMBER = AppearanceRecord.class.getMethod("getBlockNumber-pVg5ArA");
+            GET_TX_INDEX = AppearanceRecord.class.getMethod("getTxIndex-pVg5ArA");
+        } catch (NoSuchMethodException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    private static int appearanceBlockNumber(AppearanceRecord rec) {
+        try { return (int) GET_BLOCK_NUMBER.invoke(rec); }
+        catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private static int appearanceTxIndex(AppearanceRecord rec) {
+        try { return (int) GET_TX_INDEX.invoke(rec); }
+        catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private void handleGetTransactions(String jsonLine, BufferedWriter writer) throws IOException {
+        String addr = extractString(jsonLine, "address");
+        String hex = (addr.startsWith("0x") || addr.startsWith("0X")) ? addr.substring(2) : addr;
+        if (hex.length() != 40) {
+            writer.write(jsonError("address must be a 20-byte hex string (40 hex chars)"));
+            writer.newLine();
+            writer.flush();
+            return;
+        }
+        String checksumAddr = "0x" + hex.toLowerCase();
+
+        try {
+            IpfsHttpClient ipfs = new IpfsHttpClient();
+            String manifestCID = "QmUBS83qjRmXmSgEvZADVv2ch47137jkgNbqfVVxQep5Y1";
+
+            log.info("[get-transactions] Fetching manifest for address {}", checksumAddr);
+            ManifestResponse manifest = ipfs.fetchAndParseManifestUrl(manifestCID);
+
+            // Construct kethereum Address via reflection (avoids compile-time dependency
+            // on kethereum multiplatform module)
+            Class<?> addressClass = Class.forName("org.kethereum.model.Address");
+            Constructor<?> addressCtor = addressClass.getConstructor(String.class);
+            Object tbAddress = addressCtor.newInstance(checksumAddr);
+            Method isMemberBytes = Bloom.class.getMethod("isMemberBytes", addressClass);
+            List<Chunk> chunks = manifest.getChunks();
+            int totalChunks = chunks.size();
+            int successCount = 0;
+
+            // Scan from highest block number to lowest so recent txs appear first.
+            // Stream results per-chunk: fetch tx data immediately when appearances are found.
+            for (int ci = totalChunks - 1; ci >= 0; ci--) {
+                Chunk chunk = chunks.get(ci);
+                try {
+                    Bloom bloom = ipfs.fetchBloom(chunk.getBloomHash(), chunk.getRange());
+                    if ((boolean) isMemberBytes.invoke(bloom, tbAddress)) {
+                        log.debug("[get-transactions] Bloom hit for chunk {} ({}/{})",
+                                chunk.getRange(), totalChunks - ci, totalChunks);
+                        IndexParser index = ipfs.fetchIndex(chunk.getIndexHash(), false);
+                        List<AppearanceRecord> appearances = index.findAppearances(checksumAddr);
+                        if (appearances.isEmpty()) continue;
+
+                        log.info("[get-transactions] Found {} appearances in chunk {}",
+                                appearances.size(), chunk.getRange());
+
+                        // Sort appearances within chunk descending by block number
+                        appearances.sort(Comparator.comparingInt(
+                                CommandHandler::appearanceBlockNumber).reversed());
+
+                        // Fetch and stream each transaction immediately
+                        for (AppearanceRecord appearance : appearances) {
+                            long blockNumber = Integer.toUnsignedLong(appearanceBlockNumber(appearance));
+                            int txIndex = appearanceTxIndex(appearance);
+                            try {
+                                List<BlockHeadersMessage.VerifiedHeader> headers =
+                                        connector.requestBlockHeadersBatched(blockNumber, 1)
+                                                .get(30, TimeUnit.SECONDS);
+                                if (headers.isEmpty()) {
+                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
+                                            + ",\"error\":\"No header returned\"}");
+                                    writer.newLine();
+                                    writer.flush();
+                                    continue;
+                                }
+                                BlockHeadersMessage.VerifiedHeader vh = headers.get(0);
+                                Bytes32 blockHash = vh.hash();
+
+                                List<BlockBodiesMessage.BlockBody> bodies =
+                                        connector.requestBlockBodies(blockHash)
+                                                .get(30, TimeUnit.SECONDS);
+                                if (bodies.isEmpty()) {
+                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
+                                            + ",\"error\":\"No body returned\"}");
+                                    writer.newLine();
+                                    writer.flush();
+                                    continue;
+                                }
+                                BlockBodiesMessage.BlockBody body = bodies.get(0);
+
+                                List<Bytes> txList = body.transactions();
+                                if (txIndex >= txList.size()) {
+                                    writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
+                                            + ",\"transactionIndex\":" + txIndex
+                                            + ",\"error\":\"Transaction index out of range\"}");
+                                    writer.newLine();
+                                    writer.flush();
+                                    continue;
+                                }
+                                Bytes rawTx = txList.get(txIndex);
+
+                                writer.write("{\"ok\":true,\"blockNumber\":" + blockNumber
+                                        + ",\"transactionIndex\":" + txIndex
+                                        + ",\"rawTx\":\"0x" + rawTx.toUnprefixedHexString() + "\""
+                                        + ",\"verified\":false}");
+                                writer.newLine();
+                                writer.flush();
+                                successCount++;
+
+                            } catch (Exception e) {
+                                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                                String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+                                writer.write("{\"ok\":false,\"blockNumber\":" + blockNumber
+                                        + ",\"transactionIndex\":" + txIndex
+                                        + ",\"error\":\"" + escapeJson(msg) + "\"}");
+                                writer.newLine();
+                                writer.flush();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("[get-transactions] Error processing chunk {}: {}",
+                            chunk.getRange(), e.getMessage());
+                }
+            }
+
+            log.info("[get-transactions] Scan complete. {} transactions streamed for {}",
+                    successCount, checksumAddr);
+            writer.write("{\"ok\":true,\"done\":true,\"totalTransactions\":" + successCount + "}");
+            writer.newLine();
+            writer.flush();
+
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+            writer.write(jsonError("get-transactions failed: " + msg));
+            writer.newLine();
+            writer.flush();
         }
     }
 
