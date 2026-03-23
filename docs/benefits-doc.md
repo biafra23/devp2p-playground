@@ -46,6 +46,10 @@ Bitcoin users who care about self-sovereignty have had access to trustless light
 
 ---
 
+## What This Library Is
+
+This library aims to be an Android foundation for a trustless Ethereum wallet. It gives wallet developers everything they need to show users their past transactions, current balances, and token holdings, and to create and broadcast new transactions — all without connecting to a centralised server at any point. The library handles the peer-to-peer networking, cryptographic verification, and consensus tracking directly, so the wallet built on top of it inherits all of those properties without having to implement them itself.
+
 ## What This Library Will Do Differently
 
 Rather than querying a centralised server, this library will connect directly to the Ethereum peer-to-peer network and retrieve and **verify** all data cryptographically.
