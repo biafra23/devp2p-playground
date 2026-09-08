@@ -23,7 +23,10 @@ const CAPACITY: usize = 32;
 const PER_HANDLE: usize = 4;
 const BUDGET: Duration = Duration::from_secs(90);
 static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
-thread_local! { static ENVS: RefCell<HashMap<usize, Arc<State>>> = RefCell::new(HashMap::new()); }
+thread_local! {
+    static ENVS: RefCell<HashMap<usize, Arc<State>>> = RefCell::new(HashMap::new());
+    static INITIALIZING: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
 
 type Work = Box<dyn FnOnce() -> String + Send>;
 struct Job {
@@ -333,6 +336,21 @@ fn state(env: &Env) -> Result<Arc<State>> {
     if let Some(state) = ENVS.with(|envs| envs.borrow().get(&key).cloned()) {
         return Ok(state);
     }
+    // TSFN creation may invoke async_hooks synchronously before ENVS can
+    // publish a fully initialized state. Refuse recursive initialization rather
+    // than create a second owner whose handles the outer insertion would lose.
+    if !INITIALIZING.with(|initializing| initializing.borrow_mut().insert(key)) {
+        return Err(Error::from_reason("Myotis scheduler initializing"));
+    }
+    struct Initializing(usize);
+    impl Drop for Initializing {
+        fn drop(&mut self) {
+            INITIALIZING.with(|initializing| {
+                initializing.borrow_mut().remove(&self.0);
+            });
+        }
+    }
+    let _initializing = Initializing(key);
     LIVE_WORKERS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n + WORKERS <= MAX_WORKERS).then_some(n + WORKERS)

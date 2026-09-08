@@ -4110,7 +4110,7 @@ impl ElReader {
                 }
             }
         };
-        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_DEADLINE, ladder).await
+        self.request(super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_DEADLINE, ladder)).await
     }
 
     /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
@@ -4170,7 +4170,7 @@ impl ElReader {
                 Err(e) => Err(e.to_string()),
             }
         };
-        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE, attempt).await
+        self.request(super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE, attempt)).await
     }
 
     /// One resolution attempt against one root (finalized or optimistic).
