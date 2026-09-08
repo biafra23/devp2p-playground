@@ -847,13 +847,13 @@ pub fn eth_call_overrides_json(
     };
     match engine
         .rt
-        .block_on(reader.request(async {
+        .block_on(async {
             if creation {
                 reader.eth_call_create(from, data, value, chain_id, overrides).await
             } else {
                 reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
             }
-        }))
+        })
     {
         Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -985,7 +985,7 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
     let owned = name.to_string();
     match engine
         .rt
-        .block_on(reader.request(async { reader.resolve_ens(owned, chain_id).await }))
+        .block_on(async { reader.resolve_ens(owned, chain_id).await })
     {
         Ok(outcome) => eljson::ens_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -1094,20 +1094,20 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
         let Some(finalized) = params.get("finalized").and_then(|v| v.as_bool()) else {
             return eljson::error_json("missing finalized");
         };
-        return match engine.rt.block_on(reader.request(async {
+        return match engine.rt.block_on(async {
             reader
                 .ens_ccip_callback(
                     query, chain_id, finalized, sender, callback, response, extra, wrapped,
                 )
                 .await
-        })) {
+        }) {
             Ok(outcome) => eljson::ens_record_json(&outcome),
             Err(e) => eljson::error_json(&e),
         };
     }
     match engine
         .rt
-        .block_on(reader.request(async { reader.resolve_ens_query(query, chain_id, root).await }))
+        .block_on(async { reader.resolve_ens_query(query, chain_id, root).await })
     {
         Ok(outcome) => eljson::ens_record_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -1161,7 +1161,7 @@ pub fn estimate_gas_json(
     };
     match engine
         .rt
-        .block_on(reader.request(async { reader.estimate_gas(from, to, data, value, chain_id).await }))
+        .block_on(async { reader.estimate_gas(from, to, data, value, chain_id).await })
     {
         Ok(outcome) => eljson::estimate_json(&outcome),
         Err(e) => eljson::error_json(&e),

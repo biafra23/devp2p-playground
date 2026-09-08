@@ -923,23 +923,21 @@ struct TxScanMap {
 /// cache at the same count; eviction is LRU.
 const EVM_PROOF_CACHE_ENTRIES: usize = 65_536;
 
-/// Overall deadline for one ENS resolution walk (mirrors the Java
-/// `JavaEnsApi.RESOLVE_TIMEOUT_SEC` order of magnitude — the EnsApi contract
-/// promises a bounded worst case of ~2 min).
-const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Per-ATTEMPT deadline inside the ENS root ladder (the Java
-/// `VerifiedRpcBackend.ENS_TIMEOUT_SEC` twin): AUTO runs up to two attempts
-/// (finalized, then optimistic), each bounded here, with
-/// [`RESOLVE_ENS_DEADLINE`] as the outer cap on the whole query — so a stalled
-/// finalized attempt can't consume the optimistic attempt's budget, and the
-/// JNI caller's total block time stays within the API's ~2 min contract.
+/// ENS whole-query budget is 90 s (REQUEST_BUDGET), including setup and AUTO.
+/// Each root attempt gets at most 60 s and is clamped to the remaining query
+/// budget: a full finalized attempt leaves about 30 s for the optimistic root.
+/// Cancellation drains native work; indivisible segments may overrun.
 const RESOLVE_ENS_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ElReader {
     /// Budget a host operation, including its network and blocking EVM work.
     pub async fn request<T>(&self, future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-        super::request::run_registered(&self.requests, self.request_shutdown.subscribe(), future).await
+        self.request_with_budget(super::request::REQUEST_BUDGET, future).await
+    }
+
+    async fn request_with_budget<T>(&self, budget: std::time::Duration,
+        future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        super::request::run_registered(&self.requests, self.request_shutdown.subscribe(), budget, future).await
     }
 
     /// Signal active readers before waiting for any other shutdown work.
@@ -1669,12 +1667,11 @@ impl ElReader {
         let chain_id = self.eth_cfg.network_id;
         // Tightly bounded (see the throttle note above): this shares the
         // appender loop, and a stalled resolution must not starve appends.
-        let out = tokio::time::timeout(
+        let out = self.resolve_ens_query_with_budget(
+            EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto,
             std::time::Duration::from_secs(8),
-            self.resolve_ens_query(EnsQuery::Reverse { address }, chain_id, EnsRootMode::Auto),
-        )
-        .await;
-        if let Ok(Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. })) = out {
+        ).await;
+        if let Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. }) = out {
             if let Ok(mut slot) = self.log_index.lock() {
                 if let Some(ix) = slot.as_mut() {
                     if ix.set_name(&address, &name) {
@@ -4088,9 +4085,13 @@ impl ElReader {
         chain_id: u64,
         root: EnsRootMode,
     ) -> Result<EnsQueryOutcome, String> {
-        // ONE outer deadline over the whole query — including context setups and
-        // both AUTO attempts — so the (synchronously blocking) JNI caller's worst
-        // case stays within the API's ~2 min contract regardless of root mode.
+        self.resolve_ens_query_with_budget(query, chain_id, root, super::request::REQUEST_BUDGET).await
+    }
+
+    async fn resolve_ens_query_with_budget(&self, query: EnsQuery, chain_id: u64,
+        root: EnsRootMode, budget: std::time::Duration) -> Result<EnsQueryOutcome, String> {
+        // One registered whole-query scope; AUTO's second attempt gets only
+        // the remainder after the finalized attempt has cancelled and drained.
         let ladder = async {
             match root {
                 EnsRootMode::Finalized => self.ens_attempt(query, chain_id, true).await,
@@ -4110,7 +4111,7 @@ impl ElReader {
                 }
             }
         };
-        self.request(super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_DEADLINE, ladder)).await
+        self.request_with_budget(budget, ladder).await
     }
 
     /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
@@ -4170,7 +4171,7 @@ impl ElReader {
                 Err(e) => Err(e.to_string()),
             }
         };
-        self.request(super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE, attempt)).await
+        self.request_with_budget(RESOLVE_ENS_ATTEMPT_DEADLINE, attempt).await
     }
 
     /// One resolution attempt against one root (finalized or optimistic).
@@ -5421,9 +5422,10 @@ impl ElReader {
     /// Stop discovery + the pool.
     pub async fn stop(&self) {
         self.cancel_requests();
+        // Stop producers before collecting/draining registered work.
+        self.stop_log_index_appender().await;
         let requests: Vec<_> = self.requests.lock().map(|requests| requests.iter().filter_map(std::sync::Weak::upgrade).collect()).unwrap_or_default();
         for request in requests { request.settled().await; }
-        self.stop_log_index_appender().await;
         if let Ok(mut t) = self.log_index_task.lock() {
             if let Some(h) = t.take() {
                 h.abort();

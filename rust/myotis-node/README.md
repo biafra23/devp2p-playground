@@ -176,3 +176,10 @@ replacing the first owner's state. Ownership-gated status/lifecycle calls in
 that window return their unavailable sentinels. Synchronous `create`, `pause`
 and `stop` may also throw scheduler/Node-API infrastructure errors; engine-level
 read failures still use JSON error results.
+
+ENS queries use one registered 90-second whole-query scope. A finalized root
+attempt may use up to 60 seconds; AUTO's optimistic attempt receives only the
+remaining budget (about 30 seconds after a full first attempt). CCIP callbacks
+use a 60-second operation scope, and appender name lookups use an 8-second scope.
+All retain the indivisible-work overrun limitation. Stop first aborts/joins the
+appender, then drains its retained actual execution along with other requests.

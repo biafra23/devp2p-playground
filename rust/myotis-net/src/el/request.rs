@@ -179,9 +179,10 @@ pub async fn run<T>(
 pub async fn run_registered<T>(
     registry: &Mutex<Vec<Weak<Operation>>>,
     shutdown: watch::Receiver<bool>,
+    budget: Duration,
     future: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
-    let op = Operation::new(shutdown, REQUEST_BUDGET);
+    let op = Operation::new(shutdown, budget);
     {
         let mut registry = registry
             .lock()
@@ -261,6 +262,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_custom_budget_refuses_expired_setup() {
+        let registry = Mutex::new(Vec::new());
+        let touched = AtomicBool::new(false);
+        let result = run_registered(&registry, watch::channel(false).1, Duration::ZERO, async {
+            touched.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "request deadline exceeded");
+        assert!(!touched.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
     async fn child_worker_is_counted_against_parent_until_actual_drop() {
         let parent = Operation::new(watch::channel(false).1, REQUEST_BUDGET);
         let child = CURRENT
@@ -284,7 +298,7 @@ mod tests {
     async fn parent_cancellation_reaches_child_and_registered_scope_settles() {
         let registry = Mutex::new(Vec::new());
         let (shutdown, receiver) = watch::channel(false);
-        let result = run_registered(&registry, receiver, async {
+        let result = run_registered(&registry, receiver, REQUEST_BUDGET, async {
             let current = Operation::current().unwrap();
             let child = Operation::new(shutdown.subscribe(), REQUEST_BUDGET);
             current.cancel();
