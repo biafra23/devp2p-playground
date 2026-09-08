@@ -61,7 +61,7 @@ type PendingMap = Arc<Mutex<HashMap<u64, Pending>>>;
 /// when the send completes, so the next lock holder observes the tear and
 /// refuses the corrupt stream instead of writing MAC-garbage after it.
 struct GuardedWriter {
-    inner: RlpxWriter,
+    inner: Option<RlpxWriter>,
     torn: bool,
 }
 
@@ -76,7 +76,10 @@ async fn send_frame(writer: &SharedWriter, code: u64, body: &[u8]) -> Result<(),
         return Err("egress stream torn by a cancelled frame write".to_string());
     }
     w.torn = true;
-    let result = w.inner.send(code, body).await;
+    let result = match w.inner.as_mut() {
+        Some(writer) => writer.send(code, body).await,
+        None => Err("peer writer closed".to_string()),
+    };
     // A completed-Err send (write error / frame-write timeout) leaves the
     // stream just as mid-frame-corrupt as a cancelled one — keep the marker
     // set so a request already queued on the writer lock (racing `fail_all`'s
@@ -122,7 +125,7 @@ pub struct ManagedPeer {
     /// Set once the read loop terminates (disconnect / read error); requests
     /// short-circuit instead of hanging until timeout.
     closed: Arc<AtomicBool>,
-    reader_task: JoinHandle<()>,
+    reader_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Negotiated eth version (66-69).
     pub eth_version: u64,
@@ -143,6 +146,15 @@ pub struct ManagedPeer {
 }
 
 impl ManagedPeer {
+    /// Invalidate snapshots too: active oracle Arcs must not keep reads alive.
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let task = self.reader_task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task { task.abort(); let _ = task.await; }
+        self.pending.lock().await.clear();
+        self.writer.lock().await.inner.take();
+    }
+
     /// Take over a handshook [`EthSession`], splitting its connection and
     /// spawning the background read loop. From here the peer serves concurrent
     /// requests and answers Ping/Get\* on its own.
@@ -186,7 +198,7 @@ impl ManagedPeer {
     ) -> ManagedPeer {
         let (reader, writer, peer_pubkey) = conn.split();
         let snap_codes = snap.then(|| snap::SnapCodes::for_eth_version(eth_version));
-        let writer = Arc::new(Mutex::new(GuardedWriter { inner: writer, torn: false }));
+        let writer = Arc::new(Mutex::new(GuardedWriter { inner: Some(writer), torn: false }));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -205,7 +217,7 @@ impl ManagedPeer {
             pending,
             next_id: AtomicU64::new(1),
             closed,
-            reader_task,
+            reader_task: std::sync::Mutex::new(Some(reader_task)),
             eth_version,
             snap,
             peer_status,
@@ -614,7 +626,7 @@ impl ManagedPeer {
 impl Drop for ManagedPeer {
     fn drop(&mut self) {
         // Stop the background read loop when the last handle goes away.
-        self.reader_task.abort();
+        if let Some(task) = self.reader_task.get_mut().unwrap_or_else(|e| e.into_inner()).take() { task.abort(); }
     }
 }
 

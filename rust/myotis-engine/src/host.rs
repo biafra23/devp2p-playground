@@ -418,14 +418,10 @@ pub fn pause(handle: i64) -> bool {
     };
     // Await the async teardown outside the map lock, like stop().
     engine.rt.block_on(async move {
+        if let Some(reader) = &reader { reader.cancel_requests(); }
         sync.stop().await;
         if let Some(reader) = reader {
-            reader.stop_log_index_appender().await;
-            if let Ok(reader) = Arc::try_unwrap(reader) {
-                reader.stop().await;
-            }
-            // An in-flight verified read still holds a clone: its Drop aborts
-            // the reader's tasks when the last Arc goes (same as stop()).
+            reader.stop().await;
         }
     });
     tracing::info!(handle, "paused (networking torn down; warm state persisted)");
@@ -436,17 +432,10 @@ pub fn pause(handle: i64) -> bool {
 /// path). Runs the async stops on the engine runtime.
 fn shutdown(engine: &EngineState, sync: SyncHandle, reader: Option<Arc<ElReader>>) {
     engine.rt.block_on(async move {
+        if let Some(reader) = &reader { reader.cancel_requests(); }
         sync.stop().await;
         if let Some(reader) = reader {
-            // Only our just-started reader holds an Arc here, so unwrapping the
-            // Arc to consume `stop(self)` succeeds; if it somehow doesn't, the
-            // reader's Drop still aborts its tasks. The appender is stopped
-            // (abort + await) FIRST so its per-tick strong Arc can't defeat
-            // the unwrap.
-            reader.stop_log_index_appender().await;
-            if let Ok(reader) = Arc::try_unwrap(reader) {
-                reader.stop().await;
-            }
+            reader.stop().await;
         }
     });
 }
@@ -580,12 +569,10 @@ pub fn stop(handle: i64) {
     }
     if let Some(ChainEntry::Running(_, sync, reader)) = entry {
         engine.rt.block_on(async move {
+            if let Some(reader) = &reader { reader.cancel_requests(); }
             sync.stop().await;
             if let Some(reader) = reader {
-                reader.stop_log_index_appender().await;
-                if let Ok(reader) = Arc::try_unwrap(reader) {
-                    reader.stop().await;
-                }
+                reader.stop().await;
             }
         });
     }
@@ -690,7 +677,7 @@ pub fn request_account_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_account(address).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_account(address).await })) {
         Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -725,7 +712,7 @@ pub fn get_storage_proof_json(
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_storage(address, slot, holder).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
         Ok(storage) => eljson::storage_json(
             address_hex,
             holder_hex,
@@ -751,7 +738,7 @@ pub fn get_code_json(handle: i64, address_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_code(address).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_code(address).await })) {
         Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -775,7 +762,7 @@ pub fn get_storage_at_json(handle: i64, address_hex: &str, position_hex: &str) -
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_storage_at(address, position).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_storage_at(address, position).await })) {
         Ok(storage) => {
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
@@ -860,13 +847,13 @@ pub fn eth_call_overrides_json(
     };
     match engine
         .rt
-        .block_on(async {
+        .block_on(reader.request(async {
             if creation {
                 reader.eth_call_create(from, data, value, chain_id, overrides).await
             } else {
                 reader.eth_call_overridden(from, to, data, value, chain_id, overrides).await
             }
-        })
+        }))
     {
         Ok(outcome) => eljson::call_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -998,7 +985,7 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
     let owned = name.to_string();
     match engine
         .rt
-        .block_on(async { reader.resolve_ens(owned, chain_id).await })
+        .block_on(reader.request(async { reader.resolve_ens(owned, chain_id).await }))
     {
         Ok(outcome) => eljson::ens_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -1107,20 +1094,20 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
         let Some(finalized) = params.get("finalized").and_then(|v| v.as_bool()) else {
             return eljson::error_json("missing finalized");
         };
-        return match engine.rt.block_on(async {
+        return match engine.rt.block_on(reader.request(async {
             reader
                 .ens_ccip_callback(
                     query, chain_id, finalized, sender, callback, response, extra, wrapped,
                 )
                 .await
-        }) {
+        })) {
             Ok(outcome) => eljson::ens_record_json(&outcome),
             Err(e) => eljson::error_json(&e),
         };
     }
     match engine
         .rt
-        .block_on(async { reader.resolve_ens_query(query, chain_id, root).await })
+        .block_on(reader.request(async { reader.resolve_ens_query(query, chain_id, root).await }))
     {
         Ok(outcome) => eljson::ens_record_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -1174,7 +1161,7 @@ pub fn estimate_gas_json(
     };
     match engine
         .rt
-        .block_on(async { reader.estimate_gas(from, to, data, value, chain_id).await })
+        .block_on(reader.request(async { reader.estimate_gas(from, to, data, value, chain_id).await }))
     {
         Ok(outcome) => eljson::estimate_json(&outcome),
         Err(e) => eljson::error_json(&e),
@@ -1200,7 +1187,7 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
     };
     match engine
         .rt
-        .block_on(async { reader.get_block_by_number(target, full_transactions).await })
+        .block_on(reader.request(async { reader.get_block_by_number(target, full_transactions).await }))
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
@@ -1249,7 +1236,7 @@ pub fn get_transaction_receipt_json(handle: i64, tx_hash_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_transaction_receipt(tx_hash).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_transaction_receipt(tx_hash).await })) {
         Ok(Some(receipt)) => eljson::receipt_json(&receipt),
         Ok(None) => "null".to_string(), // verified "not seen" → eth null
         Err(e) => eljson::error_json(&e),
@@ -1273,7 +1260,7 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.get_transaction_by_hash(tx_hash).await }) {
+    match engine.rt.block_on(reader.request(async { reader.get_transaction_by_hash(tx_hash).await })) {
         Ok(myotis_net::el::reader::TxLookup::Mined(tx)) => eljson::tx_json(&tx),
         Ok(myotis_net::el::reader::TxLookup::Pending { tx_hash, tx }) => {
             eljson::pending_tx_json(&tx_hash, &tx)
@@ -1305,7 +1292,7 @@ pub fn get_block_by_hash_json(
     };
     match engine
         .rt
-        .block_on(async { reader.get_block_by_hash(block_hash, full_transactions).await })
+        .block_on(reader.request(async { reader.get_block_by_hash(block_hash, full_transactions).await }))
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
@@ -1331,7 +1318,7 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.send_raw_transaction(&raw).await }) {
+    match engine.rt.block_on(reader.request(async { reader.send_raw_transaction(&raw).await })) {
         Ok(hash) => eljson::tx_hash_json(&hash),
         Err(e) => eljson::error_json(&e),
     }
@@ -1350,7 +1337,7 @@ pub fn fee_estimate_json(handle: i64) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    match engine.rt.block_on(async { reader.fee_estimate().await }) {
+    match engine.rt.block_on(reader.request(async { reader.fee_estimate().await })) {
         Ok(est) => eljson::fee_json(&est),
         Err(e) => eljson::error_json(&e),
     }
@@ -1379,7 +1366,7 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
         let Some(hash) = parse_word32(selector) else {
             return eljson::error_json("invalid block hash (expected 32-byte hex)");
         };
-        engine.rt.block_on(async { reader.get_block_receipts_by_hash(hash).await })
+        engine.rt.block_on(reader.request(async { reader.get_block_receipts_by_hash(hash).await }))
     } else {
         let tag = if selector.is_empty() { "latest" } else { selector };
         let is_tag = matches!(tag, "latest" | "pending" | "safe" | "finalized" | "earliest");
@@ -1392,7 +1379,7 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
             Ok(t) => t,
             Err(msg) => return eljson::error_json(msg),
         };
-        engine.rt.block_on(async { reader.get_block_receipts(target).await })
+        engine.rt.block_on(reader.request(async { reader.get_block_receipts(target).await }))
     };
     match outcome {
         Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
@@ -1438,9 +1425,9 @@ pub fn fee_history_json(
     // The raw request strings ARE the stale-serve signature (the Java
     // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
     let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
-    match engine.rt.block_on(async {
-        reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await
-    }) {
+    match engine.rt.block_on(reader.request(async {
+        Ok(reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await)
+    })).unwrap_or_else(|msg| Err(myotis_net::el::reader::FeeHistoryError::Reject(msg))) {
         Ok(history) => {
             let json = eljson::fee_history_json(&history);
             if let Ok(mut cache) = engine.fee_history_cache.lock() {
@@ -2685,7 +2672,12 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
             })
     );
     if needs_fill {
-        engine.rt.block_on(async { reader.advance_log_index_tail_now(filter.to_block).await });
+        if let Err(error) = engine.rt.block_on(reader.request(async {
+            reader.advance_log_index_tail_now(filter.to_block).await;
+            Ok(())
+        })) {
+            return eljson::error_json(&error);
+        }
         result = reader.with_log_index(|ix| ix.query(&filter));
     }
     match result {

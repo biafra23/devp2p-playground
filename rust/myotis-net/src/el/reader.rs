@@ -781,6 +781,8 @@ pub struct FeeEstimate {
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
 pub struct ElReader {
+    request_shutdown: tokio::sync::watch::Sender<bool>,
+    requests: std::sync::Mutex<Vec<std::sync::Weak<super::request::Operation>>>,
     discovery: Discv4Service,
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
@@ -935,6 +937,14 @@ const RESOLVE_ENS_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 const RESOLVE_ENS_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ElReader {
+    /// Budget a host operation, including its network and blocking EVM work.
+    pub async fn request<T>(&self, future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        super::request::run_registered(&self.requests, self.request_shutdown.subscribe(), future).await
+    }
+
+    /// Signal active readers before waiting for any other shutdown work.
+    pub fn cancel_requests(&self) { self.request_shutdown.send_replace(true); }
+
     /// Start a mainnet reader with a freshly-generated ephemeral node key (the
     /// CL side generates its libp2p identity per run too; a persistent EL
     /// identity is an EL-A8 concern). `cache_path` is the EL peer cache for
@@ -1022,6 +1032,8 @@ impl ElReader {
             })),
         );
         Ok(ElReader {
+            request_shutdown: tokio::sync::watch::channel(false).0,
+            requests: std::sync::Mutex::new(Vec::new()),
             discovery,
             pool,
             anchor,
@@ -3923,8 +3935,19 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallOutcome, String> {
+        self.request(self.eth_call_create_inner(from, init_code, value, chain_id, overrides)).await
+    }
+
+    async fn eth_call_create_inner(
+        &self,
+        from: Option<[u8; 20]>,
+        init_code: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "eth_call (create)").await?;
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.create_view(sender, &init_code, value, &ctx, overrides)
         })
@@ -3950,10 +3973,22 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallOutcome, String> {
+        self.request(self.eth_call_overridden_inner(from, to, data, value, chain_id, overrides)).await
+    }
+
+    async fn eth_call_overridden_inner(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+    ) -> Result<CallOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "eth_call").await?;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = super::request::blocking(move || {
             // A from-less call still honours `value` — the default sender is the zero
             // ADDRESS, not zero value — so always thread `value` through
             // call_view_from (call_view would force value = 0 and drop it).
@@ -3983,8 +4018,19 @@ impl ElReader {
         value: U256,
         chain_id: u64,
     ) -> Result<GasOutcome, String> {
+        self.request(self.estimate_gas_inner(from, to, data, value, chain_id)).await
+    }
+
+    async fn estimate_gas_inner(
+        &self,
+        from: Option<[u8; 20]>,
+        to: [u8; 20],
+        data: Vec<u8>,
+        value: U256,
+        chain_id: u64,
+    ) -> Result<GasOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "estimateGas").await?;
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.estimate_gas(sender, to, &data, value, &ctx)
         })
@@ -4007,20 +4053,19 @@ impl ElReader {
     /// is `Err`; an offchain (CCIP) name is the distinguishable
     /// [`EnsOutcome::Offchain`].
     pub async fn resolve_ens(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
+        self.request(self.resolve_ens_inner(name, chain_id)).await
+    }
+
+    async fn resolve_ens_inner(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
         let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
         let block_number = ctx.block_number;
-        let walk = tokio::task::spawn_blocking(move || {
+        let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             myotis_evm::resolve_address(&caller, &name)
         });
-        // Overall deadline (the EnsApi contract promises a bounded worst case): the
-        // walk is a chain of per-request-bounded peer calls, but a many-label name
-        // against stalling peers could multiply far past that. On timeout the
-        // abandoned closure still runs out its in-flight peer call on the blocking
-        // thread (spawn_blocking can't be cancelled) — only the caller is released.
-        let joined = tokio::time::timeout(RESOLVE_ENS_DEADLINE, walk)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+        // The enclosing request scope cancels and drains this worker on deadline.
+        // Its oracle waits and interpreter steps observe the same operation.
+        let joined = walk.await
             .map_err(|e| format!("resolve-ens task join error: {e}"))?;
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
@@ -4065,9 +4110,7 @@ impl ElReader {
                 }
             }
         };
-        tokio::time::timeout(RESOLVE_ENS_DEADLINE, ladder)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_DEADLINE, ladder).await
     }
 
     /// One ERC-3668 CALLBACK re-entry (EL-C-5-3): the host drove the gateway;
@@ -4096,7 +4139,7 @@ impl ElReader {
                 self.evm_setup(chain_id, "resolve-ens").await?
             };
             let block_number = ctx.block_number;
-            let walk = tokio::task::spawn_blocking(move || {
+            let walk = super::request::blocking(move || {
                 let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
                 let raw = myotis_evm::ccip_callback(
                     &caller,
@@ -4109,9 +4152,7 @@ impl ElReader {
                 let Some(raw) = raw else { return Ok(None) };
                 decode_ccip_answer(&caller, &query, &raw)
             });
-            let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
-                .await
-                .map_err(|_| "resolve-ens attempt timed out".to_string())?
+            let joined = walk.await
                 .map_err(|e| format!("resolve-ens task join error: {e}"))?;
             match joined {
                 Ok(Some(value)) => {
@@ -4129,9 +4170,7 @@ impl ElReader {
                 Err(e) => Err(e.to_string()),
             }
         };
-        tokio::time::timeout(RESOLVE_ENS_DEADLINE, attempt)
-            .await
-            .map_err(|_| "resolve-ens timed out".to_string())?
+        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE, attempt).await
     }
 
     /// One resolution attempt against one root (finalized or optimistic).
@@ -4141,23 +4180,23 @@ impl ElReader {
         chain_id: u64,
         finalized: bool,
     ) -> Result<EnsQueryOutcome, String> {
+        super::request::run(self.request_shutdown.subscribe(), RESOLVE_ENS_ATTEMPT_DEADLINE,
+            self.ens_attempt_inner(query, chain_id, finalized)).await
+    }
+
+    async fn ens_attempt_inner(&self, query: EnsQuery, chain_id: u64, finalized: bool) -> Result<EnsQueryOutcome, String> {
         let (ctx, executor) = if finalized {
             self.evm_setup_finalized(chain_id, "resolve-ens").await?
         } else {
             self.evm_setup(chain_id, "resolve-ens").await?
         };
         let block_number = ctx.block_number;
-        let walk = tokio::task::spawn_blocking(move || {
+        let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
             run_ens_query(&caller, &query)
         });
-        // Per-attempt deadline (Java ENS_TIMEOUT_SEC twin): a stalled finalized
-        // walk must leave budget for AUTO's optimistic attempt under the outer
-        // cap. The timed-out spawn_blocking closure still runs out its in-flight
-        // peer call (can't be cancelled) — only the caller is released.
-        let joined = tokio::time::timeout(RESOLVE_ENS_ATTEMPT_DEADLINE, walk)
-            .await
-            .map_err(|_| "resolve-ens attempt timed out".to_string())?
+        // The attempt scope drains this worker before AUTO can start another root.
+        let joined = walk.await
             .map_err(|e| format!("resolve-ens task join error: {e}"))?;
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
@@ -5380,7 +5419,11 @@ impl ElReader {
     }
 
     /// Stop discovery + the pool.
-    pub async fn stop(self) {
+    pub async fn stop(&self) {
+        self.cancel_requests();
+        let requests: Vec<_> = self.requests.lock().map(|requests| requests.iter().filter_map(std::sync::Weak::upgrade).collect()).unwrap_or_default();
+        for request in requests { request.settled().await; }
+        self.stop_log_index_appender().await;
         if let Ok(mut t) = self.log_index_task.lock() {
             if let Some(h) = t.take() {
                 h.abort();

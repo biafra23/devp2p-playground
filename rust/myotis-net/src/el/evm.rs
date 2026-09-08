@@ -224,6 +224,7 @@ fn u256_be(bytes: &[u8]) -> Option<U256> {
 /// A [`SnapStateOracle`] over a fixed snapshot of snap peers, bridging the sync
 /// trait to the async snap fetch path. Created per `eth_call`.
 pub struct PoolOracle {
+    operation: Option<Arc<super::request::Operation>>,
     peers: Vec<Arc<ManagedPeer>>,
     handle: Handle,
     /// Snap-quality reputation sink (None in tests): serves confirm a peer,
@@ -244,11 +245,21 @@ impl PoolOracle {
         quality: Option<crate::el::pool::SnapQualitySink>,
     ) -> PoolOracle {
         PoolOracle {
+            operation: super::request::Operation::current(),
             peers,
             handle,
             quality,
             leaf_memo: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T, OracleError> {
+        self.handle.block_on(async {
+            match &self.operation {
+                Some(op) => op.wait(future).await.map_err(|reason| OracleError::Cancelled { reason }),
+                None => Ok(future.await),
+            }
+        })
     }
 
     /// Record one per-peer fetch outcome (no-op without a sink).
@@ -269,12 +280,13 @@ impl PoolOracle {
         state_root: &[u8; 32],
         address: [u8; 20],
     ) -> Result<Option<AccountLeaf>, OracleError> {
+        self.check_request()?;
         if let Some(cached) = self.leaf_memo.lock().unwrap().get(&address) {
             return Ok(cached.clone());
         }
         // No lock held across the network fetch.
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
+        let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer.snap_get_account(state_root, &address).await {
                     Ok(AccountOutcome::Present(leaf)) => {
@@ -290,7 +302,7 @@ impl PoolOracle {
                 }
             }
             None
-        });
+        })?;
         match fetched {
             Some(leaf) => {
                 self.leaf_memo.lock().unwrap().insert(address, leaf.clone());
@@ -306,6 +318,13 @@ impl PoolOracle {
 }
 
 impl SnapStateOracle for PoolOracle {
+    fn check_request(&self) -> Result<(), OracleError> {
+        match &self.operation {
+            Some(op) => op.check().map_err(|reason| OracleError::Cancelled { reason }),
+            None => Ok(()),
+        }
+    }
+
     fn fetch_account(
         &self,
         state_root: &[u8; 32],
@@ -538,7 +557,7 @@ impl SnapStateOracle for PoolOracle {
         // The whole wave is bounded (Java PREFETCH_WAVE_TIMEOUT_SEC): on timeout
         // whatever landed is kept and the loop's next iteration proceeds — an
         // eth_call must never hang on a slow warm-up.
-        self.handle.block_on(async {
+        let _ = self.wait(async {
             let _ = tokio::time::timeout(WAVE_TIMEOUT, wave).await;
         });
     }
@@ -559,7 +578,7 @@ impl SnapStateOracle for PoolOracle {
         }
         let position = slot.to_be_bytes::<32>();
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
+        let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer
                     .snap_get_storage(state_root, &address, &leaf, &position)
@@ -573,7 +592,7 @@ impl SnapStateOracle for PoolOracle {
                 }
             }
             None
-        });
+        })?;
         match fetched {
             // Empty bytes = a proven-zero / absent slot.
             Some(value) => u256_be(&value).ok_or_else(|| OracleError::InvalidProof {
@@ -593,7 +612,7 @@ impl SnapStateOracle for PoolOracle {
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
         // so any peer's bytes are trusted iff they hash correctly.
         let quality = self.quality.clone();
-        let fetched = self.handle.block_on(async {
+        let fetched = self.wait(async {
             for peer in &self.peers {
                 match peer.snap_get_bytecode(code_hash).await {
                     Ok(code) => {
@@ -604,7 +623,7 @@ impl SnapStateOracle for PoolOracle {
                 }
             }
             None
-        });
+        })?;
         fetched.ok_or(OracleError::BytecodeUnavailable {
             code_hash: *code_hash,
         })

@@ -11,7 +11,9 @@
  *  - Errors are sentinels, not exceptions: negative handle ids from
  *    myotis_create, false from start/pause/resume, "{}" status for an unknown
  *    handle, {"error": "..."} objects from the verified reads.
- *  - All verified reads are BLOCKING (up to ~90 s) — call off the UI thread.
+ *  - Verified reads are BLOCKING with a cooperative ~90 s operation budget.
+ *    Cancellation drains started native execution; indivisible native work may
+ *    overrun the budget. Call off the UI thread.
  */
 
 #ifndef MYOTIS_ENGINE_H
@@ -65,7 +67,9 @@ int32_t myotis_tor_status(void);
 /* Status JSON object (camelCase keys), or "{}" for an unknown handle. */
 char *myotis_status_json(int64_t handle);
 
-/* Remove + shut down; no-op for an unknown id. */
+/* Signal pending readers, drain registered work, remove + shut down.
+ * Synchronous; no-op for an unknown id. No hard wall-clock termination bound.
+ * Serialize start/pause/resume/stop on each handle. */
 void myotis_stop(int64_t handle);
 
 /* Idle-sleep: Running->Paused (tear down networking, keep warm state).
