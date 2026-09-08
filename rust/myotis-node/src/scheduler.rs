@@ -4,7 +4,7 @@
 //! (including undelivered JS completions), at most four per handle and one
 //! executing per handle. Different chains can progress concurrently.
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,6 +13,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::admission::{Admission, HasHandle};
 use myotis_engine::capi::{myotis_stop, submitted, Submission};
 use napi::bindgen_prelude::{FromNapiValue, Object};
 use napi::{sys, Env, Error, Result};
@@ -36,6 +37,12 @@ struct Job {
     submission: Submission,
     run: Work,
 }
+impl HasHandle for Job {
+    fn handle(&self) -> i64 {
+        self.handle
+    }
+}
+
 struct Completion {
     deferred: usize,
     value: String,
@@ -47,8 +54,7 @@ struct Inner {
     cleanup_started: bool,
     poisoned: bool,
     fallback_error: Option<usize>,
-    queue: VecDeque<Job>,
-    active: HashSet<i64>,
+    queue: Admission<Job>,
     requests: HashMap<u64, (i64, Arc<AtomicBool>)>,
     handles: HashSet<i64>,
     pending: usize,
@@ -81,6 +87,10 @@ unsafe extern "C" fn complete(
     }
     let completion = unsafe { Box::from_raw(data.cast::<Completion>()) };
     let state = unsafe { &*context.cast::<Arc<State>>() };
+    deliver_completion(env, state, *completion);
+}
+
+fn deliver_completion(env: sys::napi_env, state: &State, completion: Completion) {
     // Node drains aborted TSFN items with null env. Account the item but never
     // call Node-API; the TSFN context remains owned until its finalizer.
     if env.is_null()
@@ -107,7 +117,7 @@ unsafe extern "C" fn complete(
     if got_error != sys::Status::napi_ok || error.is_null() {
         // Closing/pending exceptions can prevent even the preallocated error
         // lookup. No settlement is attempted and no JS-side fatal_error is used.
-        poison(state);
+        poison(state, env);
         delivered(state, env);
         eprintln!("Myotis: completion error reference unavailable; scheduler poisoned");
         let mut pending = false;
@@ -153,7 +163,7 @@ unsafe extern "C" fn complete(
         unsafe { sys::napi_reject_deferred(env, completion.deferred as sys::napi_deferred, error) }
     };
     if settled != sys::Status::napi_ok {
-        poison(state);
+        poison(state, env);
     }
     delivered(state, env);
     if settled != sys::Status::napi_ok {
@@ -167,17 +177,52 @@ unsafe extern "C" fn complete(
     }
 }
 
-fn poison(state: &State) {
-    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    inner.poisoned = true;
-    for (_, token) in inner.requests.values() {
-        token.store(true, Ordering::Release);
+fn cancel_queued(inner: &mut Inner, handle: Option<i64>) -> Vec<Completion> {
+    let mut failed = Vec::new();
+    for job in inner.queue.cancel_queued(handle) {
+        inner.requests.remove(&job.id);
+        if let Some(completion) =
+            post_completion(inner, job, r#"{"error":"request cancelled"}"#.into())
+        {
+            failed.push(completion);
+        }
+    }
+    failed
+}
+
+fn poison(state: &State, env: sys::napi_env) {
+    let failed = {
+        let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.poisoned = true;
+        for (_, token) in inner.requests.values() {
+            token.store(true, Ordering::Release);
+        }
+        cancel_queued(&mut inner, None)
+    };
+    state.changed.notify_all();
+    // Only the impossible enqueue-invariant path needs direct fallback. No
+    // scheduler/lifecycle lock is held and poison prevents new native work.
+    for completion in failed {
+        deliver_completion(env, state, completion);
+    }
+}
+
+fn decrement_pending(inner: &mut Inner) {
+    match inner.pending.checked_sub(1) {
+        Some(pending) => inner.pending = pending,
+        None => {
+            inner.poisoned = true;
+            for (_, token) in inner.requests.values() {
+                token.store(true, Ordering::Release);
+            }
+            eprintln!("Myotis: admission accounting underflow; scheduler poisoned");
+        }
     }
 }
 
 fn delivered(state: &State, env: sys::napi_env) {
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-    inner.pending -= 1;
+    decrement_pending(&mut inner);
     if inner.pending == 0 && !env.is_null() && !inner.closing {
         if let Some(tsfn) = inner.tsfn {
             let status = unsafe {
@@ -197,47 +242,59 @@ unsafe extern "C" fn finalize(_env: sys::napi_env, data: *mut c_void, _hint: *mu
     }
 }
 
+/// Enqueue under the producer/cleanup mutex. Unexpected failure returns the
+/// still-owned completion for a JS-thread caller; workers must fail the invariant.
+fn post_completion(inner: &mut Inner, job: Job, value: String) -> Option<Completion> {
+    if let Some(tsfn) = inner.tsfn {
+        let completion = Box::into_raw(Box::new(Completion {
+            deferred: job.deferred,
+            value,
+        }));
+        // Nonblocking: a worker NEVER needs the JS thread to make progress.
+        // Admission bounds this otherwise-unbounded TSFN queue to CAPACITY.
+        let status = unsafe {
+            sys::napi_call_threadsafe_function(
+                tsfn as sys::napi_threadsafe_function,
+                completion.cast(),
+                sys::ThreadsafeFunctionCallMode::nonblocking,
+            )
+        };
+        if status != sys::Status::napi_ok {
+            let failed = unsafe { *Box::from_raw(completion) };
+            if status == sys::Status::napi_closing {
+                // No more Node-API operations on a closing TSFN. The env
+                // cleanup hook owns worker joins and remaining bookkeeping.
+                inner.tsfn = None;
+                inner.closing = true;
+                decrement_pending(inner);
+                for (_, token) in inner.requests.values() {
+                    token.store(true, Ordering::Release);
+                }
+            } else {
+                // Queue-full is impossible (max_queue_size=0); invalid-arg
+                // indicates a broken lifetime invariant. There is no safe
+                // JS-thread delivery path through an invalid TSFN.
+                inner.poisoned = true;
+                for (_, token) in inner.requests.values() {
+                    token.store(true, Ordering::Release);
+                }
+                return Some(failed);
+            }
+        }
+    } else {
+        decrement_pending(inner);
+    }
+    None
+}
+
 impl State {
     fn finish(&self, job: Job, value: String) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.requests.remove(&job.id);
-        inner.active.remove(&job.handle);
-        if let Some(tsfn) = inner.tsfn {
-            let completion = Box::into_raw(Box::new(Completion {
-                deferred: job.deferred,
-                value,
-            }));
-            // Nonblocking: a worker NEVER needs the JS thread to make progress.
-            // Admission bounds this otherwise-unbounded TSFN queue to CAPACITY.
-            let status = unsafe {
-                sys::napi_call_threadsafe_function(
-                    tsfn as sys::napi_threadsafe_function,
-                    completion.cast(),
-                    sys::ThreadsafeFunctionCallMode::nonblocking,
-                )
-            };
-            if status != sys::Status::napi_ok {
-                unsafe {
-                    drop(Box::from_raw(completion));
-                }
-                if status == sys::Status::napi_closing {
-                    // No more Node-API operations on a closing TSFN. The env
-                    // cleanup hook owns worker joins and remaining bookkeeping.
-                    inner.tsfn = None;
-                    inner.closing = true;
-                    inner.pending -= 1;
-                    for (_, token) in inner.requests.values() {
-                        token.store(true, Ordering::Release);
-                    }
-                } else {
-                    // Queue-full is impossible (max_queue_size=0); invalid-arg
-                    // indicates a broken lifetime invariant. There is no safe
-                    // JS-thread delivery path through an invalid TSFN.
-                    fatal_completion();
-                }
-            }
-        } else {
-            inner.pending -= 1;
+        inner.queue.finish(job.handle);
+        if post_completion(&mut inner, job, value).is_some() {
+            // A worker has no alternate JS-thread delivery path.
+            fatal_completion();
         }
         self.changed.notify_all();
     }
@@ -257,15 +314,7 @@ impl State {
                     if inner.closing {
                         return;
                     }
-                    if let Some(index) = inner
-                        .queue
-                        .iter()
-                        .position(|j| !inner.active.contains(&j.handle))
-                    {
-                        let Some(job) = inner.queue.remove(index) else {
-                            continue;
-                        };
-                        inner.active.insert(job.handle);
+                    if let Some(job) = inner.queue.take_ready() {
                         break job;
                     }
                     inner = self.changed.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -304,9 +353,9 @@ impl State {
             for (_, cancelled) in inner.requests.values() {
                 cancelled.store(true, Ordering::Release);
             }
-            while let Some(job) = inner.queue.pop_front() {
+            for job in inner.queue.cancel_queued(None) {
                 inner.requests.remove(&job.id);
-                inner.pending -= 1;
+                decrement_pending(&mut inner);
             }
             if let Some(error) = inner.fallback_error.take() {
                 unsafe {
@@ -339,6 +388,9 @@ fn state(env: &Env) -> Result<Arc<State>> {
     // TSFN creation may invoke async_hooks synchronously before ENVS can
     // publish a fully initialized state. Refuse recursive initialization rather
     // than create a second owner whose handles the outer insertion would lose.
+    // Calling initialization/read APIs from that hook is unsupported. The error
+    // thrown here is process-fatal if an async_hooks init hook doesn't catch it;
+    // owns()-gated lifecycle/status calls return false/{} during this window.
     if !INITIALIZING.with(|initializing| initializing.borrow_mut().insert(key)) {
         return Err(Error::from_reason("Myotis scheduler initializing"));
     }
@@ -363,8 +415,7 @@ fn state(env: &Env) -> Result<Arc<State>> {
             cleanup_started: false,
             poisoned: false,
             fallback_error: None,
-            queue: VecDeque::new(),
-            active: HashSet::new(),
+            queue: Admission::new(),
             requests: HashMap::new(),
             handles: HashSet::new(),
             pending: 0,
@@ -508,25 +559,55 @@ pub fn prepare(env: &Env) -> Result<()> {
 /// Cancel and drain native jobs before pause/stop can publish a new generation.
 /// This waits for native completion, never JS completion. The caller is the
 /// environment thread, so another submission cannot race this lifecycle call.
-pub fn cancel_handle(env: &Env, handle: i64, remove: bool) -> Result<bool> {
+#[must_use]
+pub struct Cancellation {
+    state: Arc<State>,
+    pub owned: bool,
+    failed: Vec<Completion>,
+}
+impl Cancellation {
+    /// Rare enqueue-invariant fallback, after native stop/pause has completed.
+    /// Ordinary cancellations use the TSFN and never reenter JS in lifecycle.
+    pub fn finish(self, env: &Env) {
+        if !self.failed.is_empty() {
+            poison(&self.state, env.raw());
+        }
+        for completion in self.failed {
+            deliver_completion(env.raw(), &self.state, completion);
+        }
+    }
+}
+
+pub fn cancel_handle(env: &Env, handle: i64, remove: bool) -> Result<Cancellation> {
     let state = state(env)?;
     let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     if !inner.handles.contains(&handle) {
-        return Ok(false);
+        drop(inner);
+        return Ok(Cancellation {
+            state,
+            owned: false,
+            failed: Vec::new(),
+        });
     }
     for (h, token) in inner.requests.values() {
         if *h == handle {
             token.store(true, Ordering::Release);
         }
     }
+    let failed = cancel_queued(&mut inner, Some(handle));
     state.changed.notify_all();
-    while inner.requests.values().any(|(h, _)| *h == handle) {
+    while inner.queue.is_active(handle) {
         inner = state.changed.wait(inner).unwrap_or_else(|e| e.into_inner());
     }
     if remove {
         inner.handles.remove(&handle);
     }
-    Ok(true)
+    drop(inner);
+    Ok(Cancellation {
+        state,
+        owned: true,
+        failed,
+    })
 }
 
 pub fn submit<'env>(
@@ -593,7 +674,7 @@ pub fn submit<'env>(
         let cancelled = Arc::new(AtomicBool::new(false));
         inner.pending += 1;
         inner.requests.insert(id, (handle, Arc::clone(&cancelled)));
-        inner.queue.push_back(Job {
+        inner.queue.push(Job {
             id,
             handle,
             deferred: deferred as usize,

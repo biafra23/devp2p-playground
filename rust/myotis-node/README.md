@@ -160,3 +160,19 @@ reports the loss. JS-side allocation and pending-exception errors never use
 `napi_fatal_error`. A proven live worker-side TSFN enqueue invariant
 failure is process-fatal (including in standalone Node); ordinary engine errors
 and environment closing do not use that path.
+
+Queued stop/pause cancellations are removed immediately under the queue lock
+and delivered through the TSFN; they do not wait for workers occupied by other
+chains, and they never release the slot of an actually executing sibling.
+Stop/pause wait only for the target handle's active native job. Poisoning also
+cancels queued jobs directly. An impossible owner-thread TSFN enqueue failure
+retains the completion for one JS-thread settlement after native lifecycle
+returns; ordinary lifecycle cancellation does not run synchronous Promise hooks.
+
+Initialization/read calls from a Node `async_hooks` init hook during scheduler
+creation are unsupported and throw. An uncaught exception inside that hook can
+terminate Node; the initialization guard prevents a second scheduler from
+replacing the first owner's state. Ownership-gated status/lifecycle calls in
+that window return their unavailable sentinels. Synchronous `create`, `pause`
+and `stop` may also throw scheduler/Node-API infrastructure errors; engine-level
+read failures still use JSON error results.

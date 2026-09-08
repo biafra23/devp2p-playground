@@ -25,6 +25,7 @@ use std::ffi::{c_char, CStr, CString};
 
 use napi::bindgen_prelude::Object;
 mod scheduler;
+mod admission;
 use napi::{Env, Result};
 use napi_derive::napi;
 
@@ -138,8 +139,10 @@ pub fn status_json(env: &Env, handle: i64) -> String {
 /// Idle-sleep: Running→Paused (tear down networking, keep warm state).
 #[napi]
 pub fn pause(env: &Env, handle: i64) -> Result<bool> {
-    if !scheduler::cancel_handle(env, handle, false)? { return Ok(false); }
-    Ok(unsafe { myotis_pause(handle) })
+    let cancellation = scheduler::cancel_handle(env, handle, false)?;
+    let result = cancellation.owned && unsafe { myotis_pause(handle) };
+    cancellation.finish(env);
+    Ok(result)
 }
 
 /// Paused→Running warm restart. False = rebuild failed (still PAUSED, retry).
@@ -153,7 +156,9 @@ pub fn resume(env: &Env, handle: i64) -> bool {
 /// Promise callbacks deliver once JS regains control. Unknown id is a no-op.
 #[napi]
 pub fn stop(env: &Env, handle: i64) -> Result<()> {
-    if scheduler::cancel_handle(env, handle, true)? { unsafe { myotis_stop(handle) }; }
+    let cancellation = scheduler::cancel_handle(env, handle, true)?;
+    if cancellation.owned { unsafe { myotis_stop(handle) }; }
+    cancellation.finish(env);
     Ok(())
 }
 
