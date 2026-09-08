@@ -106,7 +106,9 @@ impl Operation {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(Duration::from_millis(10)) => self.check()?,
-                value = &mut future => { self.check()?; return Ok(value); }
+                // Ready is a committed result, including side effects. A late
+                // cancellation must not replace it with a false failure.
+                value = &mut future => return Ok(value),
             }
         }
     }
@@ -254,6 +256,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_result_survives_cancellation_during_commit() {
+        let (shutdown, receiver) = watch::channel(false);
+        let committed = AtomicBool::new(false);
+        let result = run(receiver, REQUEST_BUDGET, async {
+            committed.store(true, Ordering::Release);
+            shutdown.send_replace(true);
+            Ok("committed transaction hash")
+        })
+        .await;
+        assert!(committed.load(Ordering::Acquire));
+        assert_eq!(result.unwrap(), "committed transaction hash");
+    }
+
+    #[tokio::test]
+    async fn ready_error_is_not_replaced_by_late_cancellation() {
+        let (shutdown, receiver) = watch::channel(false);
+        let result: Result<(), String> = run(receiver, REQUEST_BUDGET, async {
+            shutdown.send_replace(true);
+            Err("verified execution reverted".into())
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "verified execution reverted");
+    }
+
+    #[tokio::test]
+    async fn cancelled_submission_never_polls_work() {
+        let touched = AtomicBool::new(false);
+        let op = submitted(
+            Submission {
+                deadline: Instant::now() + REQUEST_BUDGET,
+                cancelled: Arc::new(AtomicBool::new(true)),
+            },
+            || Operation::new(watch::channel(false).1, REQUEST_BUDGET),
+        );
+        let result = run_operation(op, async {
+            touched.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "request cancelled");
+        assert!(!touched.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
     async fn shutdown_with_live_receiver_refuses_new_work() {
         let (shutdown, receiver) = watch::channel(false);
         shutdown.send_replace(true);
@@ -302,8 +348,7 @@ mod tests {
             let current = Operation::current().unwrap();
             let child = Operation::new(shutdown.subscribe(), REQUEST_BUDGET);
             current.cancel();
-            assert!(child.check().is_err());
-            Ok(42)
+            child.check().map(|()| 42)
         })
         .await;
         assert_eq!(result.unwrap_err(), "request cancelled");

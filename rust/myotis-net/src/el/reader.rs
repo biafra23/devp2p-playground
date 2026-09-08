@@ -3948,8 +3948,7 @@ impl ElReader {
             let sender = from.unwrap_or([0u8; 20]);
             executor.create_view(sender, &init_code, value, &ctx, overrides)
         })
-        .await
-        .map_err(|e| format!("eth_call task join error: {e}"))?;
+        .await?;
         Ok(match joined {
             Ok(bytes) => CallOutcome::Success(bytes),
             Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
@@ -3992,8 +3991,7 @@ impl ElReader {
             let sender = from.unwrap_or([0u8; 20]);
             executor.call_view_overridden(sender, to, &data, value, &ctx, overrides)
         })
-        .await
-        .map_err(|e| format!("eth_call task join error: {e}"))?;
+        .await?;
         Ok(match joined {
             Ok(bytes) => CallOutcome::Success(bytes),
             Err(EvmError::Reverted { data }) => CallOutcome::Revert(data),
@@ -4031,8 +4029,7 @@ impl ElReader {
             let sender = from.unwrap_or([0u8; 20]);
             executor.estimate_gas(sender, to, &data, value, &ctx)
         })
-        .await
-        .map_err(|e| format!("estimateGas task join error: {e}"))?;
+        .await?;
         Ok(match joined {
             Ok(gas) => GasOutcome::Estimate(gas),
             // The typed error survives to here — don't stringify the revert
@@ -4062,8 +4059,7 @@ impl ElReader {
         });
         // The enclosing request scope cancels and drains this worker on deadline.
         // Its oracle waits and interpreter steps observe the same operation.
-        let joined = walk.await
-            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        let joined = walk.await?;
         match joined {
             Ok(Some(address)) => Ok(EnsOutcome::Resolved { address, block_number }),
             Ok(None) => Ok(EnsOutcome::NoRecord { block_number }),
@@ -4153,8 +4149,7 @@ impl ElReader {
                 let Some(raw) = raw else { return Ok(None) };
                 decode_ccip_answer(&caller, &query, &raw)
             });
-            let joined = walk.await
-                .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+            let joined = walk.await?;
             match joined {
                 Ok(Some(value)) => {
                     Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized })
@@ -4197,8 +4192,7 @@ impl ElReader {
             run_ens_query(&caller, &query)
         });
         // The attempt scope drains this worker before AUTO can start another root.
-        let joined = walk.await
-            .map_err(|e| format!("resolve-ens task join error: {e}"))?;
+        let joined = walk.await?;
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, verified: finalized }),
             Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, verified: finalized }),

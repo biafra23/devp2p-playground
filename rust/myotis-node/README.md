@@ -183,3 +183,27 @@ remaining budget (about 30 seconds after a full first attempt). CCIP callbacks
 use a 60-second operation scope, and appender name lookups use an 8-second scope.
 All retain the indivisible-work overrun limitation. Stop first aborts/joins the
 appender, then drains its retained actual execution along with other requests.
+
+Once a wrapped operation returns a ready success or error, cancellation does
+not replace that committed result. Cancellation or connection loss after a
+partial transaction broadcast but before the operation returns still has an
+uncertain outcome; there is no exactly-once broadcast guarantee. Outer
+fee-history cancellation/expiry follows the existing stale-cache policy: only
+the same request signature within the cache age limit may be served, and an
+explicit invalid-request rejection never uses stale data.
+
+The global EVM cap deliberately refuses an additional execution immediately
+with `native execution busy`, including C/JNI/UniFFI callers and appender ENS
+lookups. It does not add semaphore waiters. Hosts should bound their own queue
+and retry busy verified reads within their own request deadline. Node's one
+executing request per handle is intentional: a slow ENS call delays queued
+calls on the same chain, while another chain can execute concurrently. The
+ABI 25 migration must account for the four queued/executing requests per
+handle and treat `native scheduler busy` as admission refusal.
+
+A cancelled partial RLPx frame cannot be resumed safely. The torn-write marker
+prevents further writes on that stream; the next attempted send fails the peer,
+and lifecycle cleanup closes it. Under write backpressure this can require
+re-dialing an otherwise healthy peer. Cancellation does not grant an unbounded
+write grace or delay stop to preserve the connection. Cancellation-check
+frequency and polling performance remain unmeasured optimization follow-ups.

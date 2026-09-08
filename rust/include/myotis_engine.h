@@ -14,6 +14,10 @@
  *  - Verified reads are BLOCKING with a cooperative ~90 s operation budget.
  *    Cancellation drains started native execution; indivisible native work may
  *    overrun the budget. Call off the UI thread.
+ *  - EVM execution admits at most eight actual closures process-wide; further
+ *    execution fails immediately with "native execution busy". Hosts must bound
+ *    their queues and retry busy reads within their own deadline; there is no
+ *    additional native semaphore-wait queue.
  */
 
 #ifndef MYOTIS_ENGINE_H

@@ -1425,12 +1425,28 @@ pub fn fee_history_json(
     // The raw request strings ARE the stale-serve signature (the Java
     // `blockCount + "|" + newestBlock + "|" + Arrays.toString(percentiles)`).
     let key = format!("{block_count}|{}|{}", newest_block_tag.trim(), percentiles_json.trim());
-    match engine.rt.block_on(reader.request(async {
+    let result = engine.rt.block_on(reader.request(async {
         Ok(reader.fee_history(block_count as u64, newest, percentiles.as_deref()).await)
-    })).unwrap_or_else(|msg| Err(myotis_net::el::reader::FeeHistoryError::Reject(msg))) {
+    }));
+    fee_history_response(result, &engine.fee_history_cache, handle, key)
+}
+
+// Keep host result/cache policy independent of the live engine for finite tests.
+fn fee_history_response(
+    result: Result<
+        Result<myotis_net::el::reader::FeeHistory, myotis_net::el::reader::FeeHistoryError>,
+        String,
+    >,
+    cache: &Mutex<HashMap<i64, (String, String, std::time::Instant)>>,
+    handle: i64,
+    key: String,
+) -> String {
+    // An outer operation failure is a build/availability failure, just like
+    // an inner peer timeout. Explicit request Rejects retain their meaning.
+    match result.unwrap_or_else(|msg| Err(myotis_net::el::reader::FeeHistoryError::Build(msg))) {
         Ok(history) => {
             let json = eljson::fee_history_json(&history);
-            if let Ok(mut cache) = engine.fee_history_cache.lock() {
+            if let Ok(mut cache) = cache.lock() {
                 cache.insert(handle, (key, json.clone(), std::time::Instant::now()));
             }
             json
@@ -1440,7 +1456,7 @@ pub fn fee_history_json(
         // BUILD failures reach serveStaleFeeHistory).
         Err(myotis_net::el::reader::FeeHistoryError::Reject(msg)) => eljson::error_json(&msg),
         Err(myotis_net::el::reader::FeeHistoryError::Build(msg)) => {
-            if let Ok(cache) = engine.fee_history_cache.lock() {
+            if let Ok(cache) = cache.lock() {
                 if let Some((last_key, json, at)) = cache.get(&handle) {
                     // saturating + read once: explicit panic-free style (the
                     // workspace convention under panic="abort"), and the gate
@@ -1845,6 +1861,68 @@ const NOT_STARTED_FALLBACK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_history_outer_failure_preserves_stale_cache_policy() {
+        use myotis_net::el::reader::FeeHistoryError;
+        let key = "2|latest|null".to_string();
+        let json = r#"{"oldestBlock":"0x1","baseFeePerGas":["0x1"]}"#.to_string();
+        let cache = Mutex::new(HashMap::from([(
+            7,
+            (key.clone(), json.clone(), std::time::Instant::now()),
+        )]));
+        for message in ["request deadline exceeded", "request cancelled"] {
+            assert_eq!(
+                fee_history_response(Err(message.into()), &cache, 7, key.clone()),
+                json
+            );
+            assert_eq!(
+                fee_history_response(
+                    Ok(Err(FeeHistoryError::Build(message.into()))),
+                    &cache,
+                    7,
+                    key.clone()
+                ),
+                json
+            );
+        }
+        let reject = "newest block is beyond the verified head";
+        assert_eq!(
+            fee_history_response(
+                Ok(Err(FeeHistoryError::Reject(reject.into()))),
+                &cache,
+                7,
+                key.clone()
+            ),
+            eljson::error_json(reject)
+        );
+        assert_eq!(
+            fee_history_response(
+                Err("request cancelled".into()),
+                &cache,
+                7,
+                "different request".into()
+            ),
+            eljson::error_json("request cancelled")
+        );
+        assert_eq!(
+            fee_history_response(Err("request cancelled".into()), &cache, 8, key),
+            eljson::error_json("request cancelled")
+        );
+    }
+
+    #[test]
+    fn fee_history_outer_failure_does_not_serve_expired_cache() {
+        let key = "2|latest|null".to_string();
+        let expired = std::time::Instant::now()
+            .checked_sub(FEE_HISTORY_STALE_MAX)
+            .unwrap();
+        let cache = Mutex::new(HashMap::from([(7, (key.clone(), "stale".into(), expired))]));
+        assert_eq!(
+            fee_history_response(Err("request deadline exceeded".into()), &cache, 7, key),
+            eljson::error_json("request deadline exceeded")
+        );
+    }
 
     #[test]
     fn create_makes_the_data_dir() {
