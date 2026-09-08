@@ -380,6 +380,17 @@ impl State {
     }
 }
 
+struct Cleanup {
+    env: usize,
+    state: Arc<State>,
+}
+
+unsafe extern "C" fn cleanup_environment(data: *mut c_void) {
+    // Successful registration transfers this box to Node, exactly once.
+    let cleanup = unsafe { Box::from_raw(data.cast::<Cleanup>()) };
+    cleanup.state.cleanup(cleanup.env as sys::napi_env);
+}
+
 fn state(env: &Env) -> Result<Arc<State>> {
     let key = env.raw() as usize;
     if let Some(state) = ENVS.with(|envs| envs.borrow().get(&key).cloned()) {
@@ -481,10 +492,6 @@ fn state(env: &Env) -> Result<Arc<State>> {
         // Idle addon does not keep Node alive. Ref once on first admission and
         // unref after the last JS completion; no premature normal process exit.
         check(unsafe { sys::napi_unref_threadsafe_function(env.raw(), tsfn) })?;
-        let cleanup = Arc::clone(&state);
-        // Registered after TSFN creation: LIFO cleanup invalidates our producer
-        // before Node's own TSFN teardown hook can run.
-        env.add_env_cleanup_hook(key, move |key| cleanup.cleanup(key as sys::napi_env))?;
         Ok(())
     })();
     if let Err(error) = setup {
@@ -535,6 +542,25 @@ fn state(env: &Env) -> Result<Arc<State>> {
                 )));
             }
         }
+    }
+    // Register only after worker startup: failed spawn/retry must retain no
+    // stale hook. This still follows TSFN creation, so LIFO cleanup invalidates
+    // our producer before Node's own TSFN teardown hook. No work is published.
+    // Own the box explicitly: napi 3.12's remove_env_cleanup_hook unregisters
+    // its hook but does not reclaim the wrapper's boxed closure.
+    let cleanup = Box::into_raw(Box::new(Cleanup {
+        env: key,
+        state: Arc::clone(&state),
+    }));
+    let status = unsafe {
+        sys::napi_add_env_cleanup_hook(env.raw(), Some(cleanup_environment), cleanup.cast())
+    };
+    if status != sys::Status::napi_ok {
+        unsafe {
+            drop(Box::from_raw(cleanup));
+        }
+        state.cleanup(env.raw());
+        check(status)?;
     }
     ENVS.with(|envs| {
         envs.borrow_mut().insert(key, Arc::clone(&state));
