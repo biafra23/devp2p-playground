@@ -59,6 +59,32 @@ allprojects {
     version = "0.1.7-SNAPSHOT"
 }
 
+// The release version — project.version minus the -SNAPSHOT suffix — and the
+// BUILD NUMBER the installable apps derive from it, defined ONCE here and read
+// by :android-app (versionCode) and verifyIosVersion (CFBundleVersion) via
+// rootProject.extra, so the two platforms cannot drift apart.
+//
+// MAJOR*1_000_000 + MINOR*1_000 + PATCH is order-preserving for every semver
+// bump (0.1.8 -> 1008, 0.2.0 -> 2000, 1.0.0 -> 1_000_000), so it is strictly
+// increasing forever, above every literal ever shipped (v0.1.7's versionCode
+// was 8, its CFBundleVersion 1), and — unlike a dotted "0.1.8" — a valid
+// CFBundleVersion, whose first integer Apple requires to be greater than zero.
+// It deliberately does NOT encode a -SNAPSHOT/-rc suffix: a re-cut of the same
+// version gets the same number, so a re-cut bumps PATCH. MINOR/PATCH < 1000
+// keeps it under Android's 2_100_000_000 versionCode ceiling until MAJOR 2100.
+val releaseVersion: String = project.version.toString().substringBefore('-')
+val releaseBuildNumber: Int = releaseVersion.split('.').let { parts ->
+    require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
+        "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
+    }
+    require(parts[1].toInt() < 1000 && parts[2].toInt() < 1000) {
+        "MINOR/PATCH must stay below 1000 for the build-number mapping: ${project.version}"
+    }
+    parts[0].toInt() * 1_000_000 + parts[1].toInt() * 1_000 + parts[2].toInt()
+}
+extra["releaseVersion"] = releaseVersion
+extra["releaseBuildNumber"] = releaseBuildNumber
+
 // The release version — project.version minus the -SNAPSHOT suffix — exactly as
 // :app-desktop and :android-app derive their installer / app versions from it.
 // Release CI reads it from HERE (via Gradle, so it can never drift from what the
@@ -76,9 +102,8 @@ allprojects {
 tasks.register("printReleaseVersion") {
     group = "help"
     description = "Print the release version (project.version without -SNAPSHOT) as releaseVersion=<x.y.z>"
-    // Read at configuration time: the task action captures a plain String, so it
-    // stays configuration-cache compatible.
-    val releaseVersion = project.version.toString().substringBefore('-')
+    // The task action captures a plain String, so it stays configuration-cache
+    // compatible.
     doLast { println("releaseVersion=$releaseVersion") }
 }
 
@@ -105,7 +130,6 @@ tasks.register("printReleaseVersion") {
 val verifyCrateVersions = tasks.register("verifyCrateVersions") {
     group = "verification"
     description = "Fail when the Rust workspace version or a myotis-* crate disagrees with the Gradle release version"
-    val releaseVersion = project.version.toString().substringBefore('-')
     val workspaceManifest = file("rust/Cargo.toml")
     val manifests = fileTree("rust") {
         include("myotis-*/Cargo.toml")
