@@ -82,26 +82,31 @@ tasks.register("printReleaseVersion") {
     doLast { println("releaseVersion=$releaseVersion") }
 }
 
-// The release sweep sets ONE version for the Gradle build (above) and repeats it
-// in each myotis-* crate's Cargo.toml. That was convention only, and since the
-// Rust engine derives its wire-visible client ids from CARGO_PKG_VERSION
+// The release sweep sets ONE version for the Gradle build (above) and ONE for the
+// Rust workspace (`[workspace.package] version` in rust/Cargo.toml, inherited by
+// every myotis-* crate through `version.workspace = true`). Since the Rust engine
+// derives its wire-visible client ids from CARGO_PKG_VERSION
 // (rust/myotis-net/src/{el/rlpx/transport,reqresp}.rs) a sweep that bumped Gradle
-// but missed the crates would ship an engine advertising the PREVIOUS release's
-// id — the release guard would not notice, because it only compares the tag to
-// project.version.
+// but missed the workspace would ship an engine advertising the PREVIOUS
+// release's id — the release guard would not notice, because it only compares
+// the tag to project.version.
 //
 // So the invariant is checked here, on the PR that breaks it, rather than at tag
 // time when the tag already exists and must be moved. Deliberately a plain file
 // parse: no cargo needed, so it runs on cargo-less machines and under
 // -PskipRustEngine, which is how CI's `./gradlew build` invokes `check`.
 //
-// Scope is rust/myotis-*/ — exactly the crates the sweep bumps. roost and tor-poc
-// are standalone and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool;
-// none of them are release artifacts, and none are matched by the glob.
+// Two checks: the workspace version equals the release version, and every
+// rust/myotis-*/Cargo.toml actually inherits it (a member that re-grows its own
+// `version = "…"` literal silently leaves the sweep's coverage — the failure
+// this task exists to catch, one level down). roost and tor-poc are standalone
+// and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool; none of them
+// are release artifacts, and none are matched by the glob.
 val verifyCrateVersions = tasks.register("verifyCrateVersions") {
     group = "verification"
-    description = "Fail when a myotis-* crate version disagrees with the Gradle release version"
+    description = "Fail when the Rust workspace version or a myotis-* crate disagrees with the Gradle release version"
     val releaseVersion = project.version.toString().substringBefore('-')
+    val workspaceManifest = file("rust/Cargo.toml")
     val manifests = fileTree("rust") {
         include("myotis-*/Cargo.toml")
     }.files.sortedBy { it.path }
@@ -114,30 +119,51 @@ val verifyCrateVersions = tasks.register("verifyCrateVersions") {
                 "verifyCrateVersions found no rust/myotis-*/Cargo.toml — the glob is stale, fix it rather than deleting this check"
             )
         }
-        // Only the [package] section's version counts: a dependency's
-        // `version = "…"` line elsewhere in the file must never be mistaken for
-        // the crate's own.
-        val mismatches = manifests.mapNotNull { manifest ->
+        val versionLine = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
+        // Only the [workspace.package] table's version counts: a dependency's
+        // `version = "…"` line elsewhere in the file must never be mistaken for it.
+        val workspaceVersion = workspaceManifest.readText()
+            .substringAfter("[workspace.package]", "")
+            .substringBefore("\n[")
+            .let { versionLine.find(it)?.groupValues?.get(1) }
+        val mismatches = mutableListOf<String>()
+        val notInheriting = mutableListOf<String>()
+        when (workspaceVersion) {
+            releaseVersion -> Unit
+            null -> mismatches += "rust/Cargo.toml: no [workspace.package] version found"
+            else -> mismatches += "rust/Cargo.toml: [workspace.package] version = $workspaceVersion"
+        }
+        manifests.forEach { manifest ->
             val packageSection = manifest.readText()
                 .substringAfter("[package]", "")
                 .substringBefore("\n[")
-            val found = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
-                .find(packageSection)?.groupValues?.get(1)
-            when (found) {
-                releaseVersion -> null
-                null -> "${manifest.relativeTo(rootDir)}: no [package] version found"
-                else -> "${manifest.relativeTo(rootDir)}: $found"
+            // Both TOML spellings of inheritance are legal to cargo:
+            // `version.workspace = true` and `version = { workspace = true }`.
+            val inherits = Regex(
+                """^version(\.workspace\s*=\s*true|\s*=\s*\{\s*workspace\s*=\s*true\s*\})""",
+                RegexOption.MULTILINE,
+            ).containsMatchIn(packageSection)
+            val literal = versionLine.find(packageSection)?.groupValues?.get(1)
+            when {
+                inherits -> Unit
+                literal == null -> notInheriting += "${manifest.relativeTo(rootDir)}: no [package] version"
+                else -> notInheriting += "${manifest.relativeTo(rootDir)}: own version literal $literal"
             }
         }
+        val problems = mutableListOf<String>()
         if (mismatches.isNotEmpty()) {
-            throw GradleException(
-                "crate versions disagree with the Gradle release version ($releaseVersion):\n" +
-                    mismatches.joinToString("\n") { "  $it" } +
-                    "\nThe release sweep must bump these together — the Rust engine's devp2p Hello" +
-                    "\nand libp2p agent ids come from the crate version, so a stale crate ships a" +
-                    "\nstale client id. Fix the Cargo.toml(s) and regenerate the Cargo.lock files."
-            )
+            problems += "The Rust workspace version disagrees with the Gradle release version ($releaseVersion):\n" +
+                mismatches.joinToString("\n") { "  $it" } +
+                "\nThe release sweep bumps rust/Cargo.toml with build.gradle.kts — the Rust engine's devp2p" +
+                "\nHello and libp2p agent ids come from the crate version, so a stale workspace ships a" +
+                "\nstale client id. Fix rust/Cargo.toml and regenerate the Cargo.lock files."
         }
+        if (notInheriting.isNotEmpty()) {
+            problems += "These crates do not inherit the workspace version, so the release sweep does not cover them:\n" +
+                notInheriting.joinToString("\n") { "  $it" } +
+                "\nSet `version.workspace = true` in each crate's [package] table."
+        }
+        if (problems.isNotEmpty()) throw GradleException(problems.joinToString("\n\n"))
     }
 }
 tasks.named("check") { dependsOn(verifyCrateVersions) }
