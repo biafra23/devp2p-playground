@@ -671,3 +671,7 @@ pub unsafe extern "C" fn myotis_export_log_index(
         None => std::ptr::null_mut(),
     }
 }
+
+/// Rust-only scheduler bridge. Does not add or change a C ABI symbol. Carries
+/// the admission-time deadline and cancellation bit through the blocking seam.
+pub use myotis_net::el::request::{submitted, Submission};

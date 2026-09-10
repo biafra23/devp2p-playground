@@ -29,11 +29,11 @@ myotis.init();   // ABI handshake — returns the engine ABI version; gate on
 const h = myotis.create('mainnet', '/path/to/data-dir');  // dir is created if missing
 myotis.start(h);
 
-// Lifecycle + status are cheap and synchronous:
+// Lifecycle and status are synchronous (stop/pause can wait for native work):
 JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, ... }
 
-// Verified reads BLOCK up to ~90 s in the engine — the binding runs them on
-// the libuv thread pool, so they surface as ordinary Promises:
+// Verified reads run on bounded Myotis workers, with a 90 s operation budget
+// including queue wait. Cancellation drains native work before completion:
 const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
 const ch = JSON.parse(await myotis.ensRecordJson(h, JSON.stringify({
@@ -99,3 +99,111 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   host's job (not yet wrapped here).
 - The addon is loadable from Electron main/utility processes as-is (N-API is
   ABI-stable across Node and Electron).
+
+## Request ownership and cancellation
+
+This implementation preserves the current engine's **ABI 25** and existing JS
+argument/result shapes. It is not a drop-in artifact for a host pinned to ABI 22.
+Engine failures, admission refusal, cancellation, and deadline expiry remain
+in-band JSON errors. Node-API infrastructure failures may throw/reject.
+
+Each Node environment owns two native workers, with a process-wide ceiling of
+eight workers. Admission is capped at 32 requests including completions awaiting
+JS delivery, with at most four queued/executing requests per handle and one
+executing request per handle. Two chains can execute concurrently. Saturation
+fails immediately with `{"error":"native scheduler busy"}`; there is no unbounded
+thread creation or libuv work item. A fifth concurrent environment fails to initialize at the process worker cap.
+Handles belong to the environment that created them and cannot be transferred to another Node worker environment.
+
+A 90-second budget starts at submission, before scheduler setup and queue wait.
+Expired or cancelled queued jobs never call the engine. The same deadline and
+cancellation bit cross the C seam into async reader setup/network waits, EVM
+oracle waits (including writer locks and sends), and EVM instruction checks.
+ENS attempts use a shorter child budget and drain before AUTO changes roots.
+Proof validation and cache trust rules are unchanged. An indivisible proof,
+precompile, filesystem call, or OS operation can overrun the cooperative budget.
+
+`stop` and `pause` remain **synchronous**. They cancel and drain native jobs before
+teardown or a new reader generation; Promise delivery follows when JS can run.
+The shared engine signals readers even while other `Arc`s own them and drains
+registered read/execution work. Started EVM closures retain their global permits
+(maximum eight) and accounting until they actually return. Pool shutdown joins
+owned parent loops and spawned dial/backfill/send work before closing peers.
+Pause/resume/start/stop on a handle must be serialized by C/JNI/UniFFI callers.
+
+Environment cleanup closes admission and the completion producer, cancels queued
+and active work, joins native workers without waiting for JS callbacks, and stops
+owned handles. It never drops the shared Tokio runtime. The completion TSFN is
+referenced while requests await delivery and unreferenced when idle. Cleanup
+cannot preempt indivisible work: **this is not a hard-stop or crash-isolation
+contract**. Hosts needing a hard shutdown deadline still need a supervised
+process boundary. Cancelled/timed-out transaction gossip does not prove that a
+transaction was not broadcast; do not blindly retry a signed submission.
+
+Qualification of Node/Electron cleanup, forced environment teardown, parent DNS
+liveness, queue cancellation, cross-chain fairness, and native overruns belongs
+on disposable hosts. Exact-lock Node build/runtime qualification is required
+before releasing a new artifact; a type-check with cached dependency patch
+versions does not qualify that artifact.
+
+The completion bridge makes exactly one resolve/reject attempt per deferred.
+A result-string allocation failure selects rejection before settlement. If
+Node's settlement itself fails, deferred ownership is consumed/unknown: the
+addon releases its admission/keepalive accounting, marks the scheduler poisoned,
+cancels remaining native work, and reports an uncaught exception plus a stderr
+diagnostic, without retrying that pointer. New reads resolve with
+`{"error":"native scheduler poisoned"}`; lifecycle cleanup remains available. A host
+`uncaughtException` handler can suppress termination, so this is not a guarantee
+that the failed Promise settles. If even the preallocated error reference cannot be obtained, no settlement is
+attempted: the scheduler is poisoned and the pending exception or stderr
+reports the loss. JS-side allocation and pending-exception errors never use
+`napi_fatal_error`. A proven live worker-side TSFN enqueue invariant
+failure is process-fatal (including in standalone Node); ordinary engine errors
+and environment closing do not use that path.
+
+Queued stop/pause cancellations are removed immediately under the queue lock
+and delivered through the TSFN; they do not wait for workers occupied by other
+chains, and they never release the slot of an actually executing sibling.
+Stop/pause wait only for the target handle's active native job. Poisoning also
+cancels queued jobs directly. An impossible owner-thread TSFN enqueue failure
+retains the completion for one JS-thread settlement after native lifecycle
+returns; ordinary lifecycle cancellation does not run synchronous Promise hooks.
+
+Initialization/read calls from a Node `async_hooks` init hook during scheduler
+creation are unsupported and throw. An uncaught exception inside that hook can
+terminate Node; the initialization guard prevents a second scheduler from
+replacing the first owner's state. Ownership-gated status/lifecycle calls in
+that window return their unavailable sentinels. Synchronous `create`, `pause`
+and `stop` may also throw scheduler/Node-API infrastructure errors; engine-level
+read failures still use JSON error results.
+
+ENS queries use one registered 90-second whole-query scope. A finalized root
+attempt may use up to 60 seconds; AUTO's optimistic attempt receives only the
+remaining budget (about 30 seconds after a full first attempt). CCIP callbacks
+use a 60-second operation scope, and appender name lookups use an 8-second scope.
+All retain the indivisible-work overrun limitation. Stop first aborts/joins the
+appender, then drains its retained actual execution along with other requests.
+
+Once a wrapped operation returns a ready success or error, cancellation does
+not replace that committed result. Cancellation or connection loss after a
+partial transaction broadcast but before the operation returns still has an
+uncertain outcome; there is no exactly-once broadcast guarantee. Outer
+fee-history cancellation/expiry follows the existing stale-cache policy: only
+the same request signature within the cache age limit may be served, and an
+explicit invalid-request rejection never uses stale data.
+
+The global EVM cap deliberately refuses an additional execution immediately
+with `native execution busy`, including C/JNI/UniFFI callers and appender ENS
+lookups. It does not add semaphore waiters. Hosts should bound their own queue
+and retry busy verified reads within their own request deadline. Node's one
+executing request per handle is intentional: a slow ENS call delays queued
+calls on the same chain, while another chain can execute concurrently. The
+ABI 25 migration must account for the four queued/executing requests per
+handle and treat `native scheduler busy` as admission refusal.
+
+A cancelled partial RLPx frame cannot be resumed safely. The torn-write marker
+prevents further writes on that stream; the next attempted send fails the peer,
+and lifecycle cleanup closes it. Under write backpressure this can require
+re-dialing an otherwise healthy peer. Cancellation does not grant an unbounded
+write grace or delay stop to preserve the connection. Cancellation-check
+frequency and polling performance remain unmeasured optimization follow-ups.

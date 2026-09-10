@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use myotis_core::nodekey::NodeKey;
@@ -204,6 +203,7 @@ fn read_failure_verdict(fails_before: u32, pool_len: usize) -> (u32, bool) {
 }
 
 struct PoolInner {
+    tasks: super::tasks::Tasks,
     key: Arc<NodeKey>,
     local_pubkey: [u8; 64],
     cfg: Arc<EthConfig>,
@@ -535,10 +535,6 @@ impl PoolInner {
 /// dialer task is aborted; held peers close as their `Arc`s drop).
 pub struct PeerPool {
     inner: Arc<PoolInner>,
-    dialer_task: JoinHandle<()>,
-    /// Keeps the live snap-peer count at target by re-dialing cached peers when
-    /// they die (twin of the Java `ChainStack.maintainSnapPeers` loop).
-    maintainer_task: JoinHandle<()>,
 }
 
 impl PeerPool {
@@ -567,6 +563,7 @@ impl PeerPool {
             }),
         ));
         let inner = Arc::new(PoolInner {
+            tasks: super::tasks::Tasks::default(),
             key,
             local_pubkey,
             cfg,
@@ -591,9 +588,9 @@ impl PeerPool {
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget.
         let dial_slots = Arc::new(Semaphore::new(inner.pool_cfg.max_concurrent_dials));
-        let dialer_task = tokio::spawn(dialer_loop(Arc::clone(&inner), rx, Arc::clone(&dial_slots)));
-        let maintainer_task = tokio::spawn(maintainer_loop(Arc::clone(&inner), dial_slots));
-        PeerPool { inner, dialer_task, maintainer_task }
+        inner.tasks.spawn(dialer_loop(Arc::clone(&inner), rx, Arc::clone(&dial_slots)));
+        inner.tasks.spawn(maintainer_loop(Arc::clone(&inner), dial_slots));
+        PeerPool { inner }
     }
 
     /// A live snap-capable peer for a verified read, or `None` if the pool has
@@ -694,18 +691,21 @@ impl PeerPool {
 
     /// Stop the pool: flush the peer cache, abort the background tasks, and drop
     /// all held peers (closing them).
-    pub async fn stop(self) {
+    pub async fn stop(&self) {
+        // Close admission and join parent loops AND their dial/backfill/send
+        // jobs before flushing caches or clearing peers. No late dial can
+        // publish a fresh peer after stop has cleared the set.
+        self.inner.tasks.stop().await;
         self.inner.cache.lock().await.flush();
-        self.dialer_task.abort();
-        self.maintainer_task.abort();
-        self.inner.peers.lock().await.clear();
+        let mut peers = self.inner.peers.lock().await;
+        for peer in peers.iter() { peer.peer.close().await; }
+        peers.clear();
     }
 }
 
 impl Drop for PeerPool {
     fn drop(&mut self) {
-        self.dialer_task.abort();
-        self.maintainer_task.abort();
+        self.inner.tasks.abort();
     }
 }
 
@@ -808,7 +808,7 @@ async fn try_dial(
         return false;
     };
     let inner2 = Arc::clone(inner);
-    tokio::spawn(async move {
+    inner.tasks.spawn(async move {
         inner2.dial_one(addr, pubkey).await;
         drop(permit);
     });
@@ -940,7 +940,7 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
         return;
     }
     let inner2 = Arc::clone(inner);
-    tokio::spawn(async move {
+    inner.tasks.spawn(async move {
         tracing::debug!(from, count, head = anchored.0, "header backfill: anchored fetch");
         let result = peer.get_block_headers_by_number_raw(from, count).await;
         inner2.backfill_inflight.store(false, std::sync::atomic::Ordering::Release);
@@ -999,7 +999,7 @@ async fn broadcast_range_if_changed(inner: &Arc<PoolInner>) {
     // maintainer's prune/re-dial work. Spawned, the tick is bounded by nothing —
     // a failed write closes its own peer (send_block_range_update fail_alls).
     for peer in peers {
-        tokio::spawn(async move {
+        inner.tasks.spawn(async move {
             peer.send_block_range_update(earliest, latest, latest_hash).await;
         });
     }

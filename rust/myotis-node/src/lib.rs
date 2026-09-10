@@ -11,12 +11,10 @@
 //!   imports of its `no_mangle` symbols, so the functions are called by Rust
 //!   path instead (see the note on the module in myotis-engine's lib.rs).
 //! - Compound values cross as JSON strings; parsing is the JS side's job.
-//! - The verified reads BLOCK (up to ~90 s). Every one of them is exposed as an
-//!   `AsyncTask` — napi-rs runs `compute()` on the libuv thread pool, so the
-//!   host's event loop (Electron main/utility process) never blocks and JS sees
-//!   an ordinary `Promise<string>`.
-//! - Lifecycle calls (`create`/`start`/`status`/`pause`/`resume`/`stop`) are
-//!   cheap and synchronous, same as on the other seams.
+//! - Verified reads run on bounded Myotis-owned workers, never libuv workers.
+//!   Their Promise completion uses a referenced-while-busy Node-API TSFN.
+//! - Stop/pause stay synchronous: cancel and drain native requests, then tear
+//!   down the reader. They may block on indivisible native/filesystem work.
 //! - Errors stay **in-band** (`{"error": ...}` objects, negative handles,
 //!   `false`), exactly as the C header documents — no JS exceptions for
 //!   engine-level failures, so all three seams behave identically.
@@ -25,8 +23,10 @@
 
 use std::ffi::{c_char, CStr, CString};
 
-use napi::bindgen_prelude::AsyncTask;
-use napi::{Env, Result, Task};
+use napi::bindgen_prelude::Object;
+mod scheduler;
+mod admission;
+use napi::{Env, Result};
 use napi_derive::napi;
 
 // The C ABI of myotis-engine (capi.rs / rust/include/myotis_engine.h; the
@@ -60,34 +60,6 @@ fn take(ptr: *mut c_char) -> String {
 /// workspace builds with `panic = "abort"`).
 fn c_arg(s: &str) -> std::result::Result<CString, String> {
     CString::new(s).map_err(|_| r#"{"error":"argument contains NUL"}"#.to_string())
-}
-
-/// One blocking C-ABI call scheduled on the libuv thread pool. Boxing a closure
-/// keeps every `#[napi]` export a two-liner instead of one Task struct each.
-pub struct BlockingJson {
-    run: Option<Box<dyn FnOnce() -> String + Send>>,
-}
-
-impl Task for BlockingJson {
-    type Output = String;
-    type JsValue = String;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        // `compute` runs exactly once per AsyncTask; the Option guards the
-        // FnOnce so a hypothetical re-entry errors instead of panicking.
-        match self.run.take() {
-            Some(f) => Ok(f()),
-            None => Ok(r#"{"error":"task already ran"}"#.to_string()),
-        }
-    }
-
-    fn resolve(&mut self, _env: Env, output: String) -> Result<String> {
-        Ok(output)
-    }
-}
-
-fn blocking(f: impl FnOnce() -> String + Send + 'static) -> AsyncTask<BlockingJson> {
-    AsyncTask::new(BlockingJson { run: Some(Box::new(f)) })
 }
 
 // ---------------------------------------------------------------------------
@@ -133,48 +105,61 @@ pub fn canonical_network_name(name_or_alias: String) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle (synchronous — cheap by the C header's contract)
+// Lifecycle (synchronous; stop/pause drain native work)
 // ---------------------------------------------------------------------------
 
 /// Allocate a not-yet-started handle (≥ 1); -1 unknown name / runtime-init
 /// failure, -2 canonical-but-unsupported network. `data_dir` is where the
 /// engine persists sync snapshots and peer caches.
 #[napi]
-pub fn create(network: String, data_dir: String) -> i64 {
+pub fn create(env: &Env, network: String, data_dir: String) -> Result<i64> {
+    scheduler::prepare(env)?;
     let (Ok(n), Ok(d)) = (c_arg(&network), c_arg(&data_dir)) else {
-        return -1;
+        return Ok(-1);
     };
-    unsafe { myotis_create(n.as_ptr(), d.as_ptr()) }
+    let handle = unsafe { myotis_create(n.as_ptr(), d.as_ptr()) };
+    if handle > 0 { scheduler::created(env, handle)?; }
+    Ok(handle)
 }
 
 /// Start the sync loop. False for an unknown/already-running handle.
 #[napi]
-pub fn start(handle: i64) -> bool {
+pub fn start(env: &Env, handle: i64) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_start(handle) }
 }
 
 /// Status JSON object (camelCase keys), or "{}" for an unknown handle.
 #[napi]
-pub fn status_json(handle: i64) -> String {
+pub fn status_json(env: &Env, handle: i64) -> String {
+    if !scheduler::owns(env, handle) { return "{}".into(); }
     take(unsafe { myotis_status_json(handle) })
 }
 
 /// Idle-sleep: Running→Paused (tear down networking, keep warm state).
 #[napi]
-pub fn pause(handle: i64) -> bool {
-    unsafe { myotis_pause(handle) }
+pub fn pause(env: &Env, handle: i64) -> Result<bool> {
+    let cancellation = scheduler::cancel_handle(env, handle, false)?;
+    let result = cancellation.owned && unsafe { myotis_pause(handle) };
+    cancellation.finish(env);
+    Ok(result)
 }
 
 /// Paused→Running warm restart. False = rebuild failed (still PAUSED, retry).
 #[napi]
-pub fn resume(handle: i64) -> bool {
+pub fn resume(env: &Env, handle: i64) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_resume(handle) }
 }
 
-/// Remove + shut down; no-op for an unknown id.
+/// Cancel queued/active native work, drain it, then remove and shut down.
+/// Promise callbacks deliver once JS regains control. Unknown id is a no-op.
 #[napi]
-pub fn stop(handle: i64) {
-    unsafe { myotis_stop(handle) }
+pub fn stop(env: &Env, handle: i64) -> Result<()> {
+    let cancellation = scheduler::cancel_handle(env, handle, true)?;
+    if cancellation.owned { unsafe { myotis_stop(handle) }; }
+    cancellation.finish(env);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +182,8 @@ pub fn stop(handle: i64) {
 /// Applied live over the shared policy, so a parked handle re-evaluates within
 /// ~1 s. Per-host, never persisted. Returns `false` for an unknown handle.
 #[napi]
-pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
+pub fn set_ws_bound_periods(env: &Env, handle: i64, periods: i64) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_set_ws_bound_periods(handle, periods) }
 }
 
@@ -208,19 +194,20 @@ pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
 /// a fresh `create()` starts gated again. Returns `false` for an unknown
 /// handle.
 #[napi]
-pub fn accept_stale_anchor(handle: i64) -> bool {
+pub fn accept_stale_anchor(env: &Env, handle: i64) -> bool {
+    if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_accept_stale_anchor(handle) }
 }
 
 // ---------------------------------------------------------------------------
-// Verified reads (blocking → libuv thread pool → Promise<string>)
+// Verified reads (bounded owned workers → Promise<string>)
 // ---------------------------------------------------------------------------
 
 /// Verified account read (balance/nonce/code hash + Merkle proof + beacon
 /// verification fields). Resolves to the AccountProofResult JSON.
 #[napi(ts_return_type = "Promise<string>")]
-pub fn request_account_json(handle: i64, address: String) -> AsyncTask<BlockingJson> {
-    blocking(move || match c_arg(&address) {
+pub fn request_account_json<'env>(env: &'env Env, handle: i64, address: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&address) {
         Ok(a) => take(unsafe { myotis_request_account_json(handle, a.as_ptr()) }),
         Err(e) => e,
     })
@@ -229,15 +216,15 @@ pub fn request_account_json(handle: i64, address: String) -> AsyncTask<BlockingJ
 /// Verified eth_call over the revm executor. `from` empty = anonymous sender;
 /// `value` is wei as a decimal string; `block` is a tag or 0x-number.
 #[napi(ts_return_type = "Promise<string>")]
-pub fn eth_call_json(
+pub fn eth_call_json<'env>(env: &'env Env,
     handle: i64,
     from: String,
     to: String,
     data: String,
     value: String,
     block: String,
-) -> AsyncTask<BlockingJson> {
-    blocking(move || {
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || {
         match (c_arg(&from), c_arg(&to), c_arg(&data), c_arg(&value), c_arg(&block)) {
             (Ok(f), Ok(t), Ok(d), Ok(v), Ok(b)) => take(unsafe {
                 myotis_eth_call_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr(), b.as_ptr())
@@ -249,14 +236,14 @@ pub fn eth_call_json(
 
 /// Verified eth_estimateGas (local EVM metering + safety buffer).
 #[napi(ts_return_type = "Promise<string>")]
-pub fn estimate_gas_json(
+pub fn estimate_gas_json<'env>(env: &'env Env,
     handle: i64,
     from: String,
     to: String,
     data: String,
     value: String,
-) -> AsyncTask<BlockingJson> {
-    blocking(move || {
+) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || {
         match (c_arg(&from), c_arg(&to), c_arg(&data), c_arg(&value)) {
             (Ok(f), Ok(t), Ok(d), Ok(v)) => take(unsafe {
                 myotis_estimate_gas_json(handle, f.as_ptr(), t.as_ptr(), d.as_ptr(), v.as_ptr())
@@ -268,8 +255,8 @@ pub fn estimate_gas_json(
 
 /// Verified ENS forward resolution (name → address).
 #[napi(ts_return_type = "Promise<string>")]
-pub fn resolve_ens_json(handle: i64, name: String) -> AsyncTask<BlockingJson> {
-    blocking(move || match c_arg(&name) {
+pub fn resolve_ens_json<'env>(env: &'env Env, handle: i64, name: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&name) {
         Ok(n) => take(unsafe { myotis_resolve_ens_json(handle, n.as_ptr()) }),
         Err(e) => e,
     })
@@ -279,8 +266,8 @@ pub fn resolve_ens_json(handle: i64, name: String) -> AsyncTask<BlockingJson> {
 /// `{"method":"contenthash","name":"vitalik.eth"}` (the record freedom-browser
 /// navigation needs), `{"method":"text","name":"a.eth","key":"avatar"}`, …
 #[napi(ts_return_type = "Promise<string>")]
-pub fn ens_record_json(handle: i64, params_json: String) -> AsyncTask<BlockingJson> {
-    blocking(move || match c_arg(&params_json) {
+pub fn ens_record_json<'env>(env: &'env Env, handle: i64, params_json: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&params_json) {
         Ok(p) => take(unsafe { myotis_ens_record_json(handle, p.as_ptr()) }),
         Err(e) => e,
     })
@@ -288,14 +275,14 @@ pub fn ens_record_json(handle: i64, params_json: String) -> AsyncTask<BlockingJs
 
 /// Verified fee suggestions: `{"gasPriceWei","maxPriorityFeePerGasWei"}`.
 #[napi(ts_return_type = "Promise<string>")]
-pub fn fee_estimate_json(handle: i64) -> AsyncTask<BlockingJson> {
-    blocking(move || take(unsafe { myotis_fee_estimate_json(handle) }))
+pub fn fee_estimate_json<'env>(env: &'env Env, handle: i64) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || take(unsafe { myotis_fee_estimate_json(handle) }))
 }
 
 /// Gossip a signed raw transaction to devp2p peers: `{"txHash":"0x…"}`.
 #[napi(ts_return_type = "Promise<string>")]
-pub fn send_raw_transaction_json(handle: i64, raw_tx_hex: String) -> AsyncTask<BlockingJson> {
-    blocking(move || match c_arg(&raw_tx_hex) {
+pub fn send_raw_transaction_json<'env>(env: &'env Env, handle: i64, raw_tx_hex: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || match c_arg(&raw_tx_hex) {
         Ok(r) => take(unsafe { myotis_send_raw_transaction_json(handle, r.as_ptr()) }),
         Err(e) => e,
     })
