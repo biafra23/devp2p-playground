@@ -192,6 +192,41 @@ val verifyCrateVersions = tasks.register("verifyCrateVersions") {
 }
 tasks.named("check") { dependsOn(verifyCrateVersions) }
 
+// The iOS app's bundle version is the other pin outside Gradle's reach. Xcode
+// reads build settings before any script phase runs, so ios-app/Myotis/Version.xcconfig
+// (MARKETING_VERSION -> CFBundleShortVersionString, CURRENT_PROJECT_VERSION ->
+// CFBundleVersion) has to be a committed file rather than something the Gradle
+// pre-build phase derives — which makes it a sweep pin, checked here the same
+// way the Rust workspace version is. CURRENT_PROJECT_VERSION must equal
+// releaseBuildNumber above: the same number :android-app ships as versionCode,
+// and a valid CFBundleVersion (Apple requires its first integer > 0, so the 0.x
+// marketing version cannot be reused verbatim).
+val verifyIosVersion = tasks.register("verifyIosVersion") {
+    group = "verification"
+    description = "Fail when ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version"
+    val xcconfig = file("ios-app/Myotis/Version.xcconfig")
+    val expectedBuild = releaseBuildNumber.toString()
+    doLast {
+        // Only assignment lines count: the file's comment block mentions both
+        // names, so anchor on a line that STARTS with the setting.
+        val settings = xcconfig.readLines()
+            .mapNotNull { line -> Regex("""^\s*([A-Z_]+)\s*=\s*(\S+)\s*$""").find(line)?.destructured }
+            .associate { (k, v) -> k to v }
+        val mismatches = listOfNotNull(
+            settings["MARKETING_VERSION"].let { if (it == releaseVersion) null else "MARKETING_VERSION = ${it ?: "<missing>"} (expected $releaseVersion)" },
+            settings["CURRENT_PROJECT_VERSION"].let { if (it == expectedBuild) null else "CURRENT_PROJECT_VERSION = ${it ?: "<missing>"} (expected $expectedBuild, the root build's releaseBuildNumber)" },
+        )
+        if (mismatches.isNotEmpty()) {
+            throw GradleException(
+                "ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version ($releaseVersion):\n" +
+                    mismatches.joinToString("\n") { "  $it" } +
+                    "\nThe release sweep must bump it with build.gradle.kts, or the iOS app reports the previous release."
+            )
+        }
+    }
+}
+tasks.named("check") { dependsOn(verifyIosVersion) }
+
 subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
     // Compose), which are incompatible with the `java` plugin applied below:
