@@ -86,6 +86,13 @@ val rpcUpstream: String = run {
 // derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
 val releaseVersion = project.version.toString().substringBefore('-')
 
+// versionCode is DERIVED too: the release guard does not check it, so as a
+// hand-bumped literal a forgotten bump shipped an APK that refuses to install
+// over the previous one (INSTALL_FAILED_VERSION_DOWNGRADE) with green CI. The
+// mapping (and why it is monotonic) lives in the root build's
+// releaseBuildNumber, shared with the iOS CFBundleVersion check.
+val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
+
 // Mirror the root build's -PskipRustEngine parse (same truthy rules). When set,
 // the Android build omits the Rust native libs — so packaging must also drop any
 // libmyotis_*.so LEFT OVER in the source tree from an earlier toolchain build,
@@ -104,10 +111,7 @@ android {
         applicationId = "com.jaeckel.ethp2p.android"
         minSdk = 29
         targetSdk = 34
-        // Stays a manual literal: a monotonic install counter with no relation
-        // to semver, so there is nothing to derive it from. Bump it on every
-        // release or the new APK won't install over the previous one.
-        versionCode = 8
+        versionCode = derivedVersionCode // see derivedVersionCode above
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

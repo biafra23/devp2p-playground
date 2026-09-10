@@ -115,9 +115,10 @@ jobs:
               echo "Release assets are named after the TAG, but the binaries inside report the"
               echo "PROJECT VERSION — so publishing now would ship $tag assets that identify"
               echo "themselves as $version."
-              echo "Fix: run the version sweep on main (the version in build.gradle.kts, and"
-              echo "bump android-app's versionCode — which this guard does NOT check), merge"
-              echo "it, then tag that commit."
+              echo "Fix: run the version sweep on main (the version in build.gradle.kts and the"
+              echo "pins verifyCrateVersions / verifyIosVersion check under ./gradlew check —"
+              echo "android versionCode and the Java Hello client id are derived), merge it,"
+              echo "then tag that commit."
               echo "::error::tag/version mismatch: pushed tag $tag, but the tree builds $version (expected v$version or v$version-<suffix>)"
               exit 1
               ;;

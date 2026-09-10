@@ -345,9 +345,10 @@ Notes:
   and the default retention covers all available periods. This matters
   because a wallet's first request is `light_client_bootstrap` for its
   **pinned checkpoint** (`NetworkConfig.SEPOLIA`, refreshed via
-  `./gradlew refreshCheckpoint -Pnetwork=sepolia`), which is typically days-to-weeks old
-  (a sync-committee period is ~27 h) — with `only-new` the node could not
-  serve bootstraps older than its own start.
+  `./gradlew refreshCheckpoint -Pnetwork=sepolia`), which is typically hours-to-days old
+  and never past the ~2-week weak-subjectivity gate (a sync-committee period is
+  ~27 h; the wallet parks rather than bootstrap from an older pin) — with
+  `only-new` the node could not serve bootstraps older than its own start.
 - Hard limit either way: Nimbus can only produce light-client data for slots
   it processed with state — i.e. from its trustedNodeSync point forward
   (block backfill doesn't help; bootstraps need the sync committee from

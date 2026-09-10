@@ -56,8 +56,34 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.7-SNAPSHOT"
+    version = "0.1.8-SNAPSHOT"
 }
+
+// The release version — project.version minus the -SNAPSHOT suffix — and the
+// BUILD NUMBER the installable apps derive from it, defined ONCE here and read
+// by :android-app (versionCode) and verifyIosVersion (CFBundleVersion) via
+// rootProject.extra, so the two platforms cannot drift apart.
+//
+// MAJOR*1_000_000 + MINOR*1_000 + PATCH is order-preserving for every semver
+// bump (0.1.8 -> 1008, 0.2.0 -> 2000, 1.0.0 -> 1_000_000), so it is strictly
+// increasing forever, above every literal ever shipped (v0.1.7's versionCode
+// was 8, its CFBundleVersion 1), and — unlike a dotted "0.1.8" — a valid
+// CFBundleVersion, whose first integer Apple requires to be greater than zero.
+// It deliberately does NOT encode a -SNAPSHOT/-rc suffix: a re-cut of the same
+// version gets the same number, so a re-cut bumps PATCH. MINOR/PATCH < 1000
+// keeps it under Android's 2_100_000_000 versionCode ceiling until MAJOR 2100.
+val releaseVersion: String = project.version.toString().substringBefore('-')
+val releaseBuildNumber: Int = releaseVersion.split('.').let { parts ->
+    require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
+        "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
+    }
+    require(parts[1].toInt() < 1000 && parts[2].toInt() < 1000) {
+        "MINOR/PATCH must stay below 1000 for the build-number mapping: ${project.version}"
+    }
+    parts[0].toInt() * 1_000_000 + parts[1].toInt() * 1_000 + parts[2].toInt()
+}
+extra["releaseVersion"] = releaseVersion
+extra["releaseBuildNumber"] = releaseBuildNumber
 
 // The release version — project.version minus the -SNAPSHOT suffix — exactly as
 // :app-desktop and :android-app derive their installer / app versions from it.
@@ -76,32 +102,35 @@ allprojects {
 tasks.register("printReleaseVersion") {
     group = "help"
     description = "Print the release version (project.version without -SNAPSHOT) as releaseVersion=<x.y.z>"
-    // Read at configuration time: the task action captures a plain String, so it
-    // stays configuration-cache compatible.
-    val releaseVersion = project.version.toString().substringBefore('-')
+    // The task action captures a plain String, so it stays configuration-cache
+    // compatible.
     doLast { println("releaseVersion=$releaseVersion") }
 }
 
-// The release sweep sets ONE version for the Gradle build (above) and repeats it
-// in each myotis-* crate's Cargo.toml. That was convention only, and since the
-// Rust engine derives its wire-visible client ids from CARGO_PKG_VERSION
+// The release sweep sets ONE version for the Gradle build (above) and ONE for the
+// Rust workspace (`[workspace.package] version` in rust/Cargo.toml, inherited by
+// every myotis-* crate through `version.workspace = true`). Since the Rust engine
+// derives its wire-visible client ids from CARGO_PKG_VERSION
 // (rust/myotis-net/src/{el/rlpx/transport,reqresp}.rs) a sweep that bumped Gradle
-// but missed the crates would ship an engine advertising the PREVIOUS release's
-// id — the release guard would not notice, because it only compares the tag to
-// project.version.
+// but missed the workspace would ship an engine advertising the PREVIOUS
+// release's id — the release guard would not notice, because it only compares
+// the tag to project.version.
 //
 // So the invariant is checked here, on the PR that breaks it, rather than at tag
 // time when the tag already exists and must be moved. Deliberately a plain file
 // parse: no cargo needed, so it runs on cargo-less machines and under
 // -PskipRustEngine, which is how CI's `./gradlew build` invokes `check`.
 //
-// Scope is rust/myotis-*/ — exactly the crates the sweep bumps. roost and tor-poc
-// are standalone and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool;
-// none of them are release artifacts, and none are matched by the glob.
+// Two checks: the workspace version equals the release version, and every
+// rust/myotis-*/Cargo.toml actually inherits it (a member that re-grows its own
+// `version = "…"` literal silently leaves the sweep's coverage — the failure
+// this task exists to catch, one level down). roost and tor-poc are standalone
+// and pinned at 0.0.0 on purpose, uniffi-bindgen is a pinned tool; none of them
+// are release artifacts, and none are matched by the glob.
 val verifyCrateVersions = tasks.register("verifyCrateVersions") {
     group = "verification"
-    description = "Fail when a myotis-* crate version disagrees with the Gradle release version"
-    val releaseVersion = project.version.toString().substringBefore('-')
+    description = "Fail when the Rust workspace version or a myotis-* crate disagrees with the Gradle release version"
+    val workspaceManifest = file("rust/Cargo.toml")
     val manifests = fileTree("rust") {
         include("myotis-*/Cargo.toml")
     }.files.sortedBy { it.path }
@@ -114,33 +143,89 @@ val verifyCrateVersions = tasks.register("verifyCrateVersions") {
                 "verifyCrateVersions found no rust/myotis-*/Cargo.toml — the glob is stale, fix it rather than deleting this check"
             )
         }
-        // Only the [package] section's version counts: a dependency's
-        // `version = "…"` line elsewhere in the file must never be mistaken for
-        // the crate's own.
-        val mismatches = manifests.mapNotNull { manifest ->
+        val versionLine = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
+        // Only the [workspace.package] table's version counts: a dependency's
+        // `version = "…"` line elsewhere in the file must never be mistaken for it.
+        val workspaceVersion = workspaceManifest.readText()
+            .substringAfter("[workspace.package]", "")
+            .substringBefore("\n[")
+            .let { versionLine.find(it)?.groupValues?.get(1) }
+        val mismatches = mutableListOf<String>()
+        val notInheriting = mutableListOf<String>()
+        when (workspaceVersion) {
+            releaseVersion -> Unit
+            null -> mismatches += "rust/Cargo.toml: no [workspace.package] version found"
+            else -> mismatches += "rust/Cargo.toml: [workspace.package] version = $workspaceVersion"
+        }
+        manifests.forEach { manifest ->
             val packageSection = manifest.readText()
                 .substringAfter("[package]", "")
                 .substringBefore("\n[")
-            val found = Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE)
-                .find(packageSection)?.groupValues?.get(1)
-            when (found) {
-                releaseVersion -> null
-                null -> "${manifest.relativeTo(rootDir)}: no [package] version found"
-                else -> "${manifest.relativeTo(rootDir)}: $found"
+            // Both TOML spellings of inheritance are legal to cargo:
+            // `version.workspace = true` and `version = { workspace = true }`.
+            val inherits = Regex(
+                """^version(\.workspace\s*=\s*true|\s*=\s*\{\s*workspace\s*=\s*true\s*\})""",
+                RegexOption.MULTILINE,
+            ).containsMatchIn(packageSection)
+            val literal = versionLine.find(packageSection)?.groupValues?.get(1)
+            when {
+                inherits -> Unit
+                literal == null -> notInheriting += "${manifest.relativeTo(rootDir)}: no [package] version"
+                else -> notInheriting += "${manifest.relativeTo(rootDir)}: own version literal $literal"
             }
         }
+        val problems = mutableListOf<String>()
+        if (mismatches.isNotEmpty()) {
+            problems += "The Rust workspace version disagrees with the Gradle release version ($releaseVersion):\n" +
+                mismatches.joinToString("\n") { "  $it" } +
+                "\nThe release sweep bumps rust/Cargo.toml with build.gradle.kts — the Rust engine's devp2p" +
+                "\nHello and libp2p agent ids come from the crate version, so a stale workspace ships a" +
+                "\nstale client id. Fix rust/Cargo.toml and regenerate the Cargo.lock files."
+        }
+        if (notInheriting.isNotEmpty()) {
+            problems += "These crates do not inherit the workspace version, so the release sweep does not cover them:\n" +
+                notInheriting.joinToString("\n") { "  $it" } +
+                "\nSet `version.workspace = true` in each crate's [package] table."
+        }
+        if (problems.isNotEmpty()) throw GradleException(problems.joinToString("\n\n"))
+    }
+}
+tasks.named("check") { dependsOn(verifyCrateVersions) }
+
+// The iOS app's bundle version is the other pin outside Gradle's reach. Xcode
+// reads build settings before any script phase runs, so ios-app/Myotis/Version.xcconfig
+// (MARKETING_VERSION -> CFBundleShortVersionString, CURRENT_PROJECT_VERSION ->
+// CFBundleVersion) has to be a committed file rather than something the Gradle
+// pre-build phase derives — which makes it a sweep pin, checked here the same
+// way the Rust workspace version is. CURRENT_PROJECT_VERSION must equal
+// releaseBuildNumber above: the same number :android-app ships as versionCode,
+// and a valid CFBundleVersion (Apple requires its first integer > 0, so the 0.x
+// marketing version cannot be reused verbatim).
+val verifyIosVersion = tasks.register("verifyIosVersion") {
+    group = "verification"
+    description = "Fail when ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version"
+    val xcconfig = file("ios-app/Myotis/Version.xcconfig")
+    val expectedBuild = releaseBuildNumber.toString()
+    doLast {
+        // Only assignment lines count: the file's comment block mentions both
+        // names, so anchor on a line that STARTS with the setting.
+        val settings = xcconfig.readLines()
+            .mapNotNull { line -> Regex("""^\s*([A-Z_]+)\s*=\s*(\S+)\s*$""").find(line)?.destructured }
+            .associate { (k, v) -> k to v }
+        val mismatches = listOfNotNull(
+            settings["MARKETING_VERSION"].let { if (it == releaseVersion) null else "MARKETING_VERSION = ${it ?: "<missing>"} (expected $releaseVersion)" },
+            settings["CURRENT_PROJECT_VERSION"].let { if (it == expectedBuild) null else "CURRENT_PROJECT_VERSION = ${it ?: "<missing>"} (expected $expectedBuild, the root build's releaseBuildNumber)" },
+        )
         if (mismatches.isNotEmpty()) {
             throw GradleException(
-                "crate versions disagree with the Gradle release version ($releaseVersion):\n" +
+                "ios-app/Myotis/Version.xcconfig disagrees with the Gradle release version ($releaseVersion):\n" +
                     mismatches.joinToString("\n") { "  $it" } +
-                    "\nThe release sweep must bump these together — the Rust engine's devp2p Hello" +
-                    "\nand libp2p agent ids come from the crate version, so a stale crate ships a" +
-                    "\nstale client id. Fix the Cargo.toml(s) and regenerate the Cargo.lock files."
+                    "\nThe release sweep must bump it with build.gradle.kts, or the iOS app reports the previous release."
             )
         }
     }
 }
-tasks.named("check") { dependsOn(verifyCrateVersions) }
+tasks.named("check") { dependsOn(verifyIosVersion) }
 
 subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
@@ -877,10 +962,19 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
 
     // An explicit target period anchors at that period's FIRST slot instead of at
-    // head. Anchoring at head is wrong for this deployment: roost's archive only
-    // grows FORWARD, so an anchor at the newest period leaves a wallet nothing to
-    // walk and goes stale the moment the period rolls. The useful anchor is
-    // roost's FLOOR — the oldest period it can still serve.
+    // head. Head (the default) is the RELEASE anchor: both engines refuse an anchor
+    // older than the network's weak-subjectivity bound (ws_bound_periods — 13
+    // periods on mainnet/sepolia, 3 on gnosis; see NetworkConfig.wsBoundPeriods and
+    // the README's "Weak-subjectivity age bound"), so anything pinned further back
+    // than that parks every fresh install in STALE_ANCHOR on day one. roost serves
+    // a head-period bootstrap root on demand (fill_bootstrap_misses fetches an
+    // unseen root from its upstream), so head needs no pre-population either.
+    // -Pperiod exists for TESTING a specific retained state — the oldest bootstrap
+    // a serving node can still answer, a period at roost's archive floor — and any
+    // pin it writes must still sit within the bound of the current period to be
+    // shippable. The durable constraint is "not BELOW roost's floor" (an archive
+    // only grows forward, so a below-floor anchor is unreachable forever), never
+    // "at the floor".
     //
     // A period's first slot may be SKIPPED (no block proposed), which the beacon
     // API answers with 404, so walk forward until a block exists. Bounded at 32
@@ -1213,7 +1307,10 @@ val checkpointGenesisValidatorsRoot = mapOf(
  * Generalised from the gnosis-only task after the same gap appeared twice: an
  * anchor that drifts below roost's archive floor can never be reached, because
  * the archive only grows FORWARD. mainnet sat at period 1777 against a roost
- * floor of 1825 and simply could not sync.
+ * floor of 1825 and simply could not sync. The default (head) is the release
+ * anchor — since the weak-subjectivity gate, an anchor older than the network's
+ * bound parks fresh installs, so the floor is a testing target (-Pperiod /
+ * -Pslot), not a release one.
  *
  * It writes the Rust `ChainConfig` as well as `NetworkConfig.java`. The Rust
  * copy used to carry a "mirror this by hand" note, and hand-mirroring is
