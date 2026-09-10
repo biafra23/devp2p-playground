@@ -298,8 +298,12 @@ impl ChainConfig {
             // roost@gnosis can serve. An earlier anchor sat 116 periods below
             // roost's floor, and roost's archive only grows FORWARD from where it
             // started, so no amount of waiting closes such a gap — a wallet
-            // bootstrapping from it gets ResourceUnavailable forever. Pick the
-            // floor with `-Pperiod=<n>`, not head.
+            // bootstrapping from it gets ResourceUnavailable forever. The window
+            // is [floor, head]: anchor at head (the task's default) for a release —
+            // roost fetches an unseen head root on demand, and the weak-
+            // subjectivity gate (`ws_bound_periods` below, 3 here) refuses
+            // anything older than a few periods anyway — and use `-Pperiod=<n>`
+            // only to pin a retained state for testing, never one below the floor.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
             // trusted checkpoint: recent finalized gnosis block root (slot 29647728, 2026-08-20, period 3619)
             checkpoint_root: hex32(

@@ -877,10 +877,19 @@ fun refreshOneCheckpoint(project: Project, logger: org.gradle.api.logging.Logger
     val slotRe = Regex(""""slot"\s*:\s*"?(\d+)"?""")
 
     // An explicit target period anchors at that period's FIRST slot instead of at
-    // head. Anchoring at head is wrong for this deployment: roost's archive only
-    // grows FORWARD, so an anchor at the newest period leaves a wallet nothing to
-    // walk and goes stale the moment the period rolls. The useful anchor is
-    // roost's FLOOR — the oldest period it can still serve.
+    // head. Head (the default) is the RELEASE anchor: both engines refuse an anchor
+    // older than the network's weak-subjectivity bound (ws_bound_periods — 13
+    // periods on mainnet/sepolia, 3 on gnosis; see NetworkConfig.wsBoundPeriods and
+    // the README's "Weak-subjectivity age bound"), so anything pinned further back
+    // than that parks every fresh install in STALE_ANCHOR on day one. roost serves
+    // a head-period bootstrap root on demand (fill_bootstrap_misses fetches an
+    // unseen root from its upstream), so head needs no pre-population either.
+    // -Pperiod exists for TESTING a specific retained state — the oldest bootstrap
+    // a serving node can still answer, a period at roost's archive floor — and any
+    // pin it writes must still sit within the bound of the current period to be
+    // shippable. The durable constraint is "not BELOW roost's floor" (an archive
+    // only grows forward, so a below-floor anchor is unreachable forever), never
+    // "at the floor".
     //
     // A period's first slot may be SKIPPED (no block proposed), which the beacon
     // API answers with 404, so walk forward until a block exists. Bounded at 32
@@ -1213,7 +1222,10 @@ val checkpointGenesisValidatorsRoot = mapOf(
  * Generalised from the gnosis-only task after the same gap appeared twice: an
  * anchor that drifts below roost's archive floor can never be reached, because
  * the archive only grows FORWARD. mainnet sat at period 1777 against a roost
- * floor of 1825 and simply could not sync.
+ * floor of 1825 and simply could not sync. The default (head) is the release
+ * anchor — since the weak-subjectivity gate, an anchor older than the network's
+ * bound parks fresh installs, so the floor is a testing target (-Pperiod /
+ * -Pslot), not a release one.
  *
  * It writes the Rust `ChainConfig` as well as `NetworkConfig.java`. The Rust
  * copy used to carry a "mirror this by hand" note, and hand-mirroring is
