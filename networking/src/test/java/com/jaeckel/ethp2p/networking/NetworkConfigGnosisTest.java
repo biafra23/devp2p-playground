@@ -57,8 +57,11 @@ class NetworkConfigGnosisTest {
                 Bytes.wrap(G.genesisValidatorsRoot()));
         assertEquals(4, G.currentForkVersion().length, "fork version must be 4 bytes");
         assertArrayEquals(new byte[]{0x06, 0x00, 0x00, 0x64}, G.currentForkVersion(), "Fulu fork version");
+        assertTrue(G.acceptPriorForkDigest());
         assertNotNull(G.priorForkVersion());
         assertArrayEquals(new byte[]{0x05, 0x00, 0x00, 0x64}, G.priorForkVersion(), "Electra prior fork version");
+        // The full schedule is pinned in NetworkConfigForkScheduleTest.
+        assertEquals(16, G.forkSchedule().slotsPerEpoch(), "schedule carries the gnosis geometry");
         assertEquals(32, G.checkpointRoot().length, "checkpoint root must be 32 bytes");
         assertTrue(G.checkpointSlot() > 0, "checkpoint slot must be set");
         // EIP-7892: Gnosis folds the Electra-baseline blob params into the Fulu digest.

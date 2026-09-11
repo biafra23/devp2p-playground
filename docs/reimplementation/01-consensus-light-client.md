@@ -148,8 +148,15 @@ signing_root  = hash_tree_root(SigningData{ object_root, domain })
               = sha256(object_root ‖ domain)                                              // 2-leaf container
 ```
 
-`forkVersion` is the network's **current** fork version (not the attested header's epoch — the
-client is forward-only from a recent checkpoint, so the current version always applies).
+`forkVersion` is the fork version **active at the update's `signature_slot`**, per the spec's
+`validate_light_client_update`:
+`compute_fork_version(compute_epoch_at_slot(max(signature_slot, 1) - 1))`. It comes from the
+network's embedded **fork schedule** (`ForkSchedule` — Java `:core`, Rust
+`myotis_consensus::fork`; pinned per network in `NetworkConfig.forkSchedule` /
+`ChainConfig.fork_schedule`), NOT from a single "current" version: a store walking updates across
+a fork boundary needs both versions, and one fixed value stalls sync at every consensus fork
+(#295). Note the `- 1`: the aggregate signs the previous slot's block, so a signature at the first
+slot of a fork's activation epoch still uses the old version.
 
 ---
 

@@ -33,12 +33,64 @@ pub struct DiscoveredPeer {
     pub addr: Multiaddr,
 }
 
+/// The accepted `eth2` fork digests: current first, then the prior fork's
+/// when the chain configures one (`NetworkConfig.acceptedForkDigests`).
+///
+/// `Dynamic` is re-read per candidate ENR (two SHA-256s — noise next to the
+/// UDP round trip that produced the ENR), so a fork pinned ahead of its
+/// activation rotates the filter at its epoch without a restart; a list
+/// captured once at spawn would reject every upgraded peer from that epoch
+/// on and starve CL discovery silently (#295 review). `Fixed` is for tools
+/// and tests that mean one list for the run.
+#[derive(Clone)]
+pub enum AcceptedForkDigests {
+    Fixed(Vec<[u8; 4]>),
+    Dynamic(Arc<dyn Fn() -> Vec<[u8; 4]> + Send + Sync>),
+}
+
+impl AcceptedForkDigests {
+    /// The list to filter the NEXT candidate with.
+    pub fn current(&self) -> Vec<[u8; 4]> {
+        match self {
+            AcceptedForkDigests::Fixed(v) => v.clone(),
+            AcceptedForkDigests::Dynamic(f) => f(),
+        }
+    }
+}
+
+impl From<Vec<[u8; 4]>> for AcceptedForkDigests {
+    fn from(v: Vec<[u8; 4]>) -> Self {
+        AcceptedForkDigests::Fixed(v)
+    }
+}
+
+/// Forget every once-ever decision when the accepted list changes. The
+/// `seen` set records node IDs, including ones rejected as off-fork; after a
+/// fork activation those same nodes republish with the new digest and would
+/// otherwise never be re-checked, so the dynamic list alone could not rotate
+/// the filter for a long-running process (PR #430 review). Returns whether a
+/// rotation happened; `last` is updated in place.
+fn rotate_seen_if_changed(
+    seen: &mut HashSet<NodeId>,
+    last: &mut Vec<[u8; 4]>,
+    now: &[[u8; 4]],
+) -> bool {
+    if last.as_slice() == now {
+        return false;
+    }
+    tracing::info!(from = ?last, to = ?now, forgotten = seen.len(),
+        "accepted fork digests changed — re-checking every known node");
+    seen.clear();
+    *last = now.to_vec();
+    true
+}
+
 #[derive(Clone)]
 pub struct DiscoveryConfig {
     pub bootstrap_enrs: Vec<String>,
-    /// Accepted `eth2` fork digests: current first, then the prior fork's when
-    /// the chain configures one (`NetworkConfig.acceptedForkDigests`).
-    pub accepted_fork_digests: Vec<[u8; 4]>,
+    /// See [`AcceptedForkDigests`] — the sync loop passes a `Dynamic` reader
+    /// over `ChainConfig::accepted_fork_digests`.
+    pub accepted_fork_digests: AcceptedForkDigests,
     /// UDP port to bind. 0 lets the OS pick.
     pub listen_port: u16,
     /// libp2p ids of the chain's PINNED peers (the static-peer list). Lookups
@@ -173,7 +225,7 @@ const PINNED_ROUND_EVERY: usize = 4;
 async fn run_lookups(
     discv5: Discv5,
     events: mpsc::Receiver<Event>,
-    accepted_digests: Vec<[u8; 4]>,
+    accepted_digests: AcceptedForkDigests,
     bootnodes: Vec<Enr>,
     pinned_targets: Vec<NodeId>,
     table_size: Arc<AtomicUsize>,
@@ -192,6 +244,10 @@ async fn run_lookups(
     let mut pinned_seq: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
     let mut empty_rounds = 0u32;
     let mut round: usize = 0;
+    // The accepted list this round filters with; re-read per round and, when
+    // it rotates (a pinned-ahead fork activating), `seen` is cleared so nodes
+    // once rejected as off-fork are re-checked (`rotate_seen_if_changed`).
+    let mut last_digests: Vec<[u8; 4]> = accepted_digests.current();
     // A lookup RETURNS only the k nodes closest to its target, and its walk
     // only CONTACTS the nodes on the path there. Everything else a NODES
     // response mentions — on the shared eth2 DHT, that is where nearly all
@@ -231,6 +287,8 @@ async fn run_lookups(
         };
         round = round.wrapping_add(1);
         let mut emitted = 0usize;
+        let digests = accepted_digests.current();
+        rotate_seen_if_changed(&mut seen.lock().expect("seen lock"), &mut last_digests, &digests);
         match discv5.find_node(target).await {
             Ok(enrs) => {
                 for enr in enrs {
@@ -247,7 +305,7 @@ async fn run_lookups(
                     } else if !seen.lock().expect("seen lock").insert(enr.node_id()) {
                         continue;
                     }
-                    if let Some(peer) = filter_candidate(&enr, &accepted_digests) {
+                    if let Some(peer) = filter_candidate(&enr, &digests) {
                         emitted += 1;
                         if tx.send(peer).await.is_err() {
                             return; // receiver gone — sync loop shut down
@@ -353,11 +411,12 @@ fn reseed_due(empty_rounds: &mut u32, live_nodes: usize, bootnode_count: usize) 
 /// goes away.
 async fn consume_discovered(
     mut events: mpsc::Receiver<Event>,
-    accepted_digests: Vec<[u8; 4]>,
+    accepted_digests: AcceptedForkDigests,
     pinned_targets: Vec<NodeId>,
     seen: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
+    let mut last_digests: Vec<[u8; 4]> = accepted_digests.current();
     while let Some(event) = events.recv().await {
         let Event::Discovered(enr) = event else { continue };
         // A full channel drops the node unmarked (see below), so deciding
@@ -374,8 +433,11 @@ async fn consume_discovered(
         // duplicate into the pool channel between the other's check and
         // insert. try_send never blocks, so holding a std mutex across it is
         // fine; nothing awaits while it is held.
+        let digests = accepted_digests.current();
         let mut guard = seen.lock().expect("seen lock");
-        match classify_heard(&enr, &guard, &pinned_targets, &accepted_digests) {
+        // Either task may notice the rotation first; clearing twice is harmless.
+        rotate_seen_if_changed(&mut guard, &mut last_digests, &digests);
+        match classify_heard(&enr, &guard, &pinned_targets, &digests) {
             Heard::Skip => {}
             Heard::NeverCandidate => {
                 guard.insert(id);
@@ -492,6 +554,22 @@ mod tests {
     /// A live Gnosis bootnode ENR from NetworkConfig — known to carry an eth2
     /// field (digest 0x824be431), ip4+tcp, and a secp256k1 key.
     const GNOSIS_BOOT_ENR: &str = "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA";
+
+    /// A fork activating while the process is up: nodes rejected as off-fork
+    /// (recorded in `seen`) must be re-checked once the accepted list rotates.
+    #[test]
+    fn rotating_accepted_digests_forgets_seen_nodes() {
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        seen.insert(NodeId::random());
+        seen.insert(NodeId::random());
+        let mut last = vec![[1, 1, 1, 1]];
+        assert!(!rotate_seen_if_changed(&mut seen, &mut last, &[[1, 1, 1, 1]]));
+        assert_eq!(seen.len(), 2, "same list: nothing forgotten");
+        assert!(rotate_seen_if_changed(&mut seen, &mut last, &[[2, 2, 2, 2], [1, 1, 1, 1]]));
+        assert!(seen.is_empty(), "rotated list: every once-ever decision forgotten");
+        assert_eq!(last, vec![[2, 2, 2, 2], [1, 1, 1, 1]]);
+        assert!(!rotate_seen_if_changed(&mut seen, &mut last, &[[2, 2, 2, 2], [1, 1, 1, 1]]));
+    }
 
     #[test]
     fn a_heard_node_is_emitted_once_and_pins_are_left_to_the_lookup_path() {

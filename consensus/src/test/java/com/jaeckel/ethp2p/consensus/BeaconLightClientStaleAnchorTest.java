@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -40,7 +41,7 @@ class BeaconLightClientStaleAnchorTest {
                 List.of(),
                 new byte[32],
                 8192L * 10,
-                new byte[]{0x06, 0x00, 0x00, 0x00},
+                ForkSchedule.single(new byte[]{0x06, 0x00, 0x00, 0x00}),
                 new byte[32],
                 syncState,
                 null,
