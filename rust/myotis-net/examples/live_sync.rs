@@ -68,7 +68,7 @@ async fn main() {
             std::process::exit(0);
         }
         if once && tokio::time::Instant::now() > deadline {
-            tracing::error!("not SYNCED within 15 minutes");
+            tracing::error!(budget_s = 1500, "not SYNCED within the budget");
             handle.stop().await;
             std::process::exit(1);
         }

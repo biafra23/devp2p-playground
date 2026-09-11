@@ -1,0 +1,90 @@
+# The two cold-start regressions issue #422 asked us to keep.
+#
+# MANUAL ONLY (workflow_dispatch), deliberately: both tests dial live
+# third-party light-client servers, and both are peer-quota-bound — a serving
+# peer answers roughly one update per 10 s — so they take minutes and can fail
+# for reasons that are not our bug (every server busy, a network blip). Gating
+# merges on that would train everyone to ignore a red check. Run it before a
+# release, or when changing discovery, the peer pool, or the catch-up loop.
+#
+# What each proves, and why a green pipeline elsewhere does not:
+#   * no-pins:    every pinned server removed, so DISCOVERY alone has to find a
+#                 light-client server. The dispatched smoke job dials a warm
+#                 peer cache, which hides exactly this.
+#   * old-anchor: the trust anchor is several periods behind, so bootstrap is
+#                 not enough and catch-up must actually walk periods. A
+#                 release-fresh anchor walks 0-2 periods and proves little,
+#                 which is why the anchor is an input rather than the embedded
+#                 one. A good source is the PREVIOUS release's checkpoint: it
+#                 was a real finalized root and is one release old by
+#                 construction —
+#                   git show v0.1.8:rust/myotis-net/src/sync.rs \
+#                     | grep -A6 '@checkpoint:gnosis:begin'
+name: cold-start regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Network to cold-start (gnosis is where #422 bit hardest)"
+        type: choice
+        options: [gnosis, mainnet, sepolia]
+        default: gnosis
+      anchor_root:
+        description: "Old anchor block root (64 hex). Empty = skip the old-anchor test."
+        type: string
+        default: ""
+      anchor_slot:
+        description: "Old anchor slot (must accompany the root)"
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cold-start:
+    name: cold start (${{ inputs.network }})
+    runs-on: ubuntu-latest
+    # Both budgets plus the build, with headroom: the old-anchor test alone
+    # allows 30 minutes of walking.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build the tests
+        working-directory: rust
+        run: cargo test --release -p myotis-net --test live_cold_start --no-run
+
+      # Discovery-only: no pinned peers at all.
+      - name: Cold start without any pinned peer
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          RUST_LOG: info,myotis_net=debug
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start -- \
+            --ignored --nocapture cold_start_without_static_peers
+
+      # Deep catch-up: only when an anchor was supplied — without one the test
+      # skips itself rather than passing vacuously.
+      - name: Cold start from an old anchor
+        if: inputs.anchor_root != ''
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          MYOTIS_TEST_ANCHOR_ROOT: ${{ inputs.anchor_root }}
+          MYOTIS_TEST_ANCHOR_SLOT: ${{ inputs.anchor_slot }}
+          RUST_LOG: info,myotis_net=debug
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start -- \
+            --ignored --nocapture cold_start_from_an_old_anchor
