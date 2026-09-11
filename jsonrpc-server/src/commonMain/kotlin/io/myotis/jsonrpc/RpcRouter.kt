@@ -76,8 +76,8 @@ class RpcRouter(
                     logger.record("<empty-batch>", "null", "ERROR", elapsedMs(t0), -32600)
                     return errorEnvelope(JsonNull, -32600, "Invalid Request")
                 }
-                val responses = root.map { el ->
-                    (el as? JsonObject)?.let { handleOne(it, null) }
+                val responses = root.mapIndexed { i, el ->
+                    (el as? JsonObject)?.let { handleOne(it, null, "${i + 1}/${root.size}") }
                         ?: run {
                             logger.record("<invalid>", "null", "ERROR", 0, -32600)
                             errorEnvelope(JsonNull, -32600, "Invalid Request")
@@ -197,12 +197,29 @@ class RpcRouter(
     /**
      * Handle one request object, returning its complete JSON-RPC response envelope.
      * [wholeBody] is the original request text used for the single-request proxy path;
-     * null for a batch element (re-serialized and proxied individually).
+     * null for a batch element (re-serialized and proxied individually). [batchPos]
+     * ("2/5") places a batch element in the slow-call watchdog's WARN; null for a
+     * single request.
      */
-    private suspend fun handleOne(root: JsonObject, wholeBody: String?): String {
+    private suspend fun handleOne(root: JsonObject, wholeBody: String?, batchPos: String? = null): String {
         val method = root["method"]?.jsonPrimitive?.contentOrNull
         val id = root["id"] ?: JsonNull
         val idStr = idString(id)
+        val phase = CallPhase()
+        return logger.watch(method ?: "request", idStr, batchPos, phase) {
+            dispatchOne(root, wholeBody, method, id, idStr, phase)
+        }
+    }
+
+    /** [handleOne]'s body: route one request, keeping [phase] current for the watchdog. */
+    private suspend fun dispatchOne(
+        root: JsonObject,
+        wholeBody: String?,
+        method: String?,
+        id: JsonElement,
+        idStr: String,
+        phase: CallPhase,
+    ): String {
         if (method == "myotis_rpcCoverage") {
             logger.record(method, idStr, "LOCAL", 0)
             return resultEnvelope(id, logger.coverage())
@@ -217,6 +234,7 @@ class RpcRouter(
                 logger.record(method, idStr, "ERROR", 0, -32601)
                 return errorEnvelope(id, -32601, "method '$method' is not supported by this node")
             }
+            phase.name = "status"
             // Isolate the read like the IPC command does (CommandHandler wraps dispatch in
             // try/catch): a throw becomes a JSON-RPC error envelope, never a raw Ktor 500.
             return try {
@@ -252,6 +270,7 @@ class RpcRouter(
             }
             // Isolate the transition like the status reads / IPC command do: a throw
             // becomes a JSON-RPC error envelope, never a raw Ktor 500.
+            phase.name = "lifecycle"
             val tLc = TimeSource.Monotonic.markNow()
             return try {
                 // pause()/wakeUp() tear down / rebuild networking (seconds) and can
@@ -276,6 +295,7 @@ class RpcRouter(
                 errorEnvelope(id, -32603, "lifecycle op failed: $detail")
             }
         }
+        phase.name = "backend"
         val t0 = TimeSource.Monotonic.markNow()
         val verified = try {
             tryVerified(method, id, root)
@@ -402,6 +422,7 @@ class RpcRouter(
             }
         }
         // Dev-only proxy fallback (never used in production / strict mode).
+        phase.name = "proxy"
         val pt0 = TimeSource.Monotonic.markNow()
         val forwardBody = wholeBody ?: json.encodeToString(JsonObject.serializer(), root)
         return try {
@@ -506,8 +527,12 @@ class RpcRouter(
                     })
                 }
             }
-            // Verified beacon head; null (not synced) -> proxy.
-            "eth_blockNumber" -> b.headBlockNumber()?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
+            // Verified beacon head; null (not synced) -> proxy. BLOCKING like every read
+            // below (a paused or warming stack holds it in the wake gate), so it runs on
+            // the IO dispatcher too — which also leaves the slow-call watchdog free to
+            // report it while it is held.
+            "eth_blockNumber" -> withContext(rpcIoDispatcher) { b.headBlockNumber() }
+                ?.let { resultEnvelope(id, JsonPrimitive(hexQuantity(it))) }
 
             "eth_call" -> {
                 val p = root.params()

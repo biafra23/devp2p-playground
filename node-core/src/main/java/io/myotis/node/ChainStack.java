@@ -104,7 +104,9 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
      *  Undercounting while online merely slows demotion, which is fine. */
     private static final long ONLINE_SIGNAL_MAX_AGE_MS = 2 * 60 * 1000L;
 
-    /** Max time a verified read arriving on a paused stack is held while the wake completes. */
+    /** Max time a verified read arriving on a paused stack is held while the wake completes —
+     *  and the warm-up window every (re)start opens (WakeGate#beginWarmup), the only other
+     *  time a read is held. */
     public static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval. */
     private static final long WAKE_POLL_MS = 250L;
@@ -197,9 +199,9 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.clPeerCache = clPeerCache;
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
-        this.wakeGate = new WakeGate(phase::get, this::readyForReads,
+        this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::notReadyDetail,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
-                System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
+                System::currentTimeMillis, WAKE_POLL_MS, network.name());
         this.gatedReads = new GatedVerifiedReads(this);
     }
 
@@ -327,6 +329,9 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             buildAndStartBeacon(dnsClEnrs);
 
             // 5. Verified JSON-RPC (best-effort; a bind failure here does not fail the stack).
+            //    Warm-up window first (WakeGate#beginWarmup): reads that arrive while the
+            //    fresh stack climbs to SYNCED + a warm head are held (bounded), as after a wake.
+            wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
             startRpc();
 
             // 6. Snap-peer maintainer (optional): keep snap peers topped up from cache +
@@ -422,6 +427,10 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                 startRpc();
             }
             if (maintainerEnabled) startPeerMaintainer();
+            // Open the warm-up window BEFORE publishing RUNNING (WakeGate#beginWarmup): the
+            // reads held through the pause keep holding while the light client re-anchors and
+            // the pool re-dials, instead of being released into a cold backend at the flip.
+            wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
             phase.set(RUNNING);
             // Foreground (observation) wakes count toward the total but must not overwrite
             // the last-wake reason — see WakeReason / SleepMetrics.
@@ -512,14 +521,16 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /**
      * The wake-on-request choke point every verified read goes through: notes
      * host-visible activity, triggers a single-flight async {@link #resume()}
-     * when paused, and blocks until reads are answerable or {@code capMs}
-     * elapses.
+     * when paused, and — only while the stack is waking (paused, or inside the
+     * warm-up window a start/resume opens) — blocks until reads are answerable or
+     * {@code capMs} elapses. A RUNNING stack outside a warm-up returns at once,
+     * ready or not (#312).
      *
      * @return the live backend to query, or {@code null} when no verified answer
      *         is possible (stack stopped, RPC never started / failed to bind, or
-     *         still paused at the deadline). A stack that is RUNNING but still cold
-     *         at the deadline returns the backend anyway — it produces its own
-     *         precise bounded errors.
+     *         still paused at the deadline). A RUNNING stack that isn't ready —
+     *         outside a warm-up, or still warming at the deadline — returns the
+     *         backend anyway: it produces its own precise bounded errors.
      */
     public io.myotis.rpc.VerifiedRpcBackend awaitReadyForReads(long capMs) {
         // RUNNING with no backend means the JSON-RPC bind failed at start (the failure
@@ -572,15 +583,30 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     public long lastResumeEpochMs() { return sleepMetrics.lastResumeEpochMs(); }
     public String lastWakeReason() { return sleepMetrics.lastWakeReason(); }
 
-    /** Readiness for verified reads: beacon SYNCED and the head warmer has an anchored head. */
+    /** Readiness for verified reads — what the wake gate holds a warming stack for: beacon
+     *  SYNCED and the head warmer has an anchored head. Also true ("attempt the read now")
+     *  for a STALE_ANCHOR park, which only a human moves (raise the bound or accept the
+     *  risk): holding could never help, and the backend's refusal comes back at once as
+     *  the router's curated STALE_ANCHOR message — the Rust handle's rule too. */
     private boolean readyForReads() {
         if (phase.get() != RUNNING) return false;
         BeaconSyncState bss = beaconSyncState;
         io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
-        return bss != null && b != null
-                && bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot())
-                        == BeaconSyncState.State.SYNCED
-                && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
+        if (bss == null || b == null) return false;
+        BeaconSyncState.State s = bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+        if (s == BeaconSyncState.State.STALE_ANCHOR) return true;
+        return s == BeaconSyncState.State.SYNCED && b.verifiedHeadAgeMs() != Long.MAX_VALUE;
+    }
+
+    /** Why reads aren't answerable yet, for the wake gate's slow-hold WARN. */
+    private String notReadyDetail() {
+        BeaconSyncState bss = beaconSyncState;
+        io.myotis.rpc.VerifiedRpcBackend b = rpcBackend;
+        String beacon = bss == null ? "no beacon client"
+                : "beacon " + bss.getSyncState(network.clGenesisTime(), network.secondsPerSlot());
+        String head = b == null ? "no RPC backend"
+                : b.verifiedHeadAgeMs() == Long.MAX_VALUE ? "no verified head yet" : "verified head warm";
+        return beacon + ", " + head;
     }
 
     // -------------------------------------------------------------------------

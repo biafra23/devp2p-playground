@@ -281,7 +281,12 @@ is in the serving pool. A wallet resuming from background should therefore:
 Skipping the wake entirely still works — the first verified read on a paused stack
 wakes it on its own and is held (bounded, ~90 s) until the node can answer — but an
 explicit `myotis_wakeup` + status poll overlaps the multi-second rebuild with the UI
-transition instead of stalling the first read. When the seam isn't wired (a host that
+transition instead of stalling the first read. That hold is reserved for a node that
+is *waking*: paused, or climbing back to ready after a start or resume (for at most
+~90 s). A node that has been serving and then loses readiness — its light client
+catching up a sync-committee period, its snap pool momentarily empty — answers every
+read at once, with the retryable `-32000` when it cannot serve verified, instead of
+parking them all until it recovers (#312). When the seam isn't wired (a host that
 didn't provide a lifecycle source) both methods return `-32601`.
 
 Availability: every host that serves the JSON-RPC endpoint wires these — the daemon,

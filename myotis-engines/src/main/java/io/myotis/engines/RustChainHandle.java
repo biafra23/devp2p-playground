@@ -108,8 +108,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // Wake-on-request over the NATIVE lifecycle: the same primitive ChainStack
         // wires, so the two engines share the hold/single-flight semantics.
         this.wakeGate = new io.myotis.node.WakeGate(this::lifecycle, this::readyForReads,
-                () -> resume(io.myotis.api.WakeReason.REQUEST),
-                System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + networkName);
+                this::notReadyDetail, () -> resume(io.myotis.api.WakeReason.REQUEST),
+                System::currentTimeMillis, WAKE_POLL_MS, networkName);
     }
 
     io.myotis.api.ports.HttpGateway httpGateway() {
@@ -125,6 +125,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // Entry stamp for uptime: count from the start request, including the native
         // boot itself — anchored below only when the start succeeds.
         long startRequestNs = System.nanoTime();
+        // Warm-up window BEFORE the native flip (WakeGate#beginWarmup), as resume() does:
+        // reads that arrive while the fresh stack climbs to SYNCED + snap peers are held
+        // (bounded), and one racing this start on another thread (a UI / IPC operator query;
+        // the listener itself only starts below) never sees RUNNING without a window. Only
+        // from STOPPED, the one state a start can succeed from, so a refused start() can't
+        // reopen a window over a serving node; a window a failed start leaves behind closes
+        // at the watcher's first poll (still STOPPED).
+        if (lifecycle() == LifecycleState.STOPPED) wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
         boolean ok = RustEngineNative.nativeStart(handle);
         // Only expose the verified JSON-RPC endpoint once the native stack is up.
         if (ok) {
@@ -161,7 +169,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // can't drift.
 
     /** Max time a verified read arriving on a paused stack is held while the wake
-     *  completes (mirrors ChainStack.WAKE_WAIT_CAP_MS). */
+     *  completes — and the warm-up window every (re)start opens, the only other time
+     *  a read is held (mirrors ChainStack.WAKE_WAIT_CAP_MS). */
     static final long WAKE_WAIT_CAP_MS = 90_000L;
     /** Wake-wait poll interval (mirrors ChainStack.WAKE_POLL_MS). */
     private static final long WAKE_POLL_MS = 250L;
@@ -198,6 +207,11 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     @Override
     public synchronized boolean resume(String reason) {
         if (isRunning()) return true; // no-op success, no accounting (mirrors ChainStack)
+        // Open the warm-up window BEFORE the native flip (WakeGate#beginWarmup): the reads
+        // held through the pause keep holding while the light client re-anchors and the pool
+        // re-dials, instead of being released the instant the native entry reads Running. A
+        // failed resume stays PAUSED, where the gate holds regardless of the window.
+        wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
         if (RustEngineNative.nativeResume(handle)) {
             // Foreground (observation) wakes count toward the total but must not
             // overwrite the last-wake reason — see WakeReason / SleepMetrics.
@@ -240,10 +254,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /**
      * Wake-and-wait shared by every verified read / operator query below: a query
      * on a paused stack triggers the (single-flight) resume and waits up to the cap
-     * for readiness. A RUNNING-but-cold stack proceeds at the deadline — the native
-     * query produces its own precise bounded errors. Only PAUSED-at-deadline
-     * (resume kept failing) throws; a STOPPED stack falls through to the native's
-     * "handle not started"/"unknown handle" error (mirrors JavaChainHandle.awaitWake).
+     * for readiness, as does one arriving during a start/resume warm-up. A RUNNING
+     * stack that isn't ready proceeds — at once outside a warm-up (#312), at the
+     * deadline inside one — and the native query produces its own precise bounded
+     * errors. Only PAUSED-at-deadline (resume kept failing) throws; a STOPPED stack
+     * falls through to the native's "handle not started"/"unknown handle" error
+     * (mirrors JavaChainHandle.awaitWake).
      */
     private void awaitWake() {
         // Fast-fail the unrecoverable-while-RUNNING state (the twin of
@@ -282,8 +298,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * The wake-on-request choke point every verified read crosses before its JNI
      * call (the Rust-engine twin of ChainStack.awaitReadyForReads + the
      * begin/endRequest in-flight guard): stamps activity, wakes a paused stack,
-     * holds bounded until reads are answerable, and marks the request in flight so
-     * the host idle timer can't pause the stack mid-query.
+     * holds (bounded) while the stack is waking — paused, or in a start/resume
+     * warm-up — and marks the request in flight so the host idle timer can't pause
+     * the stack mid-query.
      */
     private <T> T gated(java.util.function.Supplier<T> nativeCall) {
         awaitWake();
@@ -300,20 +317,41 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  (the Rust twin of ChainStack.readyForReads). */
     private boolean readyForReads() {
         try {
-            ParsedStatus s = readStatus();
-            // RUNNING with no EL reader is terminal-until-pause/resume (the CL-only
-            // degraded mode): more waiting cannot help, so report "attempt the read
-            // now" and let the native surface its precise "EL reader unavailable"
-            // error. The pre-gate probe in awaitWake covers the already-RUNNING
-            // case without stamping activity; this covers a wake whose resume
-            // lands in the degraded mode MID-HOLD, which would otherwise park the
-            // request for the full cap.
-            if (s.running() && !s.elReaderAvailable()) return true;
-            return s.running() && s.beaconState() == BeaconState.SYNCED
-                    && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0;
+            return readyForReads(readStatus());
         } catch (RuntimeException e) {
             return false; // an unreadable status is "not ready", never a wake-loop crash
         }
+    }
+
+    /** {@link #readyForReads()} over one parsed status — pure, so it is testable
+     *  without JNI ({@link #readyForReadsFromJson}). */
+    private static boolean readyForReads(ParsedStatus s) {
+        // RUNNING with no EL reader is terminal-until-pause/resume (the CL-only
+        // degraded mode): more waiting cannot help, so report "attempt the read
+        // now" and let the native surface its precise "EL reader unavailable"
+        // error. The pre-gate probe in awaitWake covers the already-RUNNING
+        // case without stamping activity; this covers a wake whose resume
+        // lands in the degraded mode MID-HOLD, which would otherwise park the
+        // request for the rest of the warm-up.
+        if (s.running() && !s.elReaderAvailable()) return true;
+        // A STALE_ANCHOR park is the same kind of state: only a human moves it (raise
+        // the bound or accept the risk), so attempt now — the refusal comes back at
+        // once as the router's curated STALE_ANCHOR message (ChainStack's rule too).
+        if (s.running() && s.beaconState() == BeaconState.STALE_ANCHOR) return true;
+        return s.running() && s.beaconState() == BeaconState.SYNCED
+                && s.optimisticBlockNumber() > 0 && s.snapPeers() > 0;
+    }
+
+    /** Package-private test seam: the readiness predicate over a status JSON, without JNI. */
+    static boolean readyForReadsFromJson(String json) {
+        return readyForReads(ParsedStatus.parse(json));
+    }
+
+    /** Why reads aren't answerable yet, for the wake gate's slow-hold WARN. */
+    private String notReadyDetail() {
+        ParsedStatus s = readStatus();
+        return "beacon " + s.beaconState() + ", snapPeers " + s.snapPeers()
+                + ", head " + s.optimisticBlockNumber();
     }
 
     /** {@link NodeStatusReads}: node uptime for the JSON-RPC myotis_status result. Monotonic
@@ -1083,15 +1121,15 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     public String logIndexStatusJson() {
         // NOT gated(): this is a STATUS PROBE the hosts poll every ~2s for the UI
         // snapshot (Android AndroidNodeBridge.snapshots, desktop DesktopNode). The
-        // gated() wake-and-hold waits up to WAKE_WAIT_CAP_MS for readyForReads() —
-        // which a booting, catching-up, or STALE_ANCHOR-parked chain never
-        // satisfies — so gating here stalled every snapshot emission ~90s per
-        // unready chain and froze the whole UI at its previous state (chains
-        // rendered "stopped" while running; the stale-anchor consent appeared to
-        // do nothing). It also stamped activity + woke paused stacks on every
-        // poll, fighting the idle-pause controller. The native answers with
-        // {"error":...} on its own when the gate is down — exactly the not-ready
-        // shape this method documents — so no readiness hold is needed.
+        // gated() wake-and-hold waits up to WAKE_WAIT_CAP_MS for readyForReads() on
+        // a waking chain — a booting one's whole warm-up (and, before #312, ANY
+        // unready chain: catching-up, STALE_ANCHOR-parked) — so gating here stalled
+        // snapshot emissions ~90s per such chain and froze the whole UI at its
+        // previous state (chains rendered "stopped" while running; the stale-anchor
+        // consent appeared to do nothing). It also stamped activity + woke paused
+        // stacks on every poll, fighting the idle-pause controller. The native
+        // answers with {"error":...} on its own when the gate is down — exactly the
+        // not-ready shape this method documents — so no readiness hold is needed.
         return RustEngineNative.nativeLogIndexStatusJson(handle);
     }
 
