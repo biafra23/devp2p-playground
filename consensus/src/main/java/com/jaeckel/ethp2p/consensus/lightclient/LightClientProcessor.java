@@ -52,6 +52,18 @@ public class LightClientProcessor {
      * @param update the finality update to process
      * @return true if the update was successfully applied
      */
+    /**
+     * The committee that signs {@code sigPeriod}, given the store at {@code storePeriod}
+     * with {@code current} as its current committee: {@code current} for the store's own
+     * period, the held next committee for the one after, {@code null} otherwise (spec
+     * validate_light_client_update's applicability + key selection).
+     */
+    private SyncCommittee committeeFor(long sigPeriod, long storePeriod, SyncCommittee current) {
+        if (sigPeriod == storePeriod) return current;
+        if (sigPeriod == storePeriod + 1) return store.getNextSyncCommittee();
+        return null;
+    }
+
     public boolean processFinalityUpdate(LightClientFinalityUpdate update) {
         SyncCommittee committee = store.getCurrentSyncCommittee();
         if (committee == null) {
@@ -76,6 +88,19 @@ public class LightClientProcessor {
                 attestedSlot, finalizedSlot, update.signatureSlot(),
                 participation, update.finalityBranch().length);
 
+        // Same period rule as processUpdate. This path had no gate at all and always
+        // used the current keys, so at every period boundary — store at P holding
+        // next, wall in P+1 — every P+1-signed finality update was rejected until a
+        // catch-up round happened to force-rotate.
+        long storePeriod = store.getCurrentSyncCommitteePeriod();
+        long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
+        committee = committeeFor(sigPeriod, storePeriod, committee);
+        if (committee == null) {
+            log.debug("[lc-processor] Finality update rejected: signaturePeriod={} not applicable to "
+                    + "storePeriod={} (attestedSlot={})", sigPeriod, storePeriod, attestedSlot);
+            return false;
+        }
+
         // Verify sync aggregate over attested header
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),
@@ -84,8 +109,8 @@ public class LightClientProcessor {
                 forkVersion,
                 genesisValidatorsRoot)) {
             log.debug("[lc-processor] Finality update rejected: BLS verification failed " +
-                    "(attestedSlot={}, forkVersion={}, fv[0]={}, id={}, participation={})",
-                    attestedSlot, bytesToHex(forkVersion), forkVersion[0],
+                    "(attestedSlot={}, usedNext={}, forkVersion={}, fv[0]={}, id={}, participation={})",
+                    attestedSlot, sigPeriod != storePeriod, bytesToHex(forkVersion), forkVersion[0],
                     System.identityHashCode(forkVersion), participation);
             return false;
         }
@@ -166,9 +191,9 @@ public class LightClientProcessor {
 
         // Cheap applicability gate BEFORE the expensive BLS verify. An update's
         // sync aggregate is signed by the committee of signature_slot's period,
-        // so it can only verify against our current committee when that period
-        // matches store_period (or store_period+1 once we already hold the next
-        // committee) — per spec validate_light_client_update. This is critical
+        // so it can only verify against the committee of THAT period: ours for
+        // store_period, the held next one for store_period+1 — per spec
+        // validate_light_client_update. This is critical
         // on Android: each BLS sync-aggregate verify costs ~17-30s on ART, and a
         // catch-up updates_by_range response routinely contains far-future
         // periods (e.g. period 1766 while the store is at 1728). Without this
@@ -176,28 +201,16 @@ public class LightClientProcessor {
         // check, so catch-up from an old checkpoint never makes progress.
         long storePeriod = store.getCurrentSyncCommitteePeriod();
         long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
-        boolean haveNext = store.getNextSyncCommittee() != null;
-        boolean applicable = haveNext
-                ? (sigPeriod == storePeriod || sigPeriod == storePeriod + 1)
-                : (sigPeriod == storePeriod);
-        if (!applicable) {
+        // Selecting the keys IS the gate. Verifying both admitted periods with the
+        // current keys rejected genuine next-committee updates before rotation and
+        // accepted a current-committee signature whose unsigned signatureSlot had
+        // been relabelled into the next period (#423).
+        committee = committeeFor(sigPeriod, storePeriod, committee);
+        if (committee == null) {
             log.debug("[lc-processor] Update skipped pre-verify: signaturePeriod={} not applicable to "
                             + "storePeriod={} (haveNext={}, attestedSlot={})",
-                    sigPeriod, storePeriod, haveNext, attestedSlot);
+                    sigPeriod, storePeriod, store.getNextSyncCommittee() != null, attestedSlot);
             return false;
-        }
-
-        // The aggregate is signed by the committee of signatureSlot's PERIOD (spec
-        // validate_light_client_update): the current committee for storePeriod, the
-        // held next committee for storePeriod + 1. Verifying both admitted periods
-        // with the current keys rejected genuine next-committee updates before
-        // rotation and accepted a current-committee signature whose unsigned
-        // signatureSlot had been relabelled into the next period (#423).
-        if (sigPeriod != storePeriod) {
-            committee = store.getNextSyncCommittee();
-            if (committee == null) {
-                return false; // unreachable: the gate admitted P+1 only with a next committee
-            }
         }
 
         // Verify sync aggregate over attested header
@@ -207,8 +220,9 @@ public class LightClientProcessor {
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
-            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}): BLS sync-aggregate verify failed",
-                    attestedSlot, finalizedSlot);
+            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}, usedNext={}): "
+                            + "BLS sync-aggregate verify failed",
+                    attestedSlot, finalizedSlot, sigPeriod != storePeriod);
             return false;
         }
 

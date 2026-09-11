@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.jaeckel.ethp2p.consensus.types.LightClientBootstrap;
+import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
 import com.jaeckel.ethp2p.consensus.types.SyncAggregate;
 import com.jaeckel.ethp2p.consensus.types.SyncCommittee;
@@ -99,6 +100,46 @@ class NextCommitteeSelectionTest {
         LightClientUpdate first = LightClientUpdate.decode(corpus("001-update.ssz"));
         assertEquals(1777, BeaconChainSpec.computeSyncCommitteePeriod(first.signatureSlot()));
         assertTrue(f.processor().processUpdate(first));
+    }
+
+    @Test
+    void unknownNextCommitteeAndOutOfRangePeriodAreRejected() throws IOException {
+        // Bootstrapped only: no next committee held, so period 1778 is not admissible.
+        assumeTrue(Files.isDirectory(CORPUS));
+        LightClientBootstrap b = LightClientBootstrap.decode(corpus("bootstrap.ssz"));
+        LightClientStore store = new LightClientStore();
+        store.initialize(b.header(), b.currentSyncCommittee());
+        LightClientProcessor bare = new LightClientProcessor(store, FORK_VERSION, GVR);
+        LightClientUpdate second = LightClientUpdate.decode(corpus("002-update.ssz"));
+        assertFalse(bare.processUpdate(second));
+        // Two periods ahead is never admissible, next committee or not.
+        Fixture f = withNext();
+        LightClientUpdate tooFar = with(second, second.syncAggregate(),
+                second.signatureSlot() + BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD);
+        assertFalse(f.processor().processUpdate(tooFar));
+    }
+
+    private static LightClientFinalityUpdate finalityOf(LightClientUpdate u, long signatureSlot) {
+        return new LightClientFinalityUpdate(u.attestedHeader(), u.finalizedHeader(), u.finalityBranch(),
+                u.syncAggregate(), signatureSlot);
+    }
+
+    @Test
+    void nextPeriodFinalityUpdateIsAcceptedBeforeRotation() throws IOException {
+        Fixture f = withNext();
+        LightClientUpdate second = LightClientUpdate.decode(corpus("002-update.ssz"));
+        LightClientFinalityUpdate fin = finalityOf(second, second.signatureSlot());
+        assertTrue(f.processor().processFinalityUpdate(fin), "signed by the held next committee");
+        assertEquals(second.finalizedHeader().beacon().slot(), f.store().getFinalizedSlot());
+    }
+
+    @Test
+    void relabelledCurrentCommitteeFinalityUpdateIsRejected() throws IOException {
+        Fixture f = withNext();
+        LightClientUpdate first = LightClientUpdate.decode(corpus("001-update.ssz"));
+        LightClientFinalityUpdate fin = finalityOf(first,
+                first.signatureSlot() + BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD);
+        assertFalse(f.processor().processFinalityUpdate(fin));
     }
 
     @Test

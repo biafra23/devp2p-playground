@@ -232,11 +232,21 @@ class LightClientProcessorTest {
         // Store the next committee
         store.updateNextSyncCommittee(nextCommittee);
 
-        // Process a finality update that crosses into period 1 (slot 8192+)
+        // Process a finality update that crosses into period 1 (slot 8192+). Its
+        // signature slot is in period 1, so it is signed by the NEXT committee
+        // (spec validate_light_client_update, #423) — the same bytes signed with the
+        // period-0 keys are a relabelled current-committee signature and must fail.
         long newSlot = BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD + 10; // period 1
-        LightClientFinalityUpdate update = buildValidFinalityUpdate(newSlot, newSlot + 1);
+        LightClientFinalityUpdate relabelled = buildValidFinalityUpdate(newSlot, newSlot + 1);
+        assertFalse(processor.processFinalityUpdate(relabelled),
+                "period-1 signature slot must be verified with the next committee, not the current one");
+        LightClientFinalityUpdate update =
+                buildFinalityUpdateWithParticipation(newSlot, newSlot + 1, 512, nextKeys);
         assertTrue(processor.processFinalityUpdate(update));
         assertEquals(newSlot, store.getFinalizedSlot());
+        // Finality crossed into period 1, so the store rotated: next is now current.
+        assertNull(store.getNextSyncCommittee());
+        assertArrayEquals(nextCommittee.aggregatePubkey(), store.getCurrentSyncCommittee().aggregatePubkey());
 
         // The processor calls applyNextSyncCommitteeWhenPeriodChanges after updateFinalized,
         // so finalizedSlot is already at the new period. Test rotation via the store directly:
@@ -262,6 +272,11 @@ class LightClientProcessorTest {
 
     private LightClientFinalityUpdate buildFinalityUpdateWithParticipation(
             long finalizedSlot, long signatureSlot, int participantCount) {
+        return buildFinalityUpdateWithParticipation(finalizedSlot, signatureSlot, participantCount, secretKeys);
+    }
+
+    private LightClientFinalityUpdate buildFinalityUpdateWithParticipation(
+            long finalizedSlot, long signatureSlot, int participantCount, BIG[] keys) {
         // Build finalized header (execution payload genuinely committed to its body root)
         LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
                 finalizedSlot, 0L, new byte[32], new byte[32]);
@@ -282,19 +297,23 @@ class LightClientProcessorTest {
         LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
                 signatureSlot, 0L, new byte[32], attestedStateRoot);
 
-        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), participantCount);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), participantCount, keys);
 
         return new LightClientFinalityUpdate(
                 attestedHeader, finalizedHeader, finalityBranch, agg, signatureSlot);
     }
 
     private SyncAggregate buildSyncAggregate(BeaconBlockHeader attestedBeacon, int participantCount) {
+        return buildSyncAggregate(attestedBeacon, participantCount, secretKeys);
+    }
+
+    private SyncAggregate buildSyncAggregate(BeaconBlockHeader attestedBeacon, int participantCount, BIG[] keys) {
         byte[] domain = ForkData.computeDomain(BeaconChainSpec.DOMAIN_SYNC_COMMITTEE, FORK_VERSION, GVR);
         byte[] signingRoot = SszUtil.hashTreeRootContainer(attestedBeacon.hashTreeRoot(), domain);
 
         List<byte[]> sigs = new ArrayList<>();
         for (int i = 0; i < participantCount; i++) {
-            sigs.add(TestUtil.blsSign(secretKeys[i], signingRoot));
+            sigs.add(TestUtil.blsSign(keys[i], signingRoot));
         }
         byte[] aggSig = TestUtil.aggregateSignatures(sigs);
 

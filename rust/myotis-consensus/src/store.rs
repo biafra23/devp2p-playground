@@ -206,34 +206,21 @@ impl LightClientProcessor {
         // validate_light_client_update; mirrors the Java gate exactly).
         let store_period = self.store.current_period();
         let sig_period = self.store.period_of(update.signature_slot);
-        let have_next = self.store.next_sync_committee().is_some();
-        let applicable = if have_next {
-            sig_period == store_period || sig_period == store_period + 1
-        } else {
-            sig_period == store_period
-        };
-        if !applicable {
-            tracing::debug!(store_period, sig_period, have_next,
+        // The aggregate is signed by the committee of signature_slot's PERIOD
+        // (spec validate_light_client_update): our current committee for
+        // store_period, the held next committee for store_period + 1, nothing
+        // for anything else. Selecting the keys IS the gate. Verifying both
+        // admitted periods with the current keys rejected genuine
+        // next-committee updates before rotation and accepted a
+        // current-committee signature whose unsigned signature_slot had been
+        // relabelled into the next period (#423).
+        let Some(committee) = self.committee_for(sig_period, store_period, committee) else {
+            tracing::debug!(store_period, sig_period,
+                have_next = self.store.next_sync_committee().is_some(),
                 signature_slot = update.signature_slot,
                 attested_slot = update.attested_header.beacon.slot,
                 "update rejected: not applicable to the store's period");
             return false;
-        }
-
-        // The aggregate is signed by the committee of signature_slot's PERIOD
-        // (spec validate_light_client_update): the current committee for
-        // store_period, the held next committee for store_period + 1. Using
-        // the current keys for both admitted periods rejected genuine
-        // next-committee updates before rotation and accepted a
-        // current-committee signature whose unsigned signature_slot had been
-        // relabelled into the next period (#423).
-        let committee = if sig_period == store_period {
-            committee
-        } else {
-            let Some(next) = self.store.next_sync_committee() else {
-                return false; // unreachable: the gate admitted P+1 only with a next committee
-            };
-            next
         };
 
         if !verify::verify_sync_aggregate(
@@ -243,7 +230,7 @@ impl LightClientProcessor {
             &self.fork_version,
             &self.genesis_validators_root,
         ) {
-            tracing::debug!(store_period, sig_period,
+            tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
                 signature_slot = update.signature_slot,
                 attested_slot = update.attested_header.beacon.slot,
                 participants = update.sync_aggregate.count_participants(),
@@ -304,8 +291,39 @@ impl LightClientProcessor {
         true
     }
 
+    /// The committee that signs `sig_period`, given the store at `store_period`
+    /// with `current` as its current committee: `current` for the store's own
+    /// period, the held next committee for the one after, `None` otherwise
+    /// (spec validate_light_client_update's applicability + key selection).
+    fn committee_for<'a>(
+        &'a self,
+        sig_period: u64,
+        store_period: u64,
+        current: &'a SyncCommittee,
+    ) -> Option<&'a SyncCommittee> {
+        if sig_period == store_period {
+            Some(current)
+        } else if sig_period == store_period + 1 {
+            self.store.next_sync_committee()
+        } else {
+            None
+        }
+    }
+
     pub fn process_finality_update(&mut self, update: &LightClientFinalityUpdate) -> bool {
         let Some(committee) = self.store.current_sync_committee() else {
+            return false;
+        };
+        // Same period rule as process_update. This path had no gate at all and
+        // always used the current keys, so at every period boundary — store at
+        // P holding next, wall in P+1 — every P+1-signed finality update was
+        // rejected until a catch-up round happened to force-rotate.
+        let store_period = self.store.current_period();
+        let sig_period = self.store.period_of(update.signature_slot);
+        let Some(committee) = self.committee_for(sig_period, store_period, committee) else {
+            tracing::debug!(store_period, sig_period,
+                signature_slot = update.signature_slot,
+                "finality update rejected: not applicable to the store's period");
             return false;
         };
 
@@ -316,6 +334,8 @@ impl LightClientProcessor {
             &self.fork_version,
             &self.genesis_validators_root,
         ) {
+            tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
+                "finality update rejected: sync-aggregate BLS verification failed");
             return false;
         }
 
