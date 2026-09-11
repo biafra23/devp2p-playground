@@ -3248,6 +3248,14 @@ mod tests {
         // A malformed pin would otherwise reach run_sync and surface only as a
         // "skipping unparseable static peer multiaddr" warn.
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
     }
@@ -3310,6 +3318,14 @@ mod tests {
         // A malformed pin would otherwise reach run_sync and surface only as a
         // "skipping unparseable static peer multiaddr" warn.
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 10);
     }
 
@@ -3379,6 +3395,14 @@ mod tests {
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
         assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 

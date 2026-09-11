@@ -482,8 +482,8 @@ servers took its place in `clPeerMultiaddrs` (see the list's comment). Re-pin
 the Nimbus once the far end is fixed and its `--netkey-file` identity is
 confirmed from its startup log.
 
-Both are only stable because of the key-persistence flags above (Geth's
-datadir `nodekey`, Nimbus's `--netkey-file`). The **address** in every entry is
+Both are only stable because their keys persist across restarts (Geth's
+datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is
 the netcup relay (188.68.32.16, a static VPS), not zbox: since 2026-09-06 zbox
 sits behind mobile CGNAT and is reachable only through a WireGuard tunnel to the
 relay, which DNATs the nine serving ports (30405-30407, 9104-9109, tcp+udp) to
