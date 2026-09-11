@@ -9,8 +9,8 @@
 # three classes, noted per section:
 #   [guarded]  the library probes for the API at runtime and falls back;
 #   [dormant]  the code path is not wired/reachable in this app's configuration;
-#   [LIVE]     reachable on a normal run — a real crash on Android 10/11 (API
-#              29/30, no ART module backports) tracked for an upstream/fork fix.
+#   [LIVE]     reachable on a normal run at an API level where the app still runs
+#              that code — a real crash there, tracked for an upstream/fork fix.
 # Regenerate candidates by running the checker with --allowlist /dev/null.
 
 # desugar_jdk_libs' own j$ wrappers bridge to the platform Flow only on devices
@@ -36,11 +36,16 @@ j$/ java/util/concurrent/Flow$Subscription#<class>
 io/libp2p/ java/util/concurrent/CompletableFuture#failedFuture(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;
 io/libp2p/ java/util/concurrent/CompletableFuture#orTimeout(JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/CompletableFuture;
 
-# Besu fork + upstream besu jars. UInt256 (unsignedMultiplyHigh, API 35!) and
-# the Eq/Shift256/Exp operations are the EVM interpreter's word arithmetic —
-# [LIVE] for eth_call/ENS on Android 10/11 without ART backports; tracked by
-# issue #402 for the next biafra23/besu fork rebase (<ver>-android.N). Era1Type,
-# RollingFileWriter, LogsBloomFilter.Builder, Merkleizer, PrintWriter/
+# Besu fork + upstream besu jars (Java engine only). UInt256 (byteArrayViewVarHandle
+# in its static initializer, VarHandle get/set) and the Eq/Shift256/Exp operations
+# are the EVM interpreter's word arithmetic. Below API 33 they cannot link at all
+# (hidden VarHandle APIs; verified on an API-29 emulator), so the app disables the
+# Java engine there: EngineGate.JAVA_ENGINE_MIN_SDK forces the Rust engine with no
+# Java fallback, which makes these [dormant] on API 29-32. From API 33 the Java
+# engine runs, and String#formatted (API 34, ExceptionalHaltReason) is still [LIVE]
+# on API 33; tracked by issue #402 for the next biafra23/besu fork rebase
+# (<ver>-android.N). Math#unsignedMultiplyHigh needs no entry: R8 backports it.
+# Era1Type, RollingFileWriter, LogsBloomFilter.Builder, Merkleizer, PrintWriter/
 # BufferedInputStream uses and the xerial-snappy read are era1/util paths the
 # wallet never executes. [dormant]
 org/hyperledger/ java/io/BufferedInputStream#readNBytes(I)[B
@@ -48,7 +53,6 @@ org/hyperledger/ java/io/BufferedInputStream#skipNBytes(J)V
 org/hyperledger/ java/io/ByteArrayInputStream#readNBytes(I)[B
 org/hyperledger/ java/io/ByteArrayOutputStream#toString(Ljava/nio/charset/Charset;)Ljava/lang/String;
 org/hyperledger/ java/io/PrintWriter#<init>(Ljava/io/OutputStream;ZLjava/nio/charset/Charset;)V
-org/hyperledger/ java/lang/Math#unsignedMultiplyHigh(JJ)J
 org/hyperledger/ java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;
 org/hyperledger/ java/lang/invoke/MethodHandles#byteArrayViewVarHandle(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;
 org/hyperledger/ java/math/BigInteger#TWO
@@ -81,6 +85,12 @@ com/github/benmanes/caffeine/ java/util/stream/Stream#takeWhile(Ljava/util/funct
 # hits are its capability-probing enum holders (AbstractFutureState atomic
 # helpers, UnsignedBytes comparator, LittleEndianByteArray, FuturesGetChecked),
 # each loaded reflectively inside try/catch with a pure-Java fallback. [guarded]
+# Except below API 33: there AbstractFutureState$VarHandleAtomicHelper fails
+# VERIFICATION (VarHandle get/set are hidden), which escapes the probe and
+# leaves SettableFuture unusable for the whole process — observed on an API-29
+# emulator, where it killed the Java engine's discv5 (the discovery fork's Guava
+# cache). Harmless now because EngineGate disables the Java engine below 33;
+# no first-party or Rust-engine path uses Guava futures.
 com/google/ java/lang/ClassValue#get(Ljava/lang/Class;)Ljava/lang/Object;
 com/google/ java/lang/ClassValue#<class>
 com/google/ java/lang/ClassValue#<init>()V

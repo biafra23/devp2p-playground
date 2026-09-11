@@ -24,7 +24,9 @@ internal data class IosNetworkInfo(
  * The BLS and engine toggles are inert here: blst is compiled INTO the engine
  * static lib and the Rust engine is the only engine, so nativeBls reads as a
  * fixed `true`, preferJavaEngine keeps its inert default `false` (there is no
- * Java engine to prefer), and the setters drop the write.
+ * Java engine to prefer), and the setters drop the write. Settings shows
+ * [javaEngineUnavailableReason] in place of the engine toggle, so iOS never
+ * offers a switch that does nothing.
  */
 class IosSettings : Settings {
 
@@ -125,7 +127,10 @@ class IosSettings : Settings {
     override fun setNativeBlsEnabled(v: Boolean) {}
 
     // The Rust engine is the only engine on iOS: [Settings]' inert defaults for
-    // preferJavaEngine (false / drop-the-write) are exactly this host's semantics.
+    // preferJavaEngine (false / drop-the-write) are exactly this host's semantics,
+    // and the reason below replaces the engine toggle in Settings.
+    override fun javaEngineUnavailableReason(): String =
+        "iOS runs the Rust engine only: there is no Java engine on this platform."
 
     private companion object {
         const val K_ENABLED = "networks.enabled"

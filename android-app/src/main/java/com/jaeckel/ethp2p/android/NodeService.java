@@ -513,6 +513,9 @@ public final class NodeService extends Service {
      *  is a user who touched the toggle and deliberately ended on the Java engine — an
      *  expressed opt-out this seeds into the new key rather than silently discarding. */
     public static boolean preferJavaEngine(android.content.Context c) {
+        // Never honoured below the Java-engine gate (EngineGate): the engine cannot link on
+        // that ART. The stored value is kept, so an OS upgrade past the gate restores it.
+        if (!javaEngineSupported()) return false;
         android.content.SharedPreferences p = prefs(c);
         if (!p.contains(K_PREFER_JAVA) && p.contains("rustEngine") && !p.getBoolean("rustEngine", true)) {
             p.edit().putBoolean(K_PREFER_JAVA, true).apply();
@@ -525,14 +528,25 @@ public final class NodeService extends Service {
     }
     /** Apply the engine setting to the process-wide {@code Engines} selector. Maps the
      *  default → {@code auto} (prefer Rust where it can serve, fall back to Java with a
-     *  log), prefer-Java → {@code java}. Unlike the BLS toggle this is NOT live: networks
-     *  keep the engine that created them; the new choice applies on the next network
-     *  (re)start. Returns the applied choice. */
+     *  log), prefer-Java → {@code java}. Below {@link EngineGate#JAVA_ENGINE_MIN_SDK} it is
+     *  always a hard {@code rust}: no fallback to a Java engine that cannot link on that
+     *  ART, so a Rust create() failure fails the boot visibly. Unlike the BLS toggle this
+     *  is NOT live: networks keep the engine that created them; the new choice applies on
+     *  the next network (re)start. Returns the applied choice. */
     public static String applyEngineChoice(android.content.Context c) {
-        String choice = preferJavaEngine(c) ? "java" : "auto";
+        String choice = EngineGate.engineChoice(android.os.Build.VERSION.SDK_INT, preferJavaEngine(c));
         System.setProperty(io.myotis.engines.Engines.PROP, choice);
         io.myotis.engines.Engines.select(choice);
         return choice;
+    }
+    /** Whether this device's ART can run the Java engine at all (see {@link EngineGate}). */
+    public static boolean javaEngineSupported() {
+        return EngineGate.javaEngineSupported(android.os.Build.VERSION.SDK_INT);
+    }
+    /** Settings text explaining why the Java engine is unavailable on this device, or
+     *  null when it is available. */
+    public static String javaEngineUnavailableReason() {
+        return EngineGate.javaEngineUnavailableReason(android.os.Build.VERSION.SDK_INT);
     }
     /** Live-update the snap-peer target (no restart) on every live stack and persist it. */
     public void setTargetSnapPeers(int v) {
@@ -1709,7 +1723,10 @@ public final class NodeService extends Service {
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice
-                    + ", engine " + engineChoice + ")");
+                    + ", engine " + engineChoice
+                    + (javaEngineSupported() ? "" : " (Java engine needs API "
+                            + EngineGate.JAVA_ENGINE_MIN_SDK + "+, no fallback)")
+                    + ")");
 
             // create() + start() under the per-network bootLock: a Stop→Start / disable→enable
             // has this boot wait for the old instance's teardown (which holds the same lock) to

@@ -166,11 +166,12 @@ android {
         // Gradle Managed Device pinned to minSdk (API 29) for NodeBootSmokeTest
         // (androidTest — its KDoc carries the full why: real-ART boot coverage the
         // static dex scan cannot give). Run it with
-        //   ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine
+        //   ./gradlew :android-app:api29DebugAndroidTest
         // (CI adds -Pandroid.testoptions.manageddevices.emulator.gpu=
         // swiftshader_indirect for its GPU-less runners — see
-        // .github/workflows/android-apk.yml; without -PskipRustEngine the device
-        // also gets the Rust engine, which the toolchain gate then requires).
+        // .github/workflows/android-apk.yml). It needs the Android Rust toolchain:
+        // below API 33 the app is Rust-engine-only (EngineGate), so a
+        // -PskipRustEngine build cannot boot a network on this device.
         // "aosp", not "aosp-atd": the leaner ATD images only exist for API 30+.
         // x86_64 hosts only — Google never published an API-29 arm64 emulator
         // image, so an Apple-Silicon Mac can't run this device locally; the CI
@@ -407,7 +408,8 @@ dependencies {
 // the toolchain present, cargoNdkAndroid cross-compiles the jniLibs and
 // uniffiGenerateKotlin refreshes the committed bindings from the same source;
 // without it, the build fails and names `-PskipRustEngine` (which omits the
-// engine and falls back to the Java engine at runtime). verifyAndroidJniLibs is
+// engine; the app then runs the Java engine, on API 33+ only — EngineGate).
+// verifyAndroidJniLibs is
 // the post-build backstop that the produced .so exports every UniFFI symbol the
 // (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
 // PURPOSE — the JVM hosts must stay buildable without cargo (see
@@ -526,8 +528,8 @@ val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") 
         val missing = shippedAbis.filterNot { it in got }
         check(missing.isEmpty()) {
             "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
-                "would ship libmyotis_engine.so with no JNA dispatcher and silently fall " +
-                "back to the Java engine at runtime."
+                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
+                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
         }
     }
 }

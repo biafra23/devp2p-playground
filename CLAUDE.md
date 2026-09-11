@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build all modules. NOTE: :android-app builds the Rust engine from source by
 # default, so a full build needs the Android Rust toolchain (cargo + cargo-ndk +
 # NDK r28+ + the aarch64/x86_64-linux-android rustup targets). Without it, add
-# -PskipRustEngine to build the app on the Java engine (see the Rust section below).
+# -PskipRustEngine to build the app on the Java engine, which boots only on
+# Android 13 / API 33+ (see the Rust section below).
 ./gradlew build                  # add -PskipRustEngine without the Android Rust toolchain
 
 # Compile only (no tests)
@@ -54,7 +55,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
 # lack the toolchain — the build tells you about the switch — with:
-./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS)
+./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS); boots on API 33+ only
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
 # workspace's rust-toolchain.toml selects — i.e.
