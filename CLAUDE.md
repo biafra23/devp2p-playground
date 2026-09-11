@@ -176,8 +176,8 @@ explicitly says not to open one.
 ## Releases — ask before cutting one
 
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
-**ask these two questions first and act only on what they choose** (owner
-ruling, 2026-09-02):
+**ask these three questions first and act only on what they choose** (owner
+rulings, 2026-09-02 and 2026-09-11):
 
 1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
    blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
@@ -199,6 +199,68 @@ ruling, 2026-09-02):
    never seeds EL discovery and never holds a snap peer (#414, 2026-09-02).
    Warm profiles and the dispatched smoke job hide this because they dial
    their peer cache directly.
+3. **Run the cold-start checks?** (owner ruling, 2026-09-11.) Three live
+   tests, all `#[ignore]`d so nothing else ever runs them, and together the
+   only coverage of what a FRESH INSTALL does. Ordinary CI, the emulator smoke
+   and the dispatched node smoke all dial a warm peer cache or a release-fresh
+   anchor, which is exactly what hides this class of failure — in #422 a
+   shipped build could not catch up at all while every automated check was
+   green. Dispatch the `cold-start regression` workflow from the Actions tab
+   (preferred — a CI runner is a clean host, see the caveat below), or locally:
+
+   ```bash
+   cd rust
+   # 3a. are the shipped pins and bootnodes alive? (seconds when healthy)
+   NET=gnosis cargo test --release -p myotis-net --test live_pins_alive -- \
+       --ignored --nocapture --test-threads=1
+   # 3b. dead pins: every pinned CL server configured but unreachable
+   NET=gnosis cargo test --release -p myotis-net --test live_cold_start -- \
+       --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
+   # 3c. deep catch-up: an anchor further behind than the network's ws bound
+   NET=gnosis MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
+     cargo test --release -p myotis-net --test live_cold_start -- \
+       --ignored --nocapture cold_start_from_an_old_anchor
+   ```
+
+   Run each for every network you are shipping (`NET=mainnet|sepolia|gnosis`).
+   The workflow takes a `scope`: `full` is the release check and REFUSES to run
+   without an anchor rather than skipping the deep walk green; `pins-only` is
+   for when you deliberately want just 3a and 3b.
+
+   **3a is the one that would have caught #422 before it shipped**, and it is
+   the one whose OUTPUT you read rather than just its exit code. It asks every
+   pinned CL peer for a `light_client_bootstrap` at this build's own embedded
+   anchor and applies the SAME acceptance the production path does (checkpoint
+   pin plus both Merkle branches), then asks for one period of
+   `updates_by_range` — so a pin counts as alive only if a fresh install would
+   accept what it serves AND could catch up from it. Then it checks the
+   bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
+   sweep, because these are third-party hosts and demanding perfection makes a
+   check people skip. Individual dead pins are a re-census signal
+   (`examples/period_census.rs`), not automatically a blocker.
+
+   **Caveat that will bite you: the result is only as good as the host.** A
+   Lighthouse node that has banned your IP reports as `dial failed` while being
+   perfectly healthy for everyone else — and any machine that ran a
+   pre-gossipsub build carries those bans for 12 h (that ban IS #422). Measured
+   2026-09-11 from a dev box: 18 of 23 gnosis pins looked dead from home and
+   answered fine through a VPN minutes earlier. So prefer the dispatched
+   workflow, and before believing a bad census, check whether your host is the
+   outlier.
+
+   The old-anchor run needs an anchor from a release OLDER than the current
+   one — the newest tag is usually the release whose checkpoint is already on
+   `main`, so it proves nothing, and the test refuses an anchor within the
+   network's weak-subjectivity bound:
+
+   ```bash
+   prev=$(git tag --sort=-v:refname | sed -n 2p)
+   git show "$prev":rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
+   ```
+
+   Run them AFTER any checkpoint refresh from question 1, so the build under
+   test is the one being shipped. A failure here is release-blocking: it means
+   a fresh install cannot sync, which is the one thing a wallet must do.
 
 ## Pull requests and code review
 
