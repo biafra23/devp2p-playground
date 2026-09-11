@@ -1608,6 +1608,9 @@ async fn run_sync(
             status.period = anchor_period;
             status.ws_bound_periods = bound;
             let _ = status_tx.send(status);
+            // Parked across a fork activation, the served Status digest must
+            // still follow the schedule (see refresh_local_status).
+            refresh_local_status(&config, &processor, &local_status);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         if parked {
@@ -1754,6 +1757,10 @@ async fn run_sync(
                 // bound raised) — without it the watch keeps the park on display
                 // until the first SUCCESSFUL bootstrap, however long that takes —
                 // and it keeps peer/discovery counts moving during long stalls.
+                // The served Status digest follows the schedule here too — a
+                // peer-starved process can otherwise never bootstrap from
+                // post-fork peers (refresh_local_status's pre-bootstrap path).
+                refresh_local_status(&config, &processor, &local_status);
                 publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunting).await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -3076,6 +3083,19 @@ fn refresh_local_status(
     let store = &processor.store;
     let (Some(finalized), Some(optimistic)) = (store.finalized_header(), store.optimistic_header())
     else {
+        // Not bootstrapped yet: the checkpoint fields stay, but the digest must
+        // still follow the fork schedule at the wall clock. A process parked or
+        // peer-starved across a fork activation otherwise keeps offering the
+        // old digest on every new connection and can never bootstrap from
+        // post-fork peers (PR #430 review).
+        let mut s = local_status.get();
+        let digest = config.current_fork_digest();
+        if s.fork_digest != digest {
+            tracing::info!(from = %hex_str(&s.fork_digest), to = %hex_str(&digest),
+                "pre-bootstrap Status fork digest follows the schedule");
+            s.fork_digest = digest;
+            local_status.set(s);
+        }
         return;
     };
     let finalized_root = finalized.beacon.hash_tree_root();
@@ -3373,6 +3393,37 @@ mod tests {
         .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
+    }
+
+    /// Pre-bootstrap, `refresh_local_status` still moves the Status digest to
+    /// the schedule's wall-clock value (everything else untouched).
+    /// Copilot on PR #430: a parked process kept the start-time digest forever.
+    #[test]
+    fn pre_bootstrap_status_digest_follows_the_schedule() {
+        let config = ChainConfig::mainnet();
+        let stale = StatusMessage {
+            fork_digest: [0xDE, 0xAD, 0xBE, 0xEF],
+            finalized_root: config.checkpoint_root,
+            finalized_epoch: 7,
+            head_root: config.checkpoint_root,
+            head_slot: 8,
+            earliest_available_slot: 0,
+        };
+        let local = LocalStatus::new(stale.clone());
+        let processor = LightClientProcessor::new(
+            LightClientStore::new(config.slots_per_period()),
+            config.fork_schedule.clone(),
+            config.genesis_validators_root,
+        );
+        assert!(!processor.store.is_initialized());
+        refresh_local_status(&config, &processor, &local);
+        let got = local.get();
+        assert_eq!(got.fork_digest, config.current_fork_digest());
+        assert_eq!(
+            (got.finalized_root, got.finalized_epoch, got.head_root, got.head_slot),
+            (stale.finalized_root, stale.finalized_epoch, stale.head_root, stale.head_slot),
+            "only the digest moves before bootstrap"
+        );
     }
 
     /// The digest-side "current" version is the schedule entry active at the
