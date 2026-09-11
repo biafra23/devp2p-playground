@@ -182,16 +182,14 @@ public class BeaconP2PService implements AutoCloseable {
     private static final long PING_INTERVAL_SECS = 15;
 
     /**
-     * Gossipsub instance. Observation-only: handler logs incoming messages
-     * and always returns {@code Ignore}. Only created when
-     * {@link #gossipsubEnabled} is true. Every host now enables it: Lighthouse
-     * reports a peer whose {@code /meshsub/} negotiation fails as
-     * {@code PeerAction::Fatal} ("does_not_support_gossipsub"), which bans the
-     * peer id for 12 h after one connection and bans the IP once more than five
-     * of its peer ids are banned — a req/resp-only client got exactly one
-     * connection per Lighthouse node per start. Registering the protocol is
-     * what the check needs, so that is all {@link #gossipsubEnabled} does;
-     * joining the light-client topics is a separate, off-by-default switch
+     * Gossipsub instance, always registered so the {@code /meshsub/} protocol
+     * negotiates on every connection. Lighthouse reports a peer whose
+     * negotiation fails as {@code PeerAction::Fatal} ("does_not_support_gossipsub"),
+     * which bans the peer id for 12 h after one connection and bans the IP once
+     * more than five of its peer ids are banned — a req/resp-only client got
+     * exactly one connection per Lighthouse node per start. Registering the
+     * protocol is all that check needs. Joining the light-client topics is a
+     * separate, off-by-default switch
      * ({@link #setGossipTopicSubscriptionEnabled(boolean)}): a short-lived
      * wallet that joins a mesh and vanishes churns it for everyone else, the
      * jvm-libp2p default message id (from+seqno) collapses eth2's unsigned
@@ -199,34 +197,22 @@ public class BeaconP2PService implements AutoCloseable {
      */
     private io.libp2p.pubsub.gossip.Gossip gossip;
 
-    /** Off by default; call {@link #setGossipsubEnabled(boolean)} before {@link #start()}. */
-    private boolean gossipsubEnabled = false;
-
     /**
-     * Whether to also SUBSCRIBE to the light-client gossip topics once gossipsub
-     * is registered. Off by default — see the {@link #gossip} field doc. No host
-     * enables it yet; it stays as the hook for the live-finality plan
-     * (plan-gossipsub-subscription.md).
+     * Whether to also SUBSCRIBE to the light-client gossip topics. Off by
+     * default — see the {@link #gossip} field doc. No host enables it yet; it
+     * stays as the hook for the live-finality plan (plan-gossipsub-subscription.md).
      */
     private boolean gossipTopicSubscriptionEnabled = false;
 
     /** Topics {@link #subscribeLightClientGossipTopics()} joined; empty unless the topic switch is on. */
     private final Set<String> subscribedGossipTopics = ConcurrentHashMap.newKeySet();
 
-    /** Toggle topic subscription (requires gossipsub). Must be called before {@link #start()}. */
+    /** Toggle topic subscription. Must be called before {@link #start()}. */
     public void setGossipTopicSubscriptionEnabled(boolean enabled) {
         if (host != null) {
             throw new IllegalStateException("gossip topic flag cannot change after start()");
         }
         this.gossipTopicSubscriptionEnabled = enabled;
-    }
-
-    /** Toggle gossipsub subscription. Must be called before {@link #start()}. */
-    public void setGossipsubEnabled(boolean enabled) {
-        if (host != null) {
-            throw new IllegalStateException("gossipsub flag cannot change after start()");
-        }
-        this.gossipsubEnabled = enabled;
     }
 
     public BeaconP2PService() {
@@ -277,10 +263,6 @@ public class BeaconP2PService implements AutoCloseable {
      * Start the underlying libp2p host and register light client protocol handlers.
      */
     public void start() {
-        if (gossipTopicSubscriptionEnabled && !gossipsubEnabled) {
-            throw new IllegalStateException(
-                    "gossip topic subscription requires gossipsub (setGossipsubEnabled(true))");
-        }
         // Gossipsub is registered so the /meshsub/ protocol negotiates (see the
         // `gossip` field doc: Lighthouse fatally bans peers that lack it). Topic
         // subscription is a separate switch, off by default — PR 1 of the
@@ -293,10 +275,8 @@ public class BeaconP2PService implements AutoCloseable {
                 .listen("/ip4/0.0.0.0/tcp/0") // ephemeral port; some peers reject dial-only hosts
                 // Ethereum CL spec requires secp256k1 identity keys
                 .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1));
-        if (gossipsubEnabled) {
-            gossip = new io.libp2p.pubsub.gossip.Gossip();
-            hostBuilder.protocol(gossip);
-        }
+        gossip = new io.libp2p.pubsub.gossip.Gossip();
+        hostBuilder.protocol(gossip);
         host = hostBuilder.build();
 
         // Log connection events and auto-query Identify for protocol support
@@ -389,7 +369,7 @@ public class BeaconP2PService implements AutoCloseable {
         keepaliveExecutor.scheduleAtFixedRate(this::pingAllConnections,
                 PING_INTERVAL_SECS, PING_INTERVAL_SECS, java.util.concurrent.TimeUnit.SECONDS);
 
-        if (gossipsubEnabled && gossipTopicSubscriptionEnabled) {
+        if (gossipTopicSubscriptionEnabled) {
             subscribeLightClientGossipTopics();
         }
     }

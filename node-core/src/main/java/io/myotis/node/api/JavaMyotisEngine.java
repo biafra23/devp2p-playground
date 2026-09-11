@@ -96,8 +96,7 @@ public final class JavaMyotisEngine implements MyotisEngine {
                 ports.httpGateway() != null
                         ? PortBridges.toCcipGateway(ports.httpGateway(), httpExecutor)
                         : null,
-                config.syncSnapshotPath() != null ? Paths.get(config.syncSnapshotPath()) : null,
-                config.gossipsubEnabled());
+                config.syncSnapshotPath() != null ? Paths.get(config.syncSnapshotPath()) : null);
         if (config.targetSnapPeers() > 0) {
             stack.configureSnapMaintainer(config.targetSnapPeers(),
                     PortBridges.toDnsServerProvider(ports.dnsServers()));

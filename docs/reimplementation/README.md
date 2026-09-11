@@ -314,7 +314,7 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
   throw; programmer/state errors (malformed address, network not running) DO throw the
   API's single `EngineException`.
 - **`EngineConfig`** — `(networkName, elPort, discv5Port, rpcPort [0 = per-network
-  default], syncSnapshotPath, gossipsubEnabled, targetSnapPeers [0 = maintainer off],
+  default], syncSnapshotPath, targetSnapPeers [0 = maintainer off],
   strictStateFreshness)`.
 - **Status**: `status() -> StatusSnapshot` (EL + beacon counts, per-peer rows),
   `discoveredPeers()`, `connectedPeers()`, `beaconStatus() -> BeaconStatus` (deep CL

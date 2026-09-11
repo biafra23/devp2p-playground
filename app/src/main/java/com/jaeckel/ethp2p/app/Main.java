@@ -156,12 +156,9 @@ public final class Main {
 
 
     public static void main(String[] args) throws Exception {
-        // Parse --network (comma-separated list), --port, --[no-]gossipsub from anywhere in args.
+        // Parse --network (comma-separated list) and --port from anywhere in args.
         List<String> networkNames = new ArrayList<>();
         int port = DEFAULT_PORT;
-        // On by default: Lighthouse fatally bans a peer whose /meshsub/ negotiation
-        // fails, so a req/resp-only client gets one connection per peer id per 12 h.
-        boolean gossipsubEnabled = !"false".equalsIgnoreCase(System.getProperty("beacon.gossipsub", "true"));
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
@@ -171,10 +168,6 @@ public final class Main {
                 }
             } else if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
-            } else if ("--gossipsub".equals(args[i])) {
-                gossipsubEnabled = true;
-            } else if ("--no-gossipsub".equals(args[i])) {
-                gossipsubEnabled = false;
             } else {
                 remaining.add(args[i]);
             }
@@ -245,15 +238,15 @@ public final class Main {
                 System.exit(1);
             }
         }
-        runDaemon(engine, canonical, port, gossipsubEnabled);
+        runDaemon(engine, canonical, port);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
 
-    private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride,
-                                  boolean gossipsubEnabled) throws Exception {
+    private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride)
+            throws Exception {
         boolean multi = networks.size() > 1;
         log.info("=== ethp2p Daemon ({}) ===", String.join(", ", networks));
 
@@ -296,7 +289,7 @@ public final class Main {
             String dataDir = Path.of("").toAbsolutePath().toString();
             EngineConfig config = multi
                     ? new EngineConfig(network, 0, 0, 0,
-                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            syncSnapshotFile(network).toString(),
                             SNAP_PEER_TARGET, strict, dataDir)
                     : new EngineConfig(network, portOverride, 9000,
                             // Legacy 8545 stays pinned for mainnet (byte-identical
@@ -304,7 +297,7 @@ public final class Main {
                             // catalog default (0 = engine default; sepolia 8547) so a
                             // sepolia daemon beside a mainnet one doesn't collide.
                             "mainnet".equals(network) ? 8545 : 0,
-                            syncSnapshotFile(network).toString(), gossipsubEnabled,
+                            syncSnapshotFile(network).toString(),
                             SNAP_PEER_TARGET, strict, dataDir);
             // dnsServers=null → resolver's default DNS (the daemon, unlike Android, has
             // system DNS config). The snap maintainer (SNAP_PEER_TARGET) keeps snap peers

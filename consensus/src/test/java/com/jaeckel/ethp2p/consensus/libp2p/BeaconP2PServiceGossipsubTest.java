@@ -1,6 +1,7 @@
 package com.jaeckel.ethp2p.consensus.libp2p;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -9,10 +10,10 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * The Lighthouse-ban regression: a host with gossipsub enabled must negotiate a
- * {@code /meshsub/} stream opened toward it — that negotiation is what
- * Lighthouse's {@code does_not_support_gossipsub} Fatal report keys on — while
- * joining no light-client topic unless the separate topic switch is on.
+ * The Lighthouse-ban regression: every host must negotiate a {@code /meshsub/}
+ * stream opened toward it — that negotiation is what Lighthouse's
+ * {@code does_not_support_gossipsub} Fatal report keys on — while joining no
+ * light-client topic unless the separate topic switch is on.
  */
 class BeaconP2PServiceGossipsubTest {
 
@@ -29,37 +30,25 @@ class BeaconP2PServiceGossipsubTest {
     }
 
     @Test
-    void gossipsubNegotiatesMeshsubWithoutJoiningTopics() throws Exception {
-        BeaconP2PService withGossip = new BeaconP2PService(null);
-        withGossip.setGossipsubEnabled(true);
-        BeaconP2PService without = new BeaconP2PService(null);
+    void everyHostNegotiatesMeshsubWithoutJoiningTopics() throws Exception {
+        BeaconP2PService target = new BeaconP2PService(null);
         BeaconP2PService observer = new BeaconP2PService(null);
-        withGossip.start();
-        without.start();
+        target.start();
         observer.start();
         try {
-            String negotiated = observer.probeProtocol(loopbackAddress(withGossip), MESHSUB)
-                    .get(20, TimeUnit.SECONDS);
-            assertEquals(MESHSUB, negotiated);
-            assertTrue(withGossip.subscribedGossipTopics().isEmpty(),
+            String addr = loopbackAddress(target);
+            assertEquals(MESHSUB, observer.probeProtocol(addr, MESHSUB).get(20, TimeUnit.SECONDS));
+            assertTrue(target.subscribedGossipTopics().isEmpty(),
                     "protocol registration must not join any topic");
 
-            // Control: the same probe against a host without gossipsub must fail
-            // negotiation — exactly the outcome that used to earn the Fatal report.
+            // Control for the probe itself: a protocol nobody registered must fail
+            // negotiation — the outcome that used to earn the Fatal report.
             ExecutionException refused = assertThrows(ExecutionException.class, () ->
-                    observer.probeProtocol(loopbackAddress(without), MESHSUB).get(20, TimeUnit.SECONDS));
-            assertTrue(refused.getCause() != null, "negotiation failure must carry a cause");
+                    observer.probeProtocol(addr, "/meshsub/9.9.9").get(20, TimeUnit.SECONDS));
+            assertNotNull(refused.getCause(), "negotiation failure must carry a cause");
         } finally {
             observer.close();
-            without.close();
-            withGossip.close();
+            target.close();
         }
-    }
-
-    @Test
-    void topicSubscriptionWithoutGossipsubIsRefused() {
-        BeaconP2PService svc = new BeaconP2PService(null);
-        svc.setGossipTopicSubscriptionEnabled(true);
-        assertThrows(IllegalStateException.class, svc::start);
     }
 }

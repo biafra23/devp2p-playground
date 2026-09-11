@@ -1764,9 +1764,6 @@ public final class NodeService extends Service {
                 EngineConfig config = new EngineConfig(
                         n, 0, 0, rpcPort,
                         netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
-                        // Gossipsub on: Lighthouse fatally bans a peer whose /meshsub/
-                        // negotiation fails (one connection per peer id per 12 h).
-                        /*gossipsub*/ true,
                         snapTarget(this),
                         strictStateFreshness(this),
                         // Reconstructible engine-owned state belongs with the other network

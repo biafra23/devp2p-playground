@@ -80,7 +80,7 @@ class SelectorEngineTest {
 
     private static EngineConfig config(String network) {
         // Non-default ports so a create-only test can't collide with a live daemon.
-        return new EngineConfig(network, 42303, 42900, 42545, null, false, 0, true, null);
+        return new EngineConfig(network, 42303, 42900, 42545, null, 0, true, null);
     }
 
     @Test

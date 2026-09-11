@@ -321,7 +321,7 @@ class RustStatusJsonTest {
                 "libmyotis_engine not on java.library.path — skipping live JNI status test");
         RustMyotisEngine rust = new RustMyotisEngine();
         EngineConfig cfg = new EngineConfig(
-                "mainnet", 0, 0, 0, null, false, 0, true, "/tmp/myotis-r1-test");
+                "mainnet", 0, 0, 0, null, 0, true, "/tmp/myotis-r1-test");
         var handle = rust.create(cfg, null);
         try {
             // A created-but-not-started handle reports not-running / STARTING.

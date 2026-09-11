@@ -348,7 +348,7 @@ order of magnitude.
 | Served-block window (`setServedBlockWindow`) | 32 (max 4096) | RAM (~500 B/header) and what we serve peers; not a big wire term. |
 | Idle pause (Android Settings) | 5 min | Everything → 0 while asleep. |
 | CL finality fan-out | 16 (32 hunting) | Multiplies per-slot CL response bytes. Compile-time today (`BeaconLightClient`). |
-| Gossipsub observation (`setGossipsubEnabled`) | **off** | When on, adds inbound finality/optimistic gossip per slot (observation-only). |
+| Gossip topic subscription (`BeaconP2PService.setGossipTopicSubscriptionEnabled`) | **off** | The gossipsub protocol itself is always negotiated (Lighthouse bans peers without it) at no traffic cost; joining the topics would add inbound finality/optimistic gossip per slot. |
 | Fee snapshot refresh / tip window | 12 s / 3 blocks | The body-warming term (§3.2) scales with refresh rate × window. |
 | Deep-pool threshold, dial budgets (`DNS_DIALS_PER_MIN` etc.) | see `ChainStack` | Discovery/dial churn traffic. |
 

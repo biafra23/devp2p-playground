@@ -1429,16 +1429,6 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
-     * Register gossipsub on the libp2p host (no topic subscriptions). Every
-     * host enables this: Lighthouse fatally bans a peer whose {@code /meshsub/}
-     * negotiation fails, see {@code BeaconP2PService#gossip}. Must be called
-     * before {@link #start()}.
-     */
-    public void setGossipsubEnabled(boolean enabled) {
-        p2pService.setGossipsubEnabled(enabled);
-    }
-
-    /**
      * Send Status to a peer, trying {@code /status/2} first and falling back
      * to {@code /status/1} if the peer doesn't support v2. Each protocol is
      * additionally tried with each candidate fork version in sequence.
