@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use discv5::enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
-use discv5::{Event, ConfigBuilder, Discv5, Enr, ListenConfig};
+use discv5::{ConfigBuilder, Discv5, Enr, Event, ListenConfig};
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::mpsc;
 
@@ -180,7 +180,9 @@ async fn run_lookups(
     hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
-    let mut seen: HashSet<NodeId> = HashSet::new();
+    // Once-ever emission set, SHARED with the Discovered-event consumer so a
+    // re-seed (which clears it) refills the pool from both paths.
+    let seen: Arc<std::sync::Mutex<HashSet<NodeId>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
     // Last emitted ENR sequence number per PINNED id. A pinned server may be
     // re-found on every targeted round, but only a STRICTLY newer record — a
     // genuine republication, e.g. after an address change — re-emits. Gating on
@@ -195,16 +197,20 @@ async fn run_lookups(
     // response mentions — on the shared eth2 DHT, that is where nearly all
     // of a small network's peers appear, since a random target is almost
     // never near a sepolia node — was thrown away. The Java twin
-    // (DiscV5Service.poll over streamLiveNodes()) sees those records and
+    // (DiscV5Service.poll over streamLiveNodes(), its liveness-checked
+    // bucket entries) fills its buckets from those same responses and
     // emitted 28 fork-matched sepolia peers in ten seconds where this loop
     // emitted one per ~2 minutes from the same address. So consume the
     // Discovered event, which fires for EVERY ENR in every NODES response,
-    // and emit the fork-matched ones once each. Pinned ids stay on the
-    // seq-gated lookup path (a hearsay copy may be an older record).
+    // and emit the fork-matched ones once each (measured: first sepolia peer
+    // 4 s after start instead of 2 min 12 s, 39 within 150 s). See
+    // consume_discovered for why these are hearsay and why its sends never
+    // block.
     tokio::spawn(consume_discovered(
         events,
         accepted_digests.clone(),
         pinned_targets.clone(),
+        Arc::clone(&seen),
         tx.clone(),
     ));
     loop {
@@ -235,10 +241,10 @@ async fn run_lookups(
                             Some(&last) if enr.seq() <= last => continue,
                             _ => {
                                 pinned_seq.insert(enr.node_id(), enr.seq());
-                                seen.insert(enr.node_id());
+                                seen.lock().expect("seen lock").insert(enr.node_id());
                             }
                         }
-                    } else if !seen.insert(enr.node_id()) {
+                    } else if !seen.lock().expect("seen lock").insert(enr.node_id()) {
                         continue;
                     }
                     if let Some(peer) = filter_candidate(&enr, &accepted_digests) {
@@ -251,7 +257,8 @@ async fn run_lookups(
             }
             Err(e) => tracing::debug!(error = %e, "discv5 lookup failed"),
         }
-        tracing::debug!(emitted, known = seen.len(), "discv5 lookup round complete");
+        tracing::debug!(emitted, known = seen.lock().expect("seen lock").len(),
+            "discv5 lookup round complete");
 
         // Status metric: TOTAL routing-table entries (never a misleading 0
         // during a connectivity blip that flips entries Disconnected-in-place).
@@ -265,7 +272,7 @@ async fn run_lookups(
             // every re-found peer fails the seen-dedup and is never re-emitted
             // (emission is once-ever per NodeId), leaving the pool starved
             // even after a successful re-seed.
-            seen.clear();
+            seen.lock().expect("seen lock").clear();
             tracing::info!(pinged = bootnodes.len(), readded, rounds = RESEED_EMPTY_ROUNDS,
                 "discv5 live table empty — pinged bootnodes and cleared the dedup set");
         }
@@ -280,8 +287,9 @@ async fn run_lookups(
         let pause = if hunt_boost.load(Ordering::Relaxed) { 2 } else { 15 };
         tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         // Bound the dedup set: discovery on mainnet finds thousands of nodes.
-        if seen.len() > 16_384 {
-            seen.clear();
+        let mut guard = seen.lock().expect("seen lock");
+        if guard.len() > 16_384 {
+            guard.clear();
         }
     }
 }
@@ -329,38 +337,58 @@ fn reseed_due(empty_rounds: &mut u32, live_nodes: usize, bootnode_count: usize) 
 }
 
 /// Forward every fork-matched ENR the discv5 service hears about — the
-/// `Discovered` event fires per ENR in every NODES response, contacted or not
-/// — to the sync pool, once per node id. Ends when the service or the pool
+/// `Discovered` event fires per ENR in every NODES response — to the sync
+/// pool, once per node id. These records are HEARSAY (sigp: "not guaranteed
+/// to be live or contactable"), unlike lookup results, which only name nodes
+/// that answered: the pool's dial is what verifies them, an unreachable one is
+/// struck out on its first failure, and the ENR signature was checked on
+/// decode so a wrong record cannot impersonate anyone at the Noise handshake.
+///
+/// Sends are non-blocking on purpose. The pool channel is small and drained
+/// at the sync loop's cadence; on mainnet nearly every heard ENR matches, so a
+/// blocking send here would park behind hundreds of emissions and stall the
+/// lookup loop's own sends, its cadence and its re-seed check. A node dropped
+/// on a full channel is not recorded as seen, so it is re-emitted the next
+/// time it is heard. Ends when the service drops its event sender or the pool
 /// goes away.
 async fn consume_discovered(
     mut events: mpsc::Receiver<Event>,
     accepted_digests: Vec<[u8; 4]>,
     pinned_targets: Vec<NodeId>,
+    seen: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     tx: mpsc::Sender<DiscoveredPeer>,
 ) {
-    let mut seen: HashSet<NodeId> = HashSet::new();
-    let mut heard = 0usize;
     while let Some(event) = events.recv().await {
         let Event::Discovered(enr) = event else { continue };
-        heard += 1;
-        if pinned_targets.contains(&enr.node_id()) {
+        let id = enr.node_id();
+        // Pinned ids keep the lookup path's seq gate: a hearsay copy may be
+        // an older record than the one already emitted.
+        if pinned_targets.contains(&id) {
             continue;
         }
-        for peer in collect_new_candidates(std::iter::once(enr), &mut seen, &accepted_digests) {
-            tracing::debug!(heard, known = seen.len(), "CL peer heard in a NODES response");
-            if tx.send(peer).await.is_err() {
-                return;
-            }
+        if seen.lock().expect("seen lock").contains(&id) {
+            continue;
         }
-        if seen.len() > 16_384 {
-            seen.clear();
+        let Some(peer) = filter_candidate(&enr, &accepted_digests) else {
+            // Off-fork or no TCP endpoint: never a candidate, never re-checked.
+            seen.lock().expect("seen lock").insert(id);
+            continue;
+        };
+        match tx.try_send(peer) {
+            Ok(()) => {
+                seen.lock().expect("seen lock").insert(id);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Not recorded: heard again later, emitted then.
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
         }
     }
 }
 
 /// The fork-matched, TCP-bearing peers among `enrs` that `seen` has not yet
-/// recorded — recording them as it goes, so a node is emitted once ever (until
-/// the caller clears `seen` on a re-seed).
+/// recorded — recording them as it goes, so a node is emitted once per `seen`
+/// lifetime. The lookup loop's once-ever rule in one place, with a test.
 fn collect_new_candidates(
     enrs: impl IntoIterator<Item = Enr>,
     seen: &mut HashSet<NodeId>,
@@ -443,8 +471,7 @@ mod tests {
     const GNOSIS_BOOT_ENR: &str = "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA";
 
     #[test]
-    #[test]
-    fn a_table_sweep_emits_each_matching_node_once() {
+    fn heard_nodes_are_emitted_once_each() {
         let enr: Enr = GNOSIS_BOOT_ENR.parse().expect("boot ENR parses");
         let digest = enr_eth2_fork_digest(&enr).expect("eth2 field");
         let mut seen = HashSet::new();
@@ -460,6 +487,7 @@ mod tests {
         assert!(seen2.contains(&enr.node_id()));
     }
 
+    #[test]
     fn parses_eth2_field_and_peer_id_from_real_enr() {
         let enr: Enr = GNOSIS_BOOT_ENR.parse().unwrap();
         let digest = enr_eth2_fork_digest(&enr).unwrap();
