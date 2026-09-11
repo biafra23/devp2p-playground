@@ -223,14 +223,18 @@ rulings, 2026-09-02 and 2026-09-11):
    ```
 
    Run each for every network you are shipping (`NET=mainnet|sepolia|gnosis`).
+   The workflow takes a `scope`: `full` is the release check and REFUSES to run
+   without an anchor rather than skipping the deep walk green; `pins-only` is
+   for when you deliberately want just 3a and 3b.
 
    **3a is the one that would have caught #422 before it shipped**, and it is
    the one whose OUTPUT you read rather than just its exit code. It asks every
    pinned CL peer for a `light_client_bootstrap` at this build's own embedded
-   anchor — one request that proves the host is up, the peer id still matches,
-   the fork digest agrees, it still serves light clients, and it still holds
-   the anchor a fresh install starts from — then checks the bootnodes can seed
-   discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
+   anchor and applies the SAME acceptance the production path does (checkpoint
+   pin plus both Merkle branches), then asks for one period of
+   `updates_by_range` — so a pin counts as alive only if a fresh install would
+   accept what it serves AND could catch up from it. Then it checks the
+   bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
    sweep, because these are third-party hosts and demanding perfection makes a
    check people skip. Individual dead pins are a re-census signal
    (`examples/period_census.rs`), not automatically a blocker.
