@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use libp2p::Multiaddr;
 use myotis_consensus::store::LightClientProcessor;
-use myotis_consensus::types::LightClientBootstrap;
+use myotis_consensus::types::{LightClientBootstrap, LightClientUpdate};
 use myotis_consensus::{spec, ssz};
 use myotis_net::codec;
 use myotis_net::reqresp::{self, LocalStatus};
@@ -113,6 +113,23 @@ fn assert_no_cl_env_overrides() {
             "{var} is set — it replaces the shipped configuration, so this census would \
              not be about the peers this build ships. Unset it."
         );
+    }
+}
+
+/// Did this `updates_by_range` response actually carry an update a wallet
+/// could apply? A success byte is not enough — a truncated or malformed frame
+/// (even a bare `[0]`) would otherwise count as "serves catch-up", letting the
+/// census meet its floor on peers that cannot advance a stale install. Mirrors
+/// the real catch-up path: split the chunks, then decode one.
+fn served_an_update(raw: &[u8]) -> bool {
+    if raw.first() != Some(&codec::RESULT_SUCCESS) {
+        return false;
+    }
+    match codec::decode_multi_chunk_response(raw, 1) {
+        Ok(chunks) => chunks
+            .first()
+            .is_some_and(|c| !c.is_empty() && LightClientUpdate::decode(c).is_ok()),
+        Err(_) => false,
     }
 }
 
@@ -219,13 +236,16 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                     // bootstrap for some other anchor, or bytes that merely
                     // decompress, would count as a healthy pin that a fresh
                     // install then rejects.
-                    let ours = config.current_fork_digest();
-                    let verdict = if d.fork_digest != ours {
-                        Err(format!(
-                            "served a bootstrap framed for fork {:02x?}, we speak {ours:02x?}",
-                            d.fork_digest
-                        ))
-                    } else {
+                    // Deliberately NOT compared against current_fork_digest():
+                    // a bootstrap's context bytes follow the slot of the block
+                    // it anchors to, not the wall clock, and a still-valid
+                    // checkpoint can sit behind a fork boundary — roost stamps
+                    // them that way on purpose (`roost/src/serve.rs`, "stamping
+                    // it with head's digest would be wrong for exactly the
+                    // wallets that are furthest behind"). The production
+                    // bootstrap path does not check it either; the checkpoint
+                    // pin and the two branches below are the real proof.
+                    let verdict = {
                         match LightClientBootstrap::decode(&d.ssz_payload) {
                             Err(e) => Err(format!("bootstrap did not decode: {e}")),
                             Ok(b) if b.header.beacon.hash_tree_root() != config.checkpoint_root => {
@@ -296,14 +316,12 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                                     Err(_) => Err("timeout".to_string()),
                                 },
                             );
-                            if matches!(&updates, Some(Ok(raw))
-                                if raw.first() == Some(&codec::RESULT_SUCCESS))
-                            {
+                            if matches!(&updates, Some(Ok(raw)) if served_an_update(raw)) {
                                 break;
                             }
                         }
                         match updates.expect("the loop always sets it") {
-                            Ok(raw) if raw.first() == Some(&codec::RESULT_SUCCESS) => {
+                            Ok(raw) if served_an_update(&raw) => {
                                 alive += 1;
                                 eprintln!(
                                     "[pins] OK   {addr} (bootstrap {} B, serves period {period})",
@@ -313,8 +331,9 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
                             other => {
                                 let why = match other {
                                     Ok(raw) => format!(
-                                        "result code {}",
-                                        raw.first().copied().unwrap_or(255)
+                                        "result code {}, {} B, no decodable update",
+                                        raw.first().copied().unwrap_or(255),
+                                        raw.len()
                                     ),
                                     Err(e) => e,
                                 };
