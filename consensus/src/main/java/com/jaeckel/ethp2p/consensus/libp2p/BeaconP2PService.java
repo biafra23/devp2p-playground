@@ -183,16 +183,39 @@ public class BeaconP2PService implements AutoCloseable {
     /**
      * Gossipsub instance. Observation-only: handler logs incoming messages
      * and always returns {@code Ignore}. Only created when
-     * {@link #gossipsubEnabled} is true, which defaults to {@code false}
-     * because the primary target (short-lived Android sessions) doesn't
-     * benefit from mesh participation — mesh-join latency is longer than a
-     * whole session, and churning the mesh every 24 h is worse citizenship
-     * than not joining.
+     * {@link #gossipsubEnabled} is true. Every host now enables it: Lighthouse
+     * reports a peer whose {@code /meshsub/} negotiation fails as
+     * {@code PeerAction::Fatal} ("does_not_support_gossipsub"), which bans the
+     * peer id for 12 h after one connection and bans the IP once more than five
+     * of its peer ids are banned — a req/resp-only client got exactly one
+     * connection per Lighthouse node per start. Registering the protocol is
+     * what the check needs, so that is all {@link #gossipsubEnabled} does;
+     * joining the light-client topics is a separate, off-by-default switch
+     * ({@link #setGossipTopicSubscriptionEnabled(boolean)}): a short-lived
+     * wallet that joins a mesh and vanishes churns it for everyone else, the
+     * jvm-libp2p default message id (from+seqno) collapses eth2's unsigned
+     * messages, and the subscription is pinned to the fork digest at start.
      */
     private io.libp2p.pubsub.gossip.Gossip gossip;
 
     /** Off by default; call {@link #setGossipsubEnabled(boolean)} before {@link #start()}. */
     private boolean gossipsubEnabled = false;
+
+    /**
+     * Whether to also SUBSCRIBE to the light-client gossip topics once gossipsub
+     * is registered. Off by default — see the {@link #gossip} field doc. No host
+     * enables it yet; it stays as the hook for the live-finality plan
+     * (plan-gossipsub-subscription.md).
+     */
+    private boolean gossipTopicSubscriptionEnabled = false;
+
+    /** Toggle topic subscription (requires gossipsub). Must be called before {@link #start()}. */
+    public void setGossipTopicSubscriptionEnabled(boolean enabled) {
+        if (host != null) {
+            throw new IllegalStateException("gossip topic flag cannot change after start()");
+        }
+        this.gossipTopicSubscriptionEnabled = enabled;
+    }
 
     /** Toggle gossipsub subscription. Must be called before {@link #start()}. */
     public void setGossipsubEnabled(boolean enabled) {
@@ -361,7 +384,7 @@ public class BeaconP2PService implements AutoCloseable {
         keepaliveExecutor.scheduleAtFixedRate(this::pingAllConnections,
                 PING_INTERVAL_SECS, PING_INTERVAL_SECS, java.util.concurrent.TimeUnit.SECONDS);
 
-        if (gossipsubEnabled) {
+        if (gossipsubEnabled && gossipTopicSubscriptionEnabled) {
             subscribeLightClientGossipTopics();
         }
     }
@@ -521,8 +544,8 @@ public class BeaconP2PService implements AutoCloseable {
      * (Lighthouse-style application codes &ge; 128, plus spec's FaultError
      * (3) and ClientShutdown (1) where reconnecting doesn't help). For the
      * spec's IrrelevantNetwork (2) we do <em>not</em> cooldown: that's a
-     * static-capability mismatch (we don't advertise gossipsub, so we stay
-     * "irrelevant" until we subscribe), and cooldowning locks us out of
+     * static-capability mismatch (a fork-digest or network disagreement in
+     * Status that re-dialing cannot change), and cooldowning locks us out of
      * every peer at once without reducing abuse — the peer already decided
      * based on Identify, they won't be angrier if we re-dial.
      */

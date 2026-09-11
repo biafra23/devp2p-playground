@@ -322,7 +322,8 @@ re-implementation as the reference desktop host (mobile hosts replace this with 
 
 ### 4.1 Daemon vs client mode
 
-- Parse `--network <csv>` (host several networks in one process), `--port`, `--gossipsub`, and a
+- Parse `--network <csv>` (host several networks in one process), `--port`, `--[no-]gossipsub`
+  (on by default), and a
   remaining command.
 - A command token + a *running* daemon → **client mode**: connect to the network's socket, send one
   JSON line, print responses, exit.

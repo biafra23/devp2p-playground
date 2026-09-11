@@ -25,7 +25,7 @@ use libp2p::identify;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
+use libp2p::{gossipsub, Multiaddr, PeerId, StreamProtocol, Swarm};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::codec;
@@ -278,6 +278,16 @@ pub struct Behaviour {
     // established connections so a peer flood can't exhaust fds/memory.
     pub limits: connection_limits::Behaviour,
     pub identify: identify::Behaviour,
+    /// Gossipsub with NO subscriptions. It exists so the `/meshsub/` protocol
+    /// negotiates on every connection: Lighthouse (v8.1.3–v8.2.2 verified in
+    /// `lighthouse_network/src/service/mod.rs`) reports a peer whose gossipsub
+    /// upgrade fails with `PeerAction::Fatal` ("does_not_support_gossipsub"),
+    /// which bans the peer id for 12 h after ONE goodbye (reason 0) and bans
+    /// the whole IP once more than five of its peer ids are banned. A wallet
+    /// therefore got exactly one first-contact connection per Lighthouse
+    /// node per start, and the IP ban after a handful of restarts. Negotiating
+    /// the protocol is all the check needs; the mesh is never joined.
+    pub gossipsub: gossipsub::Behaviour,
     pub status_v2: RR,
     pub status_v1: RR,
     pub ping: RR,
@@ -311,6 +321,17 @@ impl Behaviour {
                 identify::Config::new("eth2/1.0.0".into(), local_public_key)
                     .with_agent_version(concat!("myotis/", env!("CARGO_PKG_VERSION"), "-rs").into()),
             ),
+            // Anonymous on both sides matches the eth2 wire (StrictNoSign:
+            // messages carry no signature, key or seqno); nothing is ever
+            // published or subscribed, so this only shapes the handshake.
+            gossipsub: gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Anonymous,
+                gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .build()
+                    .expect("static gossipsub config"),
+            )
+            .expect("static gossipsub behaviour"),
             status_v2: rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT),
             status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),
             ping: rr(protocols::PING, ProtocolSupport::Full, RESP_TIMEOUT),
@@ -1289,6 +1310,9 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
         }
         E::Identify(_) => {}
+        // No subscriptions, so the only events are peers' subscription
+        // announcements and unsupported-protocol notices; none needs handling.
+        E::Gossipsub(_) => {}
         E::StatusV2(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V2, ev),
         E::StatusV1(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V1, ev),
         E::Ping(ev) => on_rr_event(swarm, ctx, protocols::PING, ev),

@@ -102,11 +102,14 @@ tasks.register<JavaExec>("run") {
         appArgs.add("--port")
         appArgs.add(portArg)
     }
-    // -Pgossipsub=true enables the (observation-only) light-client gossipsub
-    // subscription. Off by default because short-session clients churn the mesh.
+    // Gossipsub is ON by default (Lighthouse bans peers whose /meshsub/ negotiation
+    // fails); -Pgossipsub=false passes --no-gossipsub, -Pgossipsub=true is a no-op
+    // kept for older invocations.
     val gossipsubArg = project.findProperty("gossipsub") as String?
     if (gossipsubArg != null && gossipsubArg.equals("true", ignoreCase = true)) {
         appArgs.add("--gossipsub")
+    } else if (gossipsubArg != null && gossipsubArg.equals("false", ignoreCase = true)) {
+        appArgs.add("--no-gossipsub")
     }
     val cmdArgs = (project.findProperty("args") as String?)
         ?.split("\\s+".toRegex())

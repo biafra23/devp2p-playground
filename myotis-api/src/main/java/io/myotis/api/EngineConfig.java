@@ -11,8 +11,11 @@ package io.myotis.api;
  * @param rpcPort              verified JSON-RPC HTTP port (loopback); 0 → the network's default
  * @param syncSnapshotPath     file path for the light-client sync snapshot (a private
  *                             cache, not a trust anchor); null → no snapshot persistence
- * @param gossipsubEnabled     subscribe to CL gossipsub (live finality updates) in
- *                             addition to polling
+ * @param gossipsubEnabled     register the gossipsub protocol on the CL libp2p host
+ *                             (no topic subscriptions). Hosts enable it: Lighthouse
+ *                             fatally bans a peer whose /meshsub/ negotiation fails.
+ *                             The Java engine honours it; the Rust engine always
+ *                             negotiates gossipsub and ignores the flag
  * @param targetSnapPeers      snap-peer maintainer target; 0 → maintainer disabled
  *                             (bare daemons rely on continuous discv4; NAT'd/mobile
  *                             hosts should enable it)

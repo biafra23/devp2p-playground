@@ -1429,11 +1429,10 @@ public class BeaconLightClient implements AutoCloseable {
     }
 
     /**
-     * Enable gossipsub subscription to the light-client topics. Off by
-     * default because short-session clients (Android app that runs ~2 min
-     * once per day) don't benefit from mesh participation and churn the
-     * mesh by joining-then-disappearing. Must be called before
-     * {@link #start()}.
+     * Register gossipsub on the libp2p host (no topic subscriptions). Every
+     * host enables this: Lighthouse fatally bans a peer whose {@code /meshsub/}
+     * negotiation fails, see {@code BeaconP2PService#gossip}. Must be called
+     * before {@link #start()}.
      */
     public void setGossipsubEnabled(boolean enabled) {
         p2pService.setGossipsubEnabled(enabled);

@@ -55,7 +55,9 @@ const REFRESH: Duration = Duration::from_secs(12);
 /// node's limit is sized for gossip peers and shared with its outbound dials,
 /// and inheriting it is what starved wallets in the first place. Per-connection
 /// cost here is a Noise session and a yamux stream — tens of KB — with no
-/// gossipsub mesh, no peer scoring and no per-peer computation.
+/// gossipsub mesh (the `/meshsub/` protocol negotiates, because Lighthouse
+/// bans peers that lack it, but nothing is subscribed so no mesh forms), no
+/// peer scoring and no per-peer computation.
 const MAX_INBOUND: u32 = 1024;
 
 /// How often to re-read the chain's fork/blob schedule, in ticks.

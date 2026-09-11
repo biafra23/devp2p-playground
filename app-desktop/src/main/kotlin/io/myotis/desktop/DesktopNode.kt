@@ -122,7 +122,7 @@ class DesktopNodeController(
                 val config = EngineConfig(
                     canonical, 0, 0, settings.rpcPortFor(canonical),
                     dataDir.resolve("sync-state$suffix.snapshot").toString(),
-                    false,
+                    true, // gossipsub: Lighthouse bans peers whose /meshsub/ negotiation fails
                     settings.snapTarget(),
                     settings.strictStateFreshness(),
                     dataDir.toString(),

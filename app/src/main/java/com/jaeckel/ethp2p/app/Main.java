@@ -156,10 +156,12 @@ public final class Main {
 
 
     public static void main(String[] args) throws Exception {
-        // Parse --network (comma-separated list), --port, --gossipsub from anywhere in args.
+        // Parse --network (comma-separated list), --port, --[no-]gossipsub from anywhere in args.
         List<String> networkNames = new ArrayList<>();
         int port = DEFAULT_PORT;
-        boolean gossipsubEnabled = false;
+        // On by default: Lighthouse fatally bans a peer whose /meshsub/ negotiation
+        // fails, so a req/resp-only client gets one connection per peer id per 12 h.
+        boolean gossipsubEnabled = !"false".equalsIgnoreCase(System.getProperty("beacon.gossipsub", "true"));
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--network".equals(args[i]) && i + 1 < args.length) {
@@ -171,17 +173,13 @@ public final class Main {
                 port = Integer.parseInt(args[++i]);
             } else if ("--gossipsub".equals(args[i])) {
                 gossipsubEnabled = true;
+            } else if ("--no-gossipsub".equals(args[i])) {
+                gossipsubEnabled = false;
             } else {
                 remaining.add(args[i]);
             }
         }
         if (networkNames.isEmpty()) networkNames.add("mainnet");
-        // System property fallback so Android / other embedders can opt in
-        // without touching CLI args.
-        if (!gossipsubEnabled
-                && Boolean.parseBoolean(System.getProperty("beacon.gossipsub", "false"))) {
-            gossipsubEnabled = true;
-        }
         String[] cmdArgs = remaining.toArray(new String[0]);
 
         // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
