@@ -104,8 +104,11 @@ class RpcSlowCallLogTest {
 
     @Test fun stalledBatchElement_namesItsPosition() {
         route("""[{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}, $balance]""")
+        // Only the stalled element can log "still unanswered" (eth_chainId never suspends,
+        // so its watchdog can't run before it ends). Whether eth_chainId itself crosses
+        // 100 ms on a cold JVM is not this test's business — fastCall_logsNothingOnTheSlowLogger
+        // pins the under-threshold case with a threshold no cold start can reach.
         val stuck = slowLines().first { it.contains("still unanswered") }
         assertTrue(stuck.contains("method=eth_getBalance") && stuck.contains("batch=2/2"), stuck)
-        assertTrue(slowLines().none { it.contains("method=eth_chainId") }, slowLines().toString())
     }
 }

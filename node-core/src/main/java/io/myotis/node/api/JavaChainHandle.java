@@ -81,10 +81,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     /**
      * Wake-and-wait shared by the verified operator queries: a query on a paused
-     * stack triggers resume and waits up to the cap for readiness. A RUNNING-but-cold
-     * stack does NOT block to full readiness — it proceeds and the query/backend emits
-     * its own bounded errors. Only a PAUSED-at-deadline (resume kept failing) throws;
-     * a STOPPED stack falls through to each query's existing "Node is not running" guard.
+     * stack triggers resume and waits up to the cap for readiness, as does one
+     * arriving during a start/resume warm-up. Otherwise a RUNNING stack that isn't
+     * ready does NOT block — it proceeds and the query/backend emits its own bounded
+     * errors (#312). Only a PAUSED-at-deadline (resume kept failing) throws; a
+     * STOPPED stack falls through to each query's existing "Node is not running" guard.
      */
     private void awaitWake() {
         stack.awaitReadyForReads(ChainStack.WAKE_WAIT_CAP_MS);
