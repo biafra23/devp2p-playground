@@ -18,11 +18,11 @@ import java.util.concurrent.TimeUnit
  * [MainActivity], let its fresh-launch path auto-start [NodeService], and wait for the
  * primary network's boot verdict.
  *
- * The point is runtime linkage, not sync: `ChainStack.start()` synchronously walks the
- * whole networking + consensus init sequence — EIP-1459 DNS discovery, the RLPx
- * connector and initial dials, discv4, discv5 + the beacon light client (libp2p, BLS,
- * SSZ), the Ktor JSON-RPC server, the snap-peer maintainer — so a recorded
- * [NodeService.BOOT_STARTED] proves that code actually EXECUTED on this API level.
+ * The point is runtime linkage, not sync: starting the network walks the engine's whole
+ * init sequence — on this device the Rust engine (see the scope notes below): loading
+ * JNA and the native library, the UniFFI ABI handshake, the native engine's start, and
+ * the host's Ktor JSON-RPC server — so a recorded [NodeService.BOOT_STARTED] proves
+ * that code actually EXECUTED on this API level.
  * That is coverage a static bytecode scan cannot give: `android.*` framework APIs
  * above minSdk (`SDK_INT` guards are invisible to a dex scan — only running on real
  * API-29 ART checks they work), `java.*` members the SDK's api-versions.xml has no
@@ -35,10 +35,10 @@ import java.util.concurrent.TimeUnit
  *  - thrown in host/service code or `ENGINE.create()`: the boot worker catches only
  *    `Exception`, so the `Error` crashes the app process and the instrumentation
  *    report carries the crash stack;
- *  - thrown inside `ChainStack.start()`: its internal `catch (Throwable)` converts it
- *    to a `false` return (no crash, stack trace in the log), which [NodeService]
- *    records as a failed boot outcome — this test then FAILS FAST with the app log's
- *    error lines instead of burning the whole deadline.
+ *  - a failure the engine's `start()` reports, as a `false` return or an exception:
+ *    [NodeService] records it as a failed boot outcome (no crash, stack trace in the
+ *    log), and this test then FAILS FAST with the app log's error lines instead of
+ *    burning the whole deadline.
  *
  * Success additionally requires [NodeService.Snapshot.rpcServing]: ChainStack treats
  * the JSON-RPC bring-up as best-effort (an init failure there is swallowed with
@@ -51,9 +51,12 @@ import java.util.concurrent.TimeUnit
  *  - The boot is triggered by MainActivity's fresh-launch auto-start — the real
  *    cold-launch path. If that auto-start is ever gated (onboarding, a setting), this
  *    test must start the service itself instead of timing out.
- *  - Engine-agnostic, but under `-PskipRustEngine` (how CI runs it) the selector
- *    serves the Java engine — exactly the fallback an APK without the Rust jniLibs
- *    uses at runtime. The Rust engine's own load path is NOT covered here.
+ *  - Runs on the Rust engine. Below API 33 the app forces it with no Java fallback
+ *    (EngineGate: the Java engine's VarHandle users cannot link there), so on this
+ *    API-29 device it is the only engine that can boot, and a build without the Rust
+ *    jniLibs (`-PskipRustEngine`) fails this test by design. CI therefore builds WITH
+ *    the Rust engine, which also covers its on-device load path (JNA + the native
+ *    library) on minSdk ART. The Java engine's own boot is covered on API 33+ only.
  *  - Needs no peers and no internet: "started" means local binds and threads are up.
  */
 @RunWith(AndroidJUnit4::class)

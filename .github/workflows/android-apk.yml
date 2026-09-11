@@ -203,12 +203,13 @@ jobs:
   # NoClassDefFoundError/NoSuchMethodError fails here instead of on a user's
   # phone.
   #
-  # -PskipRustEngine: runs on the Java engine. The minSdk-linkage risk this job
-  # hunts lives entirely in the JVM code (the Rust .so has no JDK/ART surface),
-  # it spares this job the whole Android Rust toolchain, and it is exactly the
-  # fallback an APK without the jniLibs uses at runtime. Known gap, accepted:
-  # the Rust engine's own on-device load path (JNA/UniFFI) is not exercised by
-  # any boot test yet.
+  # Built WITH the Rust engine (no -PskipRustEngine): below API 33 the app runs
+  # the Rust engine only, with no Java fallback (EngineGate: the Java engine's
+  # VarHandle users cannot link on Android 10-12), so on this API-29 device it
+  # is the only engine that can boot. That also covers the Rust engine's
+  # on-device load path (JNA + UniFFI + libmyotis_engine.so) on minSdk ART,
+  # which no boot test exercised before. The Java engine's JVM code keeps the
+  # build job's static dex scan; its boot is no longer run on an emulator here.
   boot-smoke-api29:
     name: API-29 boot smoke (emulator)
     runs-on: ubuntu-latest
@@ -260,6 +261,23 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # The Rust engine, same toolchain as the build job: the app's preBuild runs
+      # cargoNdkAndroid for both APK ABIs (the device itself is x86_64).
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
       # AGP's managed-device setup downloads the emulator + the API-29 system
       # image (several hundred MB, a couple of minutes) into the runner's
       # preinstalled SDK by itself — no sdkmanager steps needed, licenses are
@@ -282,7 +300,7 @@ jobs:
         id: gmd
         continue-on-error: true
         run: |
-          ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine \
+          ./gradlew :android-app:api29DebugAndroidTest \
             -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect \
             --stacktrace
 

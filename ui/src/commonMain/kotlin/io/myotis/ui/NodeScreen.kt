@@ -560,28 +560,40 @@ private fun SettingsTab(
         )
 
         // Engine choice applies per network (re)start — running networks keep their engine.
-        SwitchRow(
-            label = "Prefer Java engine",
-            checked = preferJava,
-            onChange = { on ->
-                preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
-                onLogIndexChanged()
-            },
-        )
-        Text(
-            "Off (default): the Rust engine runs each network where it can serve, " +
-                "falling back to the Java engine otherwise. The Rust engine is the " +
-                "primary engine — the log index (Index tab) and Tor routing run on it " +
-                "only. On: force the original Java engine everywhere, giving up those " +
-                "features — currently the only way to use the Query tab's " +
-                "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                "network is (re)started, not to already-running networks. Note: " +
-                "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
-                "regardless of the idle-sleep setting (the Status screen's Sleep row " +
-                "says so per network).",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        // A host that cannot run the Java engine at all (Android below API 33) shows why
+        // instead of a toggle it would refuse to honour.
+        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
+        if (javaUnavailable != null) {
+            Text("Engine: Rust only")
+            Text(
+                javaUnavailable,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            SwitchRow(
+                label = "Prefer Java engine",
+                checked = preferJava,
+                onChange = { on ->
+                    preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
+                    onLogIndexChanged()
+                },
+            )
+            Text(
+                "Off (default): the Rust engine runs each network where it can serve, " +
+                    "falling back to the Java engine otherwise. The Rust engine is the " +
+                    "primary engine — the log index (Index tab) and Tor routing run on it " +
+                    "only. On: force the original Java engine everywhere, giving up those " +
+                    "features — currently the only way to use the Query tab's " +
+                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
+                    "network is (re)started, not to already-running networks. Note: " +
+                    "Rust-hosted networks do NOT idle-sleep yet — they stay always-on " +
+                    "regardless of the idle-sleep setting (the Status screen's Sleep row " +
+                    "says so per network).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         // Tor routing — shown only on hosts that can actually route over Tor
         // (controller.supportsTor; a privacy switch that flips ON while reads keep

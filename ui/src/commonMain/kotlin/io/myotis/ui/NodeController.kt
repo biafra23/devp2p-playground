@@ -253,6 +253,15 @@ interface Settings {
     fun setPreferJavaEngine(v: Boolean) {}
 
     /**
+     * Why this host cannot run the Java engine at all, or null when it can (the default,
+     * e.g. desktop). Non-null hides the "Prefer Java engine" toggle and shows this text in
+     * its place, so Settings never offers an engine the host would refuse to start. Android
+     * returns a reason below API 33, where the Java engine's EVM and discv5 fail to link and
+     * every network runs on the Rust engine with no Java fallback.
+     */
+    fun javaEngineUnavailableReason(): String? = null
+
+    /**
      * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
      * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
      * can't support it keep the default no-op getter/setter so Android/iOS still compile;

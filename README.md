@@ -816,7 +816,7 @@ Myotis ships **two engines** behind one contract: the original **Java engine** a
 - **The contract** is `:myotis-api` — zero-dependency Java-17 interfaces (`MyotisEngine`/`ChainHandle`, FFI-portable types only). Hosts (Android app, desktop app, daemon) consume *only* this API and never import engine internals.
 - **The Java engine** is the original implementation (`node-core` adapters over the `networking`/`consensus`/`myotis-evm` modules).
 - **The Rust engine** is the `rust/` Cargo workspace (`myotis-core`, `myotis-net`, `myotis-consensus`, `myotis-bls`, `myotis-evm`, `myotis-engine`): discv4 + discv5 discovery, RLPx/eth/snap, the beacon light client with BLS via blst, a revm-based EVM with the same snap-proof state oracle, ENS incl. CCIP-Read, and multichain (mainnet, Sepolia, Gnosis). It reaches the JVM through UniFFI-generated Kotlin bindings over JNA (the generated bindings are committed in `:myotis-engines`, regenerated via `uniffiGenerateKotlin`); compound values cross as JSON, pinned by golden tests on both sides. The same engine's plain C ABI also serves the two non-JVM hosts: the iOS app (Kotlin/Native cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — identical JSON shapes, pinned by the same golden tests.
-- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `auto` (default: the Rust engine where it can serve, Java fallback otherwise), `java`, or `rust` (hard — error when unavailable). On run tasks use `-Pengine=java` to opt out; in the apps it's the "Prefer Java engine" Settings toggle (applies on network restart). The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
+- **Selection**: the `:myotis-engines` selector (`Engines.engine()`) routes each network to an engine via the `myotis.engine` property — `auto` (default: the Rust engine where it can serve, Java fallback otherwise), `java`, or `rust` (hard — error when unavailable). On run tasks use `-Pengine=java` to opt out; in the apps it's the "Prefer Java engine" Settings toggle (applies on network restart). **Android below API 33 (Android 13) is Rust-only**: the Java engine's EVM (Besu's `UInt256`) and its discv5 (Guava futures) use `VarHandle` APIs that Android 10–12 keep hidden, so the app forces `rust` there with no Java fallback, and Settings explains this instead of offering the toggle. The Status screen shows which engine hosts each network — "Mainnet (r)" vs "(j)".
 - **Parity** is enforced by shared conformance vectors (BLS fixtures, a captured mainnet light-client corpus, the EL verification-ladder vectors) run against both implementations, plus a benchmark gate for the JNI path.
 
 **rustc/cargo are NOT required to build or run the JVM hosts (daemon + desktop).**
@@ -831,7 +831,7 @@ falls back to the Java engine — there is nothing to configure or disable. The
 `cargoNdkAndroid` and regenerates the bindings). There is no committed `.so`, so
 nothing can drift; a missing toolchain fails the build with a message pointing at
 `-PskipRustEngine`, which builds the app without the Rust engine (Java engine at
-runtime). The packaged **desktop installers** also need cargo
+runtime, so such a build can only start networks on Android 13 / API 33 and newer). The packaged **desktop installers** also need cargo
 (`packageDmg`/`packageDeb`/`runDistributable` fail loudly without it, so an
 installed app can always switch engines).
 Release artifacts don't rely on committed binaries — CI builds the Rust engine

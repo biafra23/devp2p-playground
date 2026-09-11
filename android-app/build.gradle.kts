@@ -166,11 +166,12 @@ android {
         // Gradle Managed Device pinned to minSdk (API 29) for NodeBootSmokeTest
         // (androidTest — its KDoc carries the full why: real-ART boot coverage the
         // static dex scan cannot give). Run it with
-        //   ./gradlew :android-app:api29DebugAndroidTest -PskipRustEngine
+        //   ./gradlew :android-app:api29DebugAndroidTest
         // (CI adds -Pandroid.testoptions.manageddevices.emulator.gpu=
         // swiftshader_indirect for its GPU-less runners — see
-        // .github/workflows/android-apk.yml; without -PskipRustEngine the device
-        // also gets the Rust engine, which the toolchain gate then requires).
+        // .github/workflows/android-apk.yml). It needs the Android Rust toolchain:
+        // below API 33 the app is Rust-engine-only (EngineGate), so a
+        // -PskipRustEngine build cannot boot a network on this device.
         // "aosp", not "aosp-atd": the leaner ATD images only exist for API 30+.
         // x86_64 hosts only — Google never published an API-29 arm64 emulator
         // image, so an Apple-Silicon Mac can't run this device locally; the CI

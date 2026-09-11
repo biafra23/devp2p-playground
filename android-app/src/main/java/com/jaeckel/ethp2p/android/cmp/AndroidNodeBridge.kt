@@ -332,6 +332,7 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
     override fun preferJavaEngine(): Boolean = NodeService.preferJavaEngine(ctx)
     override fun setPreferJavaEngine(v: Boolean) = NodeService.setPreferJavaEngine(ctx, v)
+    override fun javaEngineUnavailableReason(): String? = NodeService.javaEngineUnavailableReason()
 
     override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)
     override fun setIdlePauseMinutes(v: Int) = NodeService.setIdlePauseMinutes(ctx, v)
