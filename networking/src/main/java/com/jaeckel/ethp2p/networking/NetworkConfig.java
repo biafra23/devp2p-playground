@@ -260,8 +260,9 @@ public record NetworkConfig(
             // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
             // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
-            // 18.185.193.198 (TCP timeout for days) — that cost the Rust
-            // engine's bootstrap fan-out 82 rounds while a wallet sat in
+            // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
+            // switched off as well, cost the Rust engine's bootstrap fan-out
+            // 82 rounds on three unreachable pins while a wallet sat in
             // SYNCING. Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             prependLocal(

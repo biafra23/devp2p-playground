@@ -420,12 +420,12 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // FIRST on purpose: it exists because a general-purpose beacon node is
     // structurally bad at serving wallets — one connection semaphore shared
     // between inbound and outbound, and a trimmer that drops light clients
-    // first. Nimbus stays below it, so a roost fault degrades to exactly
-    // today's behaviour rather than to nothing.
+    // first. The census-verified public servers below it are the fallback,
+    // so a roost fault degrades to working peers rather than to nothing.
     //
     // Its peer id comes from /data/roost/sepolia.key and is stable across
-    // restarts by construction; unlike the Nimbus entry there is no flag to
-    // forget, because roost has no mode in which it mints a fresh one.
+    // restarts by construction — roost has no mode in which it mints a
+    // fresh one.
     //
     // The address is the netcup relay (see the ADDRESS note above); ENR
     // publication (design §7) is what removes the need to pin at all.
@@ -436,9 +436,9 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // for one period at a time — see agent_serves_one_period). They replace
     // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
     // libp2p handshake times out — the tunnel's far end is not answering) and
-    // 18.185.193.198 (TCP timeout for days). A dead pin is not free: the
-    // bootstrap fan-out spent 82 rounds on three unreachable peers while a
-    // wallet sat in SYNCING.
+    // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
+    // roost sepolia switched off as well, the bootstrap fan-out spent 82
+    // rounds on three unreachable pins while a wallet sat in SYNCING.
     "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
     "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
     "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
