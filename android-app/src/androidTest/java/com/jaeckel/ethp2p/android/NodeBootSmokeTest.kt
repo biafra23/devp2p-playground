@@ -56,7 +56,8 @@ import java.util.concurrent.TimeUnit
  *    API-29 device it is the only engine that can boot, and a build without the Rust
  *    jniLibs (`-PskipRustEngine`) fails this test by design. CI therefore builds WITH
  *    the Rust engine, which also covers its on-device load path (JNA + the native
- *    library) on minSdk ART. The Java engine's own boot is covered on API 33+ only.
+ *    library) on minSdk ART. The Java engine can only boot on API 33+, and no emulator
+ *    job runs its boot today; it is covered only by the build job's static dex scan.
  *  - Needs no peers and no internet: "started" means local binds and threads are up.
  */
 @RunWith(AndroidJUnit4::class)

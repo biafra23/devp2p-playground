@@ -215,6 +215,12 @@ jobs:
   # build job's static dex scan; its boot is no longer run on an emulator here.
   boot-smoke-api29:
     name: API-29 boot smoke (emulator)
+    # After the build job: this job builds the same Rust engine, and the build
+    # job saves the shared `android-rust` cache at its end, so this job always
+    # restores a warm dependency cache from the same run instead of racing it
+    # cold. It also spends no emulator time on a commit whose build is broken.
+    # The cost is wall-clock: it starts only once the build job finishes.
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -227,8 +233,8 @@ jobs:
     # below), which would otherwise run to GitHub's 6-hour default on a job
     # whose failure nothing surfaces.
     # 60, not 45: this job now also builds the Rust engine (host bindings +
-    # both Android ABIs), roughly 13 min on the shared warm cache and far more
-    # cold, on top of the emulator run.
+    # both Android ABIs), roughly 13 min on the warm cache `needs: build`
+    # guarantees, on top of the emulator run.
     timeout-minutes: 60
     # NON-BLOCKING for now, deliberately: this is the repo's first emulator job,
     # and hosted-runner emulators are notoriously flaky (boot hangs, adb drops)
@@ -278,8 +284,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          # The build job's cache (see there); read-only here so a flaky red
-          # emulator run can't churn the repo's cache quota.
+          # The build job's cache, saved by that job earlier in this same run
+          # (needs: build). Read-only here so a flaky red emulator run can't
+          # churn the repo's cache quota.
           shared-key: android-rust
           save-if: false
 
