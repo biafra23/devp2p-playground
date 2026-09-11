@@ -250,22 +250,26 @@ public record NetworkConfig(
             // silent regression on the DEFAULT engine, and the reason
             // lc-server-design rollout step 3 wants this settled.
             //
-            // The dedicated Nimbus follows it, so a roost OUTAGE degrades to
-            // exactly the previous behaviour rather than to nothing. That entry's
-            // peer-id is stable only because the node pins --netkey-file; Nimbus
-            // otherwise mints a new one per restart, which invalidates it with
-            // InvalidRemotePubKey (see the doc's §5 note). roost has no such
-            // mode — its identity is persisted by construction.
+            // The roost literal is the netcup relay (188.68.32.16, static VPS)
+            // in front of zbox, which lives behind mobile CGNAT — see the
+            // mainnet list above. ENR publication (lc-server-design §7) is what
+            // removes the need to pin at all.
             //
-            // Both literals are the netcup relay (188.68.32.16, static VPS) in
-            // front of zbox, which lives behind mobile CGNAT — see the mainnet
-            // list above. ENR publication (lc-server-design §7) is what removes
-            // the need to pin at all.
+            // The public servers after it are census-verified 2026-09-11: each
+            // answered light_client_bootstrap for the pinned root AND
+            // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
+            // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
+            // relay (9104: TCP accepts, the libp2p handshake times out) and
+            // 18.185.193.198 (TCP timeout for days) — that cost the Rust
+            // engine's bootstrap fan-out 82 rounds while a wallet sat in
+            // SYNCING. Keep this list identical to SEPOLIA_STATIC_PEERS in
+            // rust/myotis-net/src/sync.rs (both parity tests pin it).
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
                     List.of(
-                            "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                            "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS"
+                            "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+                            "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+                            "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"
                     )),
             null,
             1655733600L, // sepolia beacon genesis: 2022-06-20 14:00:00 UTC
