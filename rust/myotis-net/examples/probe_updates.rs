@@ -41,10 +41,7 @@ async fn main() {
     });
     let client = reqresp::start_host(Arc::clone(&local)).expect("host");
 
-    let mut ssz_request = Vec::with_capacity(16);
-    ssz_request.extend_from_slice(&from_period.to_le_bytes());
-    ssz_request.extend_from_slice(&span.to_le_bytes());
-    let wire = codec::encode_request(&ssz_request);
+    let wire = codec::encode_updates_by_range_request(from_period, span);
 
     for peer_str in &config.static_peers {
         // Split /p2p/<id> off the multiaddr (same as sync's parse_static_peer).
