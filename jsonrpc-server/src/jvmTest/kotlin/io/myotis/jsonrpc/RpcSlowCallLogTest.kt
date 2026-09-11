@@ -70,10 +70,12 @@ class RpcSlowCallLogTest {
         access.stop()
     }
 
-    private fun route(body: String) {
+    /** The stalled call sleeps 700 ms against a 100 ms threshold: the watchdog has
+     *  600 ms of margin to fire while the call is still stuck, even on a loaded CI box. */
+    private fun route(body: String, slowCallWarnMs: Long = 100) {
         runBlocking {
-            RpcRouter(null, MethodLogger(slowCallWarnMs = 100),
-                VerifiedReadsBackend(SlowBalanceBackend(balanceDelayMs = 400))).handle(body)
+            RpcRouter(null, MethodLogger(slowCallWarnMs = slowCallWarnMs),
+                VerifiedReadsBackend(SlowBalanceBackend(balanceDelayMs = 700))).handle(body)
         }
     }
 
@@ -94,7 +96,9 @@ class RpcSlowCallLogTest {
     }
 
     @Test fun fastCall_logsNothingOnTheSlowLogger() {
-        route("""{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}""")
+        // A generous threshold: the claim is "a call under it logs nothing", not a race
+        // between a 100 ms budget and a cold JVM's first call (class loading, Json init).
+        route("""{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}""", slowCallWarnMs = 10_000)
         assertTrue(slowLines().isEmpty(), slowLines().toString())
     }
 

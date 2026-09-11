@@ -251,10 +251,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /**
      * Wake-and-wait shared by every verified read / operator query below: a query
      * on a paused stack triggers the (single-flight) resume and waits up to the cap
-     * for readiness. A RUNNING-but-cold stack proceeds at the deadline — the native
-     * query produces its own precise bounded errors. Only PAUSED-at-deadline
-     * (resume kept failing) throws; a STOPPED stack falls through to the native's
-     * "handle not started"/"unknown handle" error (mirrors JavaChainHandle.awaitWake).
+     * for readiness, as does one arriving during a start/resume warm-up. A RUNNING
+     * stack that isn't ready proceeds — at once outside a warm-up (#312), at the
+     * deadline inside one — and the native query produces its own precise bounded
+     * errors. Only PAUSED-at-deadline (resume kept failing) throws; a STOPPED stack
+     * falls through to the native's "handle not started"/"unknown handle" error
+     * (mirrors JavaChainHandle.awaitWake).
      */
     private void awaitWake() {
         // Fast-fail the unrecoverable-while-RUNNING state (the twin of
@@ -293,8 +295,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * The wake-on-request choke point every verified read crosses before its JNI
      * call (the Rust-engine twin of ChainStack.awaitReadyForReads + the
      * begin/endRequest in-flight guard): stamps activity, wakes a paused stack,
-     * holds bounded until reads are answerable, and marks the request in flight so
-     * the host idle timer can't pause the stack mid-query.
+     * holds (bounded) while the stack is waking — paused, or in a start/resume
+     * warm-up — and marks the request in flight so the host idle timer can't pause
+     * the stack mid-query.
      */
     private <T> T gated(java.util.function.Supplier<T> nativeCall) {
         awaitWake();
@@ -1115,15 +1118,15 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     public String logIndexStatusJson() {
         // NOT gated(): this is a STATUS PROBE the hosts poll every ~2s for the UI
         // snapshot (Android AndroidNodeBridge.snapshots, desktop DesktopNode). The
-        // gated() wake-and-hold waits up to WAKE_WAIT_CAP_MS for readyForReads() —
-        // which a booting, catching-up, or STALE_ANCHOR-parked chain never
-        // satisfies — so gating here stalled every snapshot emission ~90s per
-        // unready chain and froze the whole UI at its previous state (chains
-        // rendered "stopped" while running; the stale-anchor consent appeared to
-        // do nothing). It also stamped activity + woke paused stacks on every
-        // poll, fighting the idle-pause controller. The native answers with
-        // {"error":...} on its own when the gate is down — exactly the not-ready
-        // shape this method documents — so no readiness hold is needed.
+        // gated() wake-and-hold waits up to WAKE_WAIT_CAP_MS for readyForReads() on
+        // a waking chain — a booting one's whole warm-up (and, before #312, ANY
+        // unready chain: catching-up, STALE_ANCHOR-parked) — so gating here stalled
+        // snapshot emissions ~90s per such chain and froze the whole UI at its
+        // previous state (chains rendered "stopped" while running; the stale-anchor
+        // consent appeared to do nothing). It also stamped activity + woke paused
+        // stacks on every poll, fighting the idle-pause controller. The native
+        // answers with {"error":...} on its own when the gate is down — exactly the
+        // not-ready shape this method documents — so no readiness hold is needed.
         return RustEngineNative.nativeLogIndexStatusJson(handle);
     }
 

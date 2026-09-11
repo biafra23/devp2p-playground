@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,8 +30,12 @@ class WakeGateTest {
     /** A gate over the real clock, without a not-ready detail. */
     private static WakeGate gate(AtomicReference<LifecycleState> phase, BooleanSupplier ready,
                                  Runnable resume) {
-        return new WakeGate(phase::get, ready, null, resume, System::currentTimeMillis, POLL_MS,
-                "test");
+        return gate(phase::get, ready, resume);
+    }
+
+    private static WakeGate gate(Supplier<LifecycleState> phase, BooleanSupplier ready,
+                                 Runnable resume) {
+        return new WakeGate(phase, ready, null, resume, System::currentTimeMillis, POLL_MS, "test");
     }
 
     private static long msSince(long t0Nanos) {
@@ -52,7 +57,10 @@ class WakeGateTest {
         AtomicInteger resumeRuns = new AtomicInteger();
         CountDownLatch resumeEntered = new CountDownLatch(1);
         CountDownLatch releaseResume = new CountDownLatch(1);
+        AtomicReference<WakeGate> self = new AtomicReference<>();
 
+        // The production order: warm-up opened before RUNNING is published, then a cold
+        // stretch before the stack is ready — so a waiter released early would be caught.
         WakeGate gate = gate(phase, ready::get, () -> {
             resumeRuns.incrementAndGet();
             resumeEntered.countDown();
@@ -61,16 +69,21 @@ class WakeGateTest {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            self.get().beginWarmup(10_000);
             phase.set(LifecycleState.RUNNING);
+            sleep(POLL_MS * 10); // RUNNING but cold
             ready.set(true);
         });
+        self.set(gate);
 
         int waiters = 8;
         CountDownLatch done = new CountDownLatch(waiters);
-        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger answeredReady = new AtomicInteger();
         for (int i = 0; i < waiters; i++) {
             Thread t = new Thread(() -> {
-                if (gate.await(10_000)) successes.incrementAndGet();
+                // Read readiness the instant the hold ends: a waiter let go before the
+                // stack was ready must not count.
+                if (gate.await(10_000) && ready.get()) answeredReady.incrementAndGet();
                 done.countDown();
             });
             t.setDaemon(true);
@@ -84,7 +97,7 @@ class WakeGateTest {
 
         assertTrue(done.await(10, TimeUnit.SECONDS));
         assertEquals(1, resumeRuns.get(), "N concurrent waiters must produce exactly one resume");
-        assertEquals(waiters, successes.get(), "all held requests answer after the wake");
+        assertEquals(waiters, answeredReady.get(), "every held request is released only once ready");
     }
 
     @Test
@@ -147,11 +160,35 @@ class WakeGateTest {
     }
 
     @Test
+    void aPauseRacingTheReadinessCheckStillWakesTheStack() {
+        // The first phase read sees RUNNING, then a pause lands before the readiness
+        // check (which therefore fails). That must be handled as the pause it is — wake
+        // the stack and hold — not waved through as a running stack short of readiness.
+        AtomicReference<LifecycleState> phase = new AtomicReference<>(LifecycleState.PAUSED);
+        AtomicBoolean firstRead = new AtomicBoolean(true);
+        AtomicBoolean ready = new AtomicBoolean(false);
+        AtomicInteger resumeRuns = new AtomicInteger();
+        AtomicReference<WakeGate> self = new AtomicReference<>();
+        WakeGate gate = gate(() -> firstRead.getAndSet(false) ? LifecycleState.RUNNING : phase.get(),
+                ready::get, () -> {
+                    resumeRuns.incrementAndGet();
+                    self.get().beginWarmup(10_000);
+                    phase.set(LifecycleState.RUNNING);
+                    ready.set(true);
+                });
+        self.set(gate);
+
+        assertTrue(gate.await(10_000));
+        assertEquals(1, resumeRuns.get(), "the racing pause triggered the wake");
+        assertTrue(ready.get(), "released once the woken stack was ready");
+    }
+
+    @Test
     void aWarmupHoldsARunningStackUntilItIsReady() {
         AtomicReference<LifecycleState> phase = new AtomicReference<>(LifecycleState.RUNNING);
         AtomicBoolean ready = new AtomicBoolean(false);
         WakeGate gate = gate(phase, ready::get, () -> { });
-        gate.beginWarmup(60_000);
+        gate.beginWarmup(10_000);
 
         Thread warmer = new Thread(() -> {
             sleep(200);
@@ -160,7 +197,7 @@ class WakeGateTest {
         warmer.setDaemon(true);
         long t0 = System.nanoTime();
         warmer.start();
-        assertTrue(gate.await(60_000));
+        assertTrue(gate.await(10_000));
         assertTrue(msSince(t0) >= 150, "held through the warm-up until ready: " + msSince(t0));
     }
 
@@ -183,13 +220,33 @@ class WakeGateTest {
         AtomicReference<LifecycleState> phase = new AtomicReference<>(LifecycleState.RUNNING);
         AtomicBoolean ready = new AtomicBoolean(true);
         WakeGate gate = gate(phase, ready::get, () -> { });
-        gate.beginWarmup(60_000);
-        assertTrue(gate.await(60_000));
+        gate.beginWarmup(10_000);
+        assertTrue(gate.await(10_000));
 
         ready.set(false);
         long t0 = System.nanoTime();
-        assertTrue(gate.await(60_000));
+        assertTrue(gate.await(10_000));
         assertTrue(msSince(t0) < 5_000, "no hold once the node has warmed up");
+    }
+
+    @Test
+    void aWarmupNobodyWaitedOnStillEndsAtReadiness() {
+        // The stack gets ready with no request around to see it, then loses readiness later
+        // in the window. That later read must not be held: the window closed at the first
+        // readiness, observed by a request or not — otherwise the #312 freeze comes back,
+        // bounded by the window instead of the cap.
+        AtomicReference<LifecycleState> phase = new AtomicReference<>(LifecycleState.RUNNING);
+        AtomicBoolean ready = new AtomicBoolean(true);
+        WakeGate gate = gate(phase, ready::get, () -> { });
+        gate.beginWarmup(10_000);
+        long give = System.nanoTime() + 5_000_000_000L;
+        while (gate.warmingUp() && System.nanoTime() - give < 0) sleep(POLL_MS);
+        assertFalse(gate.warmingUp(), "the watcher closed the window at readiness");
+
+        ready.set(false);
+        long t0 = System.nanoTime();
+        assertTrue(gate.await(10_000));
+        assertTrue(msSince(t0) < 5_000, "a later readiness loss is not held");
     }
 
     @Test
@@ -202,7 +259,7 @@ class WakeGateTest {
         AtomicBoolean ready = new AtomicBoolean(false);
         AtomicReference<WakeGate> self = new AtomicReference<>();
         WakeGate gate = gate(phase, ready::get, () -> {
-            self.get().beginWarmup(60_000);
+            self.get().beginWarmup(10_000);
             phase.set(LifecycleState.RUNNING);
             sleep(200); // RUNNING but cold
             ready.set(true);
@@ -210,7 +267,7 @@ class WakeGateTest {
         self.set(gate);
 
         long t0 = System.nanoTime();
-        assertTrue(gate.await(60_000));
+        assertTrue(gate.await(10_000));
         assertTrue(ready.get(), "released only once the woken stack was ready");
         assertTrue(msSince(t0) >= 150, "held through the cold start: " + msSince(t0) + " ms");
     }
@@ -219,7 +276,7 @@ class WakeGateTest {
     void runningButStillWarmingAtTheCapReturnsTrue() {
         AtomicReference<LifecycleState> phase = new AtomicReference<>(LifecycleState.RUNNING);
         WakeGate gate = gate(phase, () -> false, () -> { });
-        gate.beginWarmup(60_000);
+        gate.beginWarmup(2_000);
 
         // Warming but never ready: at the cap the request is handed to the backend
         // anyway (it produces its own precise bounded errors).
@@ -234,7 +291,7 @@ class WakeGateTest {
         WakeGate gate = new WakeGate(phase::get, () -> false,
                 () -> { throw new IllegalStateException("status unreadable"); },
                 () -> { }, System::currentTimeMillis, POLL_MS, "test");
-        gate.beginWarmup(60_000);
+        gate.beginWarmup(5_000);
 
         long t0 = System.nanoTime();
         assertTrue(gate.await(WakeGate.SLOW_HOLD_WARN_MS + 300));

@@ -20,17 +20,18 @@ import java.util.function.Supplier;
  * <p><b>Only a WAKING stack holds requests.</b> A request is parked while the
  * stack is {@code PAUSED} (the wake is in flight), or {@code RUNNING} but not
  * yet ready inside a <em>warm-up window</em> — opened by every (re)entry into
- * {@code RUNNING} ({@link #beginWarmup}) and closed by the first poll that finds
- * the stack ready, or when the window elapses. That is the climb the hold exists
- * for: a start or a wake re-anchoring the light client and re-dialing snap peers,
- * seconds away from answering. A {@code RUNNING} stack outside a warm-up is never
- * held, ready or not: a node that WAS serving and then lost readiness (the light
- * client catching up a sync-committee period, the snap pool momentarily empty)
- * hands the request straight to the backend, which answers or fails with its own
- * precise, bounded error. Holding those parked every verified read —
- * {@code eth_blockNumber} included — on one shared readiness predicate for the
- * full cap and released them all at the same instant: wallets with a 10 s timeout
- * reported the node offline for minutes while every request eventually
+ * {@code RUNNING} ({@link #beginWarmup}) and closed as soon as the stack is first
+ * ready (a watcher polls through the warm-up, so that doesn't depend on a request
+ * being there to see it), or when the window elapses. That is the climb the hold
+ * exists for: a start or a wake re-anchoring the light client and re-dialing snap
+ * peers, seconds away from answering. A {@code RUNNING} stack outside a warm-up
+ * is never held, ready or not: a node that WAS serving and then lost readiness
+ * (the light client catching up a sync-committee period, the snap pool
+ * momentarily empty) hands the request straight to the backend, which answers or
+ * fails with its own precise, bounded error. Holding those parked every verified
+ * read — {@code eth_blockNumber} included — on one shared readiness predicate for
+ * the full cap and released them all at the same instant: wallets with a 10 s
+ * timeout reported the node offline for minutes while every request eventually
  * "succeeded" (#312).
  *
  * <p>Extracted from {@code ChainStack} so the wait/single-flight behavior is
@@ -63,9 +64,10 @@ public final class WakeGate {
     private final AtomicLong lastActivityMs = new AtomicLong(0);
 
     /** The open warm-up window, or null. A holder object rather than a bare
-     *  deadline: a poll that finds the stack ready closes exactly the window it
-     *  read (CAS) — never a newer one a racing resume opened — and no nanoTime
-     *  value has to double as a "none" sentinel (any long is a valid reading). */
+     *  deadline: closing it is a CAS on the exact window read, so neither a ready
+     *  poll nor a finishing watcher can close a newer window a racing resume
+     *  opened — and no nanoTime value has to double as a "none" sentinel (any
+     *  long is a valid reading). */
     private final AtomicReference<Warmup> warmup = new AtomicReference<>();
 
     private record Warmup(long deadlineNanos) {}
@@ -104,7 +106,42 @@ public final class WakeGate {
      * stack with no warm-up and be released into a cold backend.
      */
     public void beginWarmup(long windowMs) {
-        warmup.set(new Warmup(System.nanoTime() + windowMs * 1_000_000L));
+        Warmup w = new Warmup(System.nanoTime() + windowMs * 1_000_000L);
+        warmup.set(w);
+        // End the window the moment the stack is first ready, whether or not a request is
+        // there to see it: a window no poll saw complete would stay open, and a readiness
+        // blip later in it (a snap-pool reshuffle after a resume) would park every read until
+        // it ran out — the #312 freeze again, bounded by the window instead of the cap.
+        Thread t = new Thread(() -> watchWarmup(w), "wake-warmup-" + name);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Poll through one warm-up window and close it at the stack's first readiness, when
+     *  it stops, or when the window runs out; exits early once a newer window replaces it. */
+    private void watchWarmup(Warmup w) {
+        while (warmup.get() == w && System.nanoTime() - w.deadlineNanos() < 0) {
+            try {
+                LifecycleState p = phase.get();
+                if (p == LifecycleState.STOPPED) break; // nothing holds; a later start reopens
+                if (p == LifecycleState.RUNNING && ready.getAsBoolean()) break;
+            } catch (RuntimeException e) {
+                // An unreadable status is "not ready yet" — never a dead watcher.
+            }
+            try {
+                Thread.sleep(pollMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        warmup.compareAndSet(w, null); // a no-op once superseded
+    }
+
+    /** Whether a warm-up window is open right now (test seam). */
+    boolean warmingUp() {
+        Warmup w = warmup.get();
+        return w != null && System.nanoTime() - w.deadlineNanos() < 0;
     }
 
     /**
@@ -143,6 +180,10 @@ public final class WakeGate {
                 }
                 if (w == null || System.nanoTime() - w.deadlineNanos() >= 0) {
                     if (w != null) warmup.compareAndSet(w, null);
+                    // A pause (or stop) that landed between the phase read and the
+                    // readiness check is handled as one — re-poll, which wakes a PAUSED
+                    // stack — not waved through as a running stack short of readiness.
+                    if (phase.get() != LifecycleState.RUNNING) continue;
                     // Not waking: a running stack that lost readiness (or whose warm-up
                     // ran out). Hand the request to the backend now instead of parking it
                     // on a predicate that can stay false for minutes (#312).

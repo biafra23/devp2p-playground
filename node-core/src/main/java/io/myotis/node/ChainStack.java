@@ -521,14 +521,16 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /**
      * The wake-on-request choke point every verified read goes through: notes
      * host-visible activity, triggers a single-flight async {@link #resume()}
-     * when paused, and blocks until reads are answerable or {@code capMs}
-     * elapses.
+     * when paused, and — only while the stack is waking (paused, or inside the
+     * warm-up window a start/resume opens) — blocks until reads are answerable or
+     * {@code capMs} elapses. A RUNNING stack outside a warm-up returns at once,
+     * ready or not (#312).
      *
      * @return the live backend to query, or {@code null} when no verified answer
      *         is possible (stack stopped, RPC never started / failed to bind, or
-     *         still paused at the deadline). A stack that is RUNNING but still cold
-     *         at the deadline returns the backend anyway — it produces its own
-     *         precise bounded errors.
+     *         still paused at the deadline). A RUNNING stack that isn't ready —
+     *         outside a warm-up, or still warming at the deadline — returns the
+     *         backend anyway: it produces its own precise bounded errors.
      */
     public io.myotis.rpc.VerifiedRpcBackend awaitReadyForReads(long capMs) {
         // RUNNING with no backend means the JSON-RPC bind failed at start (the failure
