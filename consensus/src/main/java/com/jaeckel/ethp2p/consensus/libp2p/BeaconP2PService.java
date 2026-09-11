@@ -198,6 +198,14 @@ public class BeaconP2PService implements AutoCloseable {
     private io.libp2p.pubsub.gossip.Gossip gossip;
 
     /**
+     * The gossip router's event/heartbeat executor. Owned here because
+     * jvm-libp2p's default {@code GossipRouterBuilder} creates one per router
+     * and exposes no shutdown, and this service is restarted in place on every
+     * pause/resume — an unowned executor would strand one thread per cycle.
+     */
+    private java.util.concurrent.ScheduledExecutorService gossipExecutor;
+
+    /**
      * Whether to also SUBSCRIBE to the light-client gossip topics. Off by
      * default — see the {@link #gossip} field doc. No host enables it yet; it
      * stays as the hook for the live-finality plan (plan-gossipsub-subscription.md).
@@ -275,7 +283,15 @@ public class BeaconP2PService implements AutoCloseable {
                 .listen("/ip4/0.0.0.0/tcp/0") // ephemeral port; some peers reject dial-only hosts
                 // Ethereum CL spec requires secp256k1 identity keys
                 .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1));
-        gossip = new io.libp2p.pubsub.gossip.Gossip();
+        gossipExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "beacon-gossip-router");
+            t.setDaemon(true);
+            return t;
+        });
+        io.libp2p.pubsub.gossip.builders.GossipRouterBuilder routerBuilder =
+                new io.libp2p.pubsub.gossip.builders.GossipRouterBuilder();
+        routerBuilder.setScheduledAsyncExecutor(gossipExecutor);
+        gossip = new io.libp2p.pubsub.gossip.Gossip(routerBuilder.build());
         hostBuilder.protocol(gossip);
         host = hostBuilder.build();
 
@@ -447,6 +463,12 @@ public class BeaconP2PService implements AutoCloseable {
             keepaliveExecutor.shutdownNow();
             keepaliveExecutor = null;
         }
+        if (gossipExecutor != null) {
+            gossipExecutor.shutdownNow();
+            gossipExecutor = null;
+        }
+        gossip = null;
+        subscribedGossipTopics.clear();
         Host h = host;
         // Null the reference so a close→start cycle (BeaconLightClient pause/resume)
         // gets a fresh host, double-close is a no-op, and doReqResp/getConnectedPeers

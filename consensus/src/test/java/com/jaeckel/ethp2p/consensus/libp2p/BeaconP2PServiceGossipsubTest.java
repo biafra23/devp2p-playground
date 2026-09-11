@@ -30,6 +30,26 @@ class BeaconP2PServiceGossipsubTest {
     }
 
     @Test
+    void restartCyclesLeaveNoGossipRouterThreadBehind() throws Exception {
+        BeaconP2PService svc = new BeaconP2PService(null);
+        for (int i = 0; i < 3; i++) {
+            svc.start();
+            assertTrue(gossipRouterThreads() >= 1, "router executor thread should exist while started");
+            svc.close();
+        }
+        // shutdownNow() interrupts the idle worker; give it a moment to exit.
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (gossipRouterThreads() > 0 && System.currentTimeMillis() < deadline) Thread.sleep(50);
+        assertEquals(0, gossipRouterThreads(), "every close() must stop its gossip router executor");
+    }
+
+    private static long gossipRouterThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.isAlive() && t.getName().startsWith("beacon-gossip-router"))
+                .count();
+    }
+
+    @Test
     void everyHostNegotiatesMeshsubWithoutJoiningTopics() throws Exception {
         BeaconP2PService target = new BeaconP2PService(null);
         BeaconP2PService observer = new BeaconP2PService(null);
