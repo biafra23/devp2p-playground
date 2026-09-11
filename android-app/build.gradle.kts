@@ -408,7 +408,8 @@ dependencies {
 // the toolchain present, cargoNdkAndroid cross-compiles the jniLibs and
 // uniffiGenerateKotlin refreshes the committed bindings from the same source;
 // without it, the build fails and names `-PskipRustEngine` (which omits the
-// engine and falls back to the Java engine at runtime). verifyAndroidJniLibs is
+// engine; the app then runs the Java engine, on API 33+ only — EngineGate).
+// verifyAndroidJniLibs is
 // the post-build backstop that the produced .so exports every UniFFI symbol the
 // (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
 // PURPOSE — the JVM hosts must stay buildable without cargo (see
@@ -527,8 +528,8 @@ val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") 
         val missing = shippedAbis.filterNot { it in got }
         check(missing.isEmpty()) {
             "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
-                "would ship libmyotis_engine.so with no JNA dispatcher and silently fall " +
-                "back to the Java engine at runtime."
+                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
+                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
         }
     }
 }

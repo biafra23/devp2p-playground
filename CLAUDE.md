@@ -54,7 +54,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
 # lack the toolchain — the build tells you about the switch — with:
-./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS)
+./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS); boots on API 33+ only
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
 # workspace's rust-toolchain.toml selects — i.e.

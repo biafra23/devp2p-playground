@@ -74,6 +74,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # Shared with boot-smoke-api29 (same toolchain, same preBuild chain);
+          # only this job saves it, so the smoke job adds no second cache.
+          shared-key: android-rust
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2
@@ -223,7 +226,10 @@ jobs:
     # download, AVD creation, or an emulator/adb hang (the failure modes named
     # below), which would otherwise run to GitHub's 6-hour default on a job
     # whose failure nothing surfaces.
-    timeout-minutes: 45
+    # 60, not 45: this job now also builds the Rust engine (host bindings +
+    # both Android ABIs), roughly 13 min on the shared warm cache and far more
+    # cold, on top of the emulator run.
+    timeout-minutes: 60
     # NON-BLOCKING for now, deliberately: this is the repo's first emulator job,
     # and hosted-runner emulators are notoriously flaky (boot hangs, adb drops)
     # even with KVM. Job-level continue-on-error semantics: a failure still
@@ -272,6 +278,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # The build job's cache (see there); read-only here so a flaky red
+          # emulator run can't churn the repo's cache quota.
+          shared-key: android-rust
+          save-if: false
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@v2

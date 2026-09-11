@@ -651,7 +651,8 @@ tasks.register("requireAndroidRustEngine") {
     doLast {
         if (skipRustEngine) {
             logger.lifecycle("[rust] -PskipRustEngine set — building :android-app WITHOUT the " +
-                "Rust engine; it will use the Java engine (and JVM BLS) at runtime.")
+                "Rust engine; it will use the Java engine (and JVM BLS) at runtime, which boots only " +
+                "on Android 13 (API 33) and newer — below that the app is Rust-engine-only.")
             return@doLast
         }
         if (!androidRustToolchainReady) {
@@ -668,7 +669,7 @@ tasks.register("requireAndroidRustEngine") {
                     "incomplete — missing: ${missing.joinToString("; ")}.\n" +
                     "  • Install it (one-time setup is documented in rust/build-android.sh), OR\n" +
                     "  • Build WITHOUT the Rust engine: add -PskipRustEngine (the app will use the " +
-                    "Java engine at runtime).",
+                    "Java engine at runtime, which boots only on Android 13 / API 33 and newer).",
             )
         }
     }
@@ -818,7 +819,7 @@ gradle.taskGraph.whenReady {
     } else if (allTasks.any { it.name == "cargoNdkAndroid" } && skipRustEngine) {
         // Missing-toolchain (without the flag) is handled loudly at execution by
         // requireAndroidRustEngine; here we only note the deliberate opt-out.
-        logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime)")
+        logger.lifecycle("[rust] -PskipRustEngine set — the Android app will omit the Rust engine (Java engine at runtime; boots on API 33+ only)")
     } else if (allTasks.any { it.name == "cargoCheckWasm" } &&
         (!wasmTargetInstalled || !clangAvailable)
     ) {

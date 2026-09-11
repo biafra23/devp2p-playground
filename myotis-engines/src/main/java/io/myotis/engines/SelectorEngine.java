@@ -133,6 +133,18 @@ public final class SelectorEngine implements MyotisEngine {
                 target = java;
             }
         }
+        if (target != java) {
+            // Explicit rust (auto has returned or switched to java above): never a
+            // fallback, and a failure must still arrive as the EngineException this
+            // class promises, not as a raw LinkageError that takes the host process down.
+            // Android below API 33 runs on this path by default (no Java engine there).
+            try {
+                return createOn(target, canonical, config, ports);
+            } catch (LinkageError e) {
+                throw new EngineException("Rust engine create(" + config.networkName()
+                        + ") failed to link: " + e, e);
+            }
+        }
         return createOn(target, canonical, config, ports);
     }
 
