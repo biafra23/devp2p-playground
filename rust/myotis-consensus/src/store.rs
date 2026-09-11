@@ -197,10 +197,10 @@ impl LightClientProcessor {
     }
 
     pub fn process_update(&mut self, update: &LightClientUpdate) -> bool {
-        let Some(committee) = self.store.current_sync_committee() else {
+        if self.store.current_sync_committee().is_none() {
             tracing::debug!("update rejected: store has no current sync committee");
             return false;
-        };
+        }
 
         // Applicability gate BEFORE the expensive BLS verify (per spec
         // validate_light_client_update; mirrors the Java gate exactly).
@@ -214,7 +214,7 @@ impl LightClientProcessor {
         // next-committee updates before rotation and accepted a
         // current-committee signature whose unsigned signature_slot had been
         // relabelled into the next period (#423).
-        let Some(committee) = self.committee_for(sig_period, store_period, committee) else {
+        let Some(committee) = self.committee_for(sig_period) else {
             tracing::debug!(store_period, sig_period,
                 have_next = self.store.next_sync_committee().is_some(),
                 signature_slot = update.signature_slot,
@@ -291,18 +291,14 @@ impl LightClientProcessor {
         true
     }
 
-    /// The committee that signs `sig_period`, given the store at `store_period`
-    /// with `current` as its current committee: `current` for the store's own
-    /// period, the held next committee for the one after, `None` otherwise
-    /// (spec validate_light_client_update's applicability + key selection).
-    fn committee_for<'a>(
-        &'a self,
-        sig_period: u64,
-        store_period: u64,
-        current: &'a SyncCommittee,
-    ) -> Option<&'a SyncCommittee> {
+    /// The committee that signs `sig_period`: the store's current committee
+    /// for its own period, the held next committee for the period after,
+    /// `None` otherwise (spec validate_light_client_update's applicability +
+    /// key selection in one place).
+    fn committee_for(&self, sig_period: u64) -> Option<&SyncCommittee> {
+        let store_period = self.store.current_period();
         if sig_period == store_period {
-            Some(current)
+            self.store.current_sync_committee()
         } else if sig_period == store_period + 1 {
             self.store.next_sync_committee()
         } else {
@@ -311,16 +307,17 @@ impl LightClientProcessor {
     }
 
     pub fn process_finality_update(&mut self, update: &LightClientFinalityUpdate) -> bool {
-        let Some(committee) = self.store.current_sync_committee() else {
+        if self.store.current_sync_committee().is_none() {
             return false;
-        };
+        }
         // Same period rule as process_update. This path had no gate at all and
-        // always used the current keys, so at every period boundary — store at
-        // P holding next, wall in P+1 — every P+1-signed finality update was
-        // rejected until a catch-up round happened to force-rotate.
+        // always used the current keys, so with the store at P holding next
+        // and a P+1-signed finality update in hand — the hunt path while
+        // catch-up is starved, or a local clock lagging the chain — the update
+        // was rejected until a catch-up round happened to force-rotate.
         let store_period = self.store.current_period();
         let sig_period = self.store.period_of(update.signature_slot);
-        let Some(committee) = self.committee_for(sig_period, store_period, committee) else {
+        let Some(committee) = self.committee_for(sig_period) else {
             tracing::debug!(store_period, sig_period,
                 signature_slot = update.signature_slot,
                 "finality update rejected: not applicable to the store's period");
@@ -335,6 +332,7 @@ impl LightClientProcessor {
             &self.genesis_validators_root,
         ) {
             tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
+                attested_slot = update.attested_header.beacon.slot,
                 "finality update rejected: sync-aggregate BLS verification failed");
             return false;
         }

@@ -58,6 +58,9 @@ fn next_period_finality_update_is_accepted_before_rotation() {
     assert_eq!(spec::compute_sync_committee_period(fin.signature_slot), 1778);
     assert!(p.process_finality_update(&fin), "signed by the held next committee");
     assert_eq!(p.store.finalized_slot(), fin.finalized_header.beacon.slot);
+    // Its finalized slot is the first of period 1778, so the store rotated on apply.
+    assert_eq!(p.store.current_period(), 1778);
+    assert!(p.store.next_sync_committee().is_none());
 }
 
 #[test]

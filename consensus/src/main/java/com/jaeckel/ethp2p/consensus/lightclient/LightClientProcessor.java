@@ -40,6 +40,18 @@ public class LightClientProcessor {
     }
 
     /**
+     * The committee that signs {@code sigPeriod}: the store's current committee for its own
+     * period, the held next committee for the period after, {@code null} otherwise (spec
+     * validate_light_client_update's applicability + key selection in one place).
+     */
+    private SyncCommittee committeeFor(long sigPeriod) {
+        long storePeriod = store.getCurrentSyncCommitteePeriod();
+        if (sigPeriod == storePeriod) return store.getCurrentSyncCommittee();
+        if (sigPeriod == storePeriod + 1) return store.getNextSyncCommittee();
+        return null;
+    }
+
+    /**
      * Process a {@link LightClientFinalityUpdate}.
      *
      * <ol>
@@ -52,18 +64,6 @@ public class LightClientProcessor {
      * @param update the finality update to process
      * @return true if the update was successfully applied
      */
-    /**
-     * The committee that signs {@code sigPeriod}, given the store at {@code storePeriod}
-     * with {@code current} as its current committee: {@code current} for the store's own
-     * period, the held next committee for the one after, {@code null} otherwise (spec
-     * validate_light_client_update's applicability + key selection).
-     */
-    private SyncCommittee committeeFor(long sigPeriod, long storePeriod, SyncCommittee current) {
-        if (sigPeriod == storePeriod) return current;
-        if (sigPeriod == storePeriod + 1) return store.getNextSyncCommittee();
-        return null;
-    }
-
     public boolean processFinalityUpdate(LightClientFinalityUpdate update) {
         SyncCommittee committee = store.getCurrentSyncCommittee();
         if (committee == null) {
@@ -89,12 +89,13 @@ public class LightClientProcessor {
                 participation, update.finalityBranch().length);
 
         // Same period rule as processUpdate. This path had no gate at all and always
-        // used the current keys, so at every period boundary — store at P holding
-        // next, wall in P+1 — every P+1-signed finality update was rejected until a
+        // used the current keys, so with the store at P holding next and a P+1-signed
+        // finality update in hand (a local clock lagging the chain; the Rust engine's
+        // hunt path while catch-up is starved) the update was rejected until a
         // catch-up round happened to force-rotate.
         long storePeriod = store.getCurrentSyncCommitteePeriod();
         long sigPeriod = BeaconChainSpec.computeSyncCommitteePeriod(update.signatureSlot());
-        committee = committeeFor(sigPeriod, storePeriod, committee);
+        committee = committeeFor(sigPeriod);
         if (committee == null) {
             log.debug("[lc-processor] Finality update rejected: signaturePeriod={} not applicable to "
                     + "storePeriod={} (attestedSlot={})", sigPeriod, storePeriod, attestedSlot);
@@ -205,7 +206,7 @@ public class LightClientProcessor {
         // current keys rejected genuine next-committee updates before rotation and
         // accepted a current-committee signature whose unsigned signatureSlot had
         // been relabelled into the next period (#423).
-        committee = committeeFor(sigPeriod, storePeriod, committee);
+        committee = committeeFor(sigPeriod);
         if (committee == null) {
             log.debug("[lc-processor] Update skipped pre-verify: signaturePeriod={} not applicable to "
                             + "storePeriod={} (haveNext={}, attestedSlot={})",

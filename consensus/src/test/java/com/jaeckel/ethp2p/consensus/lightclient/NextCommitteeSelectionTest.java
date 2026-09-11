@@ -2,6 +2,7 @@ package com.jaeckel.ethp2p.consensus.lightclient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -131,6 +132,17 @@ class NextCommitteeSelectionTest {
         LightClientFinalityUpdate fin = finalityOf(second, second.signatureSlot());
         assertTrue(f.processor().processFinalityUpdate(fin), "signed by the held next committee");
         assertEquals(second.finalizedHeader().beacon().slot(), f.store().getFinalizedSlot());
+        // Its finalized slot is the first of period 1778, so the store rotated on apply.
+        assertEquals(1778, f.store().getCurrentSyncCommitteePeriod());
+        assertNull(f.store().getNextSyncCommittee());
+    }
+
+    @Test
+    void currentPeriodFinalityUpdateStillVerifies() throws IOException {
+        Fixture f = withNext();
+        LightClientUpdate first = LightClientUpdate.decode(corpus("001-update.ssz"));
+        assertEquals(1777, BeaconChainSpec.computeSyncCommitteePeriod(first.signatureSlot()));
+        assertTrue(f.processor().processFinalityUpdate(finalityOf(first, first.signatureSlot())));
     }
 
     @Test
