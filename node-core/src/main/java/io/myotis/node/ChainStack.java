@@ -975,7 +975,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         }
         BeaconLightClient blc = new BeaconLightClient(
                 clPeers, network.checkpointRoot(), network.checkpointSlot(),
-                network.currentForkVersion(), network.genesisValidatorsRoot(),
+                network.forkSchedule(), network.genesisValidatorsRoot(),
                 beaconSyncState, network.beaconApiUrl(),
                 clPeerCache::add, clPeerCache::markFailure, network.clGenesisTime());
         blc.setBlobParameters(network.activeBlobParamsEpoch(), network.activeBlobParamsMaxBlobs());

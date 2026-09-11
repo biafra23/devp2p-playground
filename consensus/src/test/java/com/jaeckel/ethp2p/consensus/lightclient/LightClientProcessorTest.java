@@ -4,6 +4,7 @@ import com.jaeckel.ethp2p.consensus.TestUtil;
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
 import com.jaeckel.ethp2p.consensus.types.*;
 import com.jaeckel.ethp2p.consensus.bls.BlsVerifier;
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import org.apache.milagro.amcl.BLS381.BIG;
 import org.apache.milagro.amcl.BLS381.ECP;
 import org.junit.jupiter.api.BeforeAll;
@@ -48,7 +49,7 @@ class LightClientProcessorTest {
         // Initialize with a header at slot 100
         BeaconBlockHeader initBeacon = new BeaconBlockHeader(100L, 0L, new byte[32], new byte[32], new byte[32]);
         store.initialize(TestUtil.dummyLightClientHeader(initBeacon), syncCommittee);
-        processor = new LightClientProcessor(store, FORK_VERSION, GVR);
+        processor = new LightClientProcessor(store, ForkSchedule.single(FORK_VERSION), GVR);
     }
 
     @Test
@@ -172,11 +173,60 @@ class LightClientProcessorTest {
         assertEquals(100L, store.getFinalizedSlot());
     }
 
+    // ---- #295: the signing domain follows the fork active at signature_slot ----
+
+    private static final byte[] OLD_FORK = {0x05, 0x00, 0x00, 0x00};
+    private static final byte[] NEW_FORK = {0x06, 0x00, 0x00, 0x00};
+    /** Boundary epoch 10 = slot 320 on the mainnet preset. */
+    private static final long BOUNDARY_EPOCH = 10;
+    private static final long BOUNDARY_SLOT = BOUNDARY_EPOCH * 32;
+
+    private static ForkSchedule boundarySchedule() {
+        return ForkSchedule.of(32,
+                new ForkSchedule.Fork(0, OLD_FORK),
+                new ForkSchedule.Fork(BOUNDARY_EPOCH, NEW_FORK));
+    }
+
+    /** Rust twin: tests/fork_boundary.rs. */
+    @Test
+    void verifiesAcrossForkBoundary() {
+        LightClientProcessor p = new LightClientProcessor(store, boundarySchedule(), GVR);
+        // signatureSlot 320: the spec verifies epoch(319) = 9 -> still OLD.
+        assertTrue(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
+        assertEquals(200L, store.getFinalizedSlot());
+        // signatureSlot 321: epoch(320) = 10 -> NEW.
+        assertTrue(p.processFinalityUpdate(buildFinalityUpdate(300L, BOUNDARY_SLOT + 1, 512, NEW_FORK)));
+        assertEquals(300L, store.getFinalizedSlot());
+    }
+
+    @Test
+    void rejectsUpdateSignedUnderTheOtherSidesFork() {
+        LightClientProcessor p = new LightClientProcessor(store, boundarySchedule(), GVR);
+        // NEW at the last OLD slot, OLD at the first NEW slot: both must fail.
+        assertFalse(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, NEW_FORK)));
+        assertFalse(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT + 1, 512, OLD_FORK)));
+        assertEquals(100L, store.getFinalizedSlot(), "nothing applied");
+    }
+
+    /** The pre-#295 behaviour, pinned as a regression: one fixed version cannot cross. */
+    @Test
+    void singleVersionScheduleStallsAtTheBoundary() {
+        LightClientProcessor oldOnly = new LightClientProcessor(store, ForkSchedule.single(OLD_FORK), GVR);
+        assertTrue(oldOnly.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
+        assertFalse(oldOnly.processFinalityUpdate(buildFinalityUpdate(300L, BOUNDARY_SLOT + 1, 512, NEW_FORK)));
+
+        LightClientStore fresh = new LightClientStore();
+        fresh.initialize(TestUtil.dummyLightClientHeader(
+                new BeaconBlockHeader(100L, 0L, new byte[32], new byte[32], new byte[32])), syncCommittee);
+        LightClientProcessor newOnly = new LightClientProcessor(fresh, ForkSchedule.single(NEW_FORK), GVR);
+        assertFalse(newOnly.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
+    }
+
     @Test
     void rejectsNullCommittee() {
         // Fresh store without initialization
         LightClientStore emptyStore = new LightClientStore();
-        LightClientProcessor emptyProcessor = new LightClientProcessor(emptyStore, FORK_VERSION, GVR);
+        LightClientProcessor emptyProcessor = new LightClientProcessor(emptyStore, ForkSchedule.single(FORK_VERSION), GVR);
 
         LightClientFinalityUpdate update = buildValidFinalityUpdate(700L, 701L);
         assertFalse(emptyProcessor.processFinalityUpdate(update));
@@ -205,7 +255,7 @@ class LightClientProcessorTest {
         LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
                 signatureSlot, 0L, new byte[32], attestedStateRoot);
 
-        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), 512);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), 512, FORK_VERSION);
 
         // Build a next sync committee with corrupt branch
         byte[][] corruptCommitteeBranch = new byte[5][32];
@@ -262,6 +312,11 @@ class LightClientProcessorTest {
 
     private LightClientFinalityUpdate buildFinalityUpdateWithParticipation(
             long finalizedSlot, long signatureSlot, int participantCount) {
+        return buildFinalityUpdate(finalizedSlot, signatureSlot, participantCount, FORK_VERSION);
+    }
+
+    private LightClientFinalityUpdate buildFinalityUpdate(
+            long finalizedSlot, long signatureSlot, int participantCount, byte[] forkVersion) {
         // Build finalized header (execution payload genuinely committed to its body root)
         LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
                 finalizedSlot, 0L, new byte[32], new byte[32]);
@@ -282,14 +337,15 @@ class LightClientProcessorTest {
         LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
                 signatureSlot, 0L, new byte[32], attestedStateRoot);
 
-        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), participantCount);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), participantCount, forkVersion);
 
         return new LightClientFinalityUpdate(
                 attestedHeader, finalizedHeader, finalityBranch, agg, signatureSlot);
     }
 
-    private SyncAggregate buildSyncAggregate(BeaconBlockHeader attestedBeacon, int participantCount) {
-        byte[] domain = ForkData.computeDomain(BeaconChainSpec.DOMAIN_SYNC_COMMITTEE, FORK_VERSION, GVR);
+    private SyncAggregate buildSyncAggregate(BeaconBlockHeader attestedBeacon, int participantCount,
+                                             byte[] forkVersion) {
+        byte[] domain = ForkData.computeDomain(BeaconChainSpec.DOMAIN_SYNC_COMMITTEE, forkVersion, GVR);
         byte[] signingRoot = SszUtil.hashTreeRootContainer(attestedBeacon.hashTreeRoot(), domain);
 
         List<byte[]> sigs = new ArrayList<>();

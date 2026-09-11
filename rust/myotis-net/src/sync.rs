@@ -19,6 +19,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, watch};
 
+use myotis_consensus::fork::ForkSchedule;
 use myotis_consensus::spec;
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{LightClientBootstrap, LightClientFinalityUpdate, LightClientUpdate};
@@ -64,11 +65,22 @@ pub struct ChainConfig {
     /// The EL chain id (EIP-155) — threaded into the EVM reads (eth_call /
     /// estimateGas / ENS) so nothing downstream hardcodes a network.
     pub chain_id: u64,
-    pub fork_version: [u8; 4],
-    /// Prior fork version, accepted as a discv5 fork-digest fallback (the Java
-    /// `NetworkConfig.acceptedForkDigests`). None for mainnet (on Fulu; stale
-    /// digests wouldn't help us sync).
-    pub prior_fork_version: Option<[u8; 4]>,
+    /// The chain's full fork schedule — `(activation epoch, fork version)`,
+    /// ascending, genesis first. Every sync-committee signature is verified
+    /// under the version active at its `signature_slot`, so the store can walk
+    /// updates across a fork boundary (#295); the newest entry also feeds the
+    /// fork digest. Append-only, consensus-critical, same trust standing as
+    /// `genesis_validators_root`: pinned from the network's published config
+    /// (`/eth/v1/config/fork_schedule`), never fetched at runtime. Keep in
+    /// lockstep with the Java `NetworkConfig.forkSchedule` — both sides pin
+    /// the same lists in their config tests.
+    pub fork_schedule: ForkSchedule,
+    /// Whether the PRIOR fork's digest is accepted as a discv5 fork-digest
+    /// fallback next to the current one (the Java
+    /// `NetworkConfig.acceptedForkDigests`). Off for mainnet and sepolia (stale
+    /// digests wouldn't help us sync); on for gnosis. A policy knob, not a
+    /// fork version — the version itself comes from the schedule.
+    pub accept_prior_fork_digest: bool,
     pub genesis_validators_root: [u8; 32],
     /// Beacon chain genesis time (seconds since epoch) for wall-clock slot estimates.
     pub genesis_time: u64,
@@ -182,9 +194,18 @@ impl ChainConfig {
         Self {
             name: "mainnet",
             chain_id: 1,
-            // Fulu, activated at slot 13164544 (2025-12-03).
-            fork_version: [0x06, 0x00, 0x00, 0x00],
-            prior_fork_version: None,
+            // consensus-specs configs/mainnet.yaml *_FORK_EPOCH / *_FORK_VERSION.
+            // Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
+            fork_schedule: ForkSchedule::new(32, &[
+                (0, [0x00, 0x00, 0x00, 0x00]),       // phase0 (genesis)
+                (74_240, [0x01, 0x00, 0x00, 0x00]),  // altair
+                (144_896, [0x02, 0x00, 0x00, 0x00]), // bellatrix
+                (194_048, [0x03, 0x00, 0x00, 0x00]), // capella
+                (269_568, [0x04, 0x00, 0x00, 0x00]), // deneb
+                (364_032, [0x05, 0x00, 0x00, 0x00]), // electra
+                (411_392, [0x06, 0x00, 0x00, 0x00]), // fulu
+            ]),
+            accept_prior_fork_digest: false,
             genesis_validators_root: hex32(
                 "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
             ),
@@ -223,11 +244,20 @@ impl ChainConfig {
         Self {
             name: "sepolia",
             chain_id: 11_155_111,
-            // Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14).
-            fork_version: [0x90, 0x00, 0x00, 0x75],
+            // eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH / *_FORK_VERSION.
+            // Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            fork_schedule: ForkSchedule::new(32, &[
+                (0, [0x90, 0x00, 0x00, 0x69]),       // phase0 (genesis)
+                (50, [0x90, 0x00, 0x00, 0x70]),      // altair
+                (100, [0x90, 0x00, 0x00, 0x71]),     // bellatrix
+                (56_832, [0x90, 0x00, 0x00, 0x72]),  // capella
+                (132_608, [0x90, 0x00, 0x00, 0x73]), // deneb
+                (222_464, [0x90, 0x00, 0x00, 0x74]), // electra
+                (272_640, [0x90, 0x00, 0x00, 0x75]), // fulu
+            ]),
             // No prior-fork fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
-            prior_fork_version: None,
+            accept_prior_fork_digest: false,
             genesis_validators_root: hex32(
                 "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
             ),
@@ -273,10 +303,20 @@ impl ChainConfig {
         Self {
             name: "gnosis",
             chain_id: 100,
-            // Fulu on Gnosis (0x06000064), active since 2026-04-14.
-            fork_version: [0x06, 0x00, 0x00, 0x64],
-            // Electra — accepted as a discv5 fork-digest fallback.
-            prior_fork_version: Some([0x05, 0x00, 0x00, 0x64]),
+            // gnosischain/configs mainnet/config.yaml *_FORK_EPOCH / *_FORK_VERSION
+            // (16-slot epochs). Fulu (0x06000064) active since epoch 1714688
+            // (2026-04-14); Electra's epoch is also the blob_params_epoch below.
+            fork_schedule: ForkSchedule::new(16, &[
+                (0, [0x00, 0x00, 0x00, 0x64]),         // phase0 (genesis)
+                (512, [0x01, 0x00, 0x00, 0x64]),       // altair
+                (385_536, [0x02, 0x00, 0x00, 0x64]),   // bellatrix
+                (648_704, [0x03, 0x00, 0x00, 0x64]),   // capella
+                (889_856, [0x04, 0x00, 0x00, 0x64]),   // deneb
+                (1_337_856, [0x05, 0x00, 0x00, 0x64]), // electra
+                (1_714_688, [0x06, 0x00, 0x00, 0x64]), // fulu
+            ]),
+            // Electra's digest is accepted as a discv5 fork-digest fallback.
+            accept_prior_fork_digest: true,
             genesis_validators_root: hex32(
                 "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47",
             ),
@@ -344,15 +384,32 @@ impl ChainConfig {
     /// the prior fork's when configured (`NetworkConfig.acceptedForkDigests`).
     pub fn accepted_fork_digests(&self) -> Vec<[u8; 4]> {
         let mut out = vec![self.current_fork_digest()];
-        if let Some(prior) = self.prior_fork_version {
+        if let Some(prior) = self.prior_fork_version() {
             out.push(fork_digest(prior, self.genesis_validators_root));
         }
         out
     }
 
+    /// The newest scheduled fork's version — the digest input (discv5 filter,
+    /// Status). NOT a signing-domain input: verification reads the schedule
+    /// per update (`ForkSchedule::version_for_signature_slot`).
+    pub fn current_fork_version(&self) -> [u8; 4] {
+        self.fork_schedule.current()
+    }
+
+    /// The prior fork's version when its digest is accepted
+    /// (`accept_prior_fork_digest`), else `None`.
+    pub fn prior_fork_version(&self) -> Option<[u8; 4]> {
+        if self.accept_prior_fork_digest {
+            self.fork_schedule.prior()
+        } else {
+            None
+        }
+    }
+
     pub fn current_fork_digest(&self) -> [u8; 4] {
         fork_digest_bpo(
-            self.fork_version,
+            self.current_fork_version(),
             self.genesis_validators_root,
             self.blob_params_epoch,
             self.blob_params_max_blobs,
@@ -1410,7 +1467,7 @@ async fn run_sync(
 
     let mut processor = LightClientProcessor::new(
         LightClientStore::new(config.slots_per_period()),
-        config.fork_version,
+        config.fork_schedule.clone(),
         config.genesis_validators_root,
     );
 
@@ -3196,7 +3253,27 @@ mod tests {
     #[test]
     fn mainnet_config_matches_networkconfig_java() {
         let c = ChainConfig::mainnet();
-        assert_eq!(c.fork_version, [6, 0, 0, 0]);
+        assert_eq!(c.current_fork_version(), [6, 0, 0, 0]);
+        assert_eq!(c.prior_fork_version(), None); // fallback digest off
+        // The FULL schedule (consensus-specs configs/mainnet.yaml) — the Java
+        // twin (NetworkConfigForkScheduleTest) pins the same list.
+        assert_eq!(c.fork_schedule.slots_per_epoch(), 32);
+        assert_eq!(
+            c.fork_schedule.forks(),
+            &[
+                (0, [0x00, 0x00, 0x00, 0x00]),
+                (74_240, [0x01, 0x00, 0x00, 0x00]),
+                (144_896, [0x02, 0x00, 0x00, 0x00]),
+                (194_048, [0x03, 0x00, 0x00, 0x00]),
+                (269_568, [0x04, 0x00, 0x00, 0x00]),
+                (364_032, [0x05, 0x00, 0x00, 0x00]),
+                (411_392, [0x06, 0x00, 0x00, 0x00]),
+            ]
+        );
+        // Fulu's first slot (13164544) still verifies under Electra; the next
+        // slot switches — the spec's max(signature_slot,1)-1.
+        assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
+        assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 15_185_856);
         assert_eq!(
@@ -3264,7 +3341,22 @@ mod tests {
     fn sepolia_config_matches_networkconfig_java() {
         let c = ChainConfig::sepolia();
         assert_eq!(c.chain_id, 11_155_111);
-        assert_eq!(c.fork_version, [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        assert_eq!(c.current_fork_version(), [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
+        assert_eq!(c.prior_fork_version(), None); // fallback digest off
+        // eth-clients/sepolia metadata/config.yaml — Java twin pins the same.
+        assert_eq!(c.fork_schedule.slots_per_epoch(), 32);
+        assert_eq!(
+            c.fork_schedule.forks(),
+            &[
+                (0, [0x90, 0x00, 0x00, 0x69]),
+                (50, [0x90, 0x00, 0x00, 0x70]),
+                (100, [0x90, 0x00, 0x00, 0x71]),
+                (56_832, [0x90, 0x00, 0x00, 0x72]),
+                (132_608, [0x90, 0x00, 0x00, 0x73]),
+                (222_464, [0x90, 0x00, 0x00, 0x74]),
+                (272_640, [0x90, 0x00, 0x00, 0x75]),
+            ]
+        );
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 11_110_080);
         assert_eq!(
@@ -3333,8 +3425,26 @@ mod tests {
     fn gnosis_config_matches_networkconfig_java() {
         let c = ChainConfig::gnosis();
         assert_eq!(c.chain_id, 100);
-        assert_eq!(c.fork_version, [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
-        assert_eq!(c.prior_fork_version, Some([0x05, 0x00, 0x00, 0x64])); // Electra
+        assert_eq!(c.current_fork_version(), [0x06, 0x00, 0x00, 0x64]); // Fulu on Gnosis
+        assert_eq!(c.prior_fork_version(), Some([0x05, 0x00, 0x00, 0x64])); // Electra
+        // gnosischain/configs mainnet/config.yaml — Java twin pins the same.
+        // 16-slot epochs: the schedule carries its own geometry.
+        assert_eq!(c.fork_schedule.slots_per_epoch(), 16);
+        assert_eq!(
+            c.fork_schedule.forks(),
+            &[
+                (0, [0x00, 0x00, 0x00, 0x64]),
+                (512, [0x01, 0x00, 0x00, 0x64]),
+                (385_536, [0x02, 0x00, 0x00, 0x64]),
+                (648_704, [0x03, 0x00, 0x00, 0x64]),
+                (889_856, [0x04, 0x00, 0x00, 0x64]),
+                (1_337_856, [0x05, 0x00, 0x00, 0x64]),
+                (1_714_688, [0x06, 0x00, 0x00, 0x64]),
+            ]
+        );
+        // Fulu epoch 1714688 x 16 = slot 27435008: first slot still Electra.
+        assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_008), [0x05, 0, 0, 0x64]);
+        assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_009), [0x06, 0, 0, 0x64]);
         // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
         assert_eq!(c.checkpoint_slot, 30_012_384);
         assert_eq!(
@@ -3961,7 +4071,7 @@ mod tests {
         let expected_period = store.current_period();
         let mut processor = LightClientProcessor::new(
             store,
-            crate::sync::ChainConfig::mainnet().fork_version,
+            crate::sync::ChainConfig::mainnet().fork_schedule,
             crate::sync::ChainConfig::mainnet().genesis_validators_root,
         );
 

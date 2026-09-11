@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.consensus.libp2p.BeaconP2PService;
 import com.jaeckel.ethp2p.consensus.lightclient.BeaconChainSpec;
 import com.jaeckel.ethp2p.consensus.lightclient.LightClientProcessor;
@@ -77,7 +78,7 @@ public class BeaconLightClient implements AutoCloseable {
     private final String beaconApiUrl;            // nullable; HTTP API for peer discovery
     private final byte[] checkpointRoot;      // 32-byte trusted checkpoint block root
     private final long checkpointSlot;        // slot of trusted checkpoint (for pre-bootstrap Status)
-    private final byte[] forkVersion;         // 4-byte fork version
+    private final ForkSchedule forkSchedule;  // per-slot signing-domain selector (#295); its newest entry feeds Status
     /**
      * Active BPO parameters per EIP-7892: {@code (epoch, max_blobs_per_block)}.
      * Folded into {@link #computeForkDigest(byte[])} via the XOR-mix-in
@@ -701,18 +702,18 @@ public class BeaconLightClient implements AutoCloseable {
      *
      * @param clPeerMultiaddrs       list of multiaddr strings for Consensus Layer peers
      * @param checkpointRoot         32-byte trusted checkpoint block root (weak subjectivity)
-     * @param forkVersion            4-byte current fork version
+     * @param forkSchedule           the chain's fork schedule (see {@link ForkSchedule})
      * @param genesisValidatorsRoot  32-byte genesis validators root
      * @param syncState              shared state holder updated as finality advances
      * @param beaconApiUrl           nullable HTTP API URL for local beacon node peer discovery
      */
     public BeaconLightClient(List<String> clPeerMultiaddrs,
                               byte[] checkpointRoot,
-                              byte[] forkVersion,
+                              ForkSchedule forkSchedule,
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl) {
-        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+        this(clPeerMultiaddrs, checkpointRoot, forkSchedule, genesisValidatorsRoot,
                 syncState, beaconApiUrl, null, null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -721,7 +722,7 @@ public class BeaconLightClient implements AutoCloseable {
      *
      * @param clPeerMultiaddrs       list of multiaddr strings for Consensus Layer peers
      * @param checkpointRoot         32-byte trusted checkpoint block root (weak subjectivity)
-     * @param forkVersion            4-byte current fork version
+     * @param forkSchedule           the chain's fork schedule (see {@link ForkSchedule})
      * @param genesisValidatorsRoot  32-byte genesis validators root
      * @param syncState              shared state holder updated as finality advances
      * @param beaconApiUrl           nullable HTTP API URL for local beacon node peer discovery
@@ -729,12 +730,12 @@ public class BeaconLightClient implements AutoCloseable {
      */
     public BeaconLightClient(List<String> clPeerMultiaddrs,
                               byte[] checkpointRoot,
-                              byte[] forkVersion,
+                              ForkSchedule forkSchedule,
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess) {
-        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+        this(clPeerMultiaddrs, checkpointRoot, forkSchedule, genesisValidatorsRoot,
                 syncState, beaconApiUrl, onPeerSuccess, null, BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
 
@@ -747,13 +748,13 @@ public class BeaconLightClient implements AutoCloseable {
      */
     public BeaconLightClient(List<String> clPeerMultiaddrs,
                               byte[] checkpointRoot,
-                              byte[] forkVersion,
+                              ForkSchedule forkSchedule,
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess,
                               java.util.function.Consumer<String> onPeerFailure) {
-        this(clPeerMultiaddrs, checkpointRoot, forkVersion, genesisValidatorsRoot,
+        this(clPeerMultiaddrs, checkpointRoot, forkSchedule, genesisValidatorsRoot,
                 syncState, beaconApiUrl, onPeerSuccess, onPeerFailure,
                 BeaconChainSpec.MAINNET_GENESIS_TIME);
     }
@@ -768,14 +769,14 @@ public class BeaconLightClient implements AutoCloseable {
      */
     public BeaconLightClient(List<String> clPeerMultiaddrs,
                               byte[] checkpointRoot,
-                              byte[] forkVersion,
+                              ForkSchedule forkSchedule,
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl,
                               java.util.function.Consumer<String> onPeerSuccess,
                               java.util.function.Consumer<String> onPeerFailure,
                               long clGenesisTime) {
-        this(clPeerMultiaddrs, checkpointRoot, 0L, forkVersion, genesisValidatorsRoot,
+        this(clPeerMultiaddrs, checkpointRoot, 0L, forkSchedule, genesisValidatorsRoot,
                 syncState, beaconApiUrl, onPeerSuccess, onPeerFailure, clGenesisTime);
     }
 
@@ -791,7 +792,7 @@ public class BeaconLightClient implements AutoCloseable {
     public BeaconLightClient(List<String> clPeerMultiaddrs,
                               byte[] checkpointRoot,
                               long checkpointSlot,
-                              byte[] forkVersion,
+                              ForkSchedule forkSchedule,
                               byte[] genesisValidatorsRoot,
                               BeaconSyncState syncState,
                               String beaconApiUrl,
@@ -801,8 +802,8 @@ public class BeaconLightClient implements AutoCloseable {
         if (checkpointRoot == null || checkpointRoot.length != 32) {
             throw new IllegalArgumentException("checkpointRoot must be 32 bytes");
         }
-        if (forkVersion == null || forkVersion.length != 4) {
-            throw new IllegalArgumentException("forkVersion must be 4 bytes");
+        if (forkSchedule == null) {
+            throw new IllegalArgumentException("forkSchedule must be set");
         }
         if (genesisValidatorsRoot == null || genesisValidatorsRoot.length != 32) {
             throw new IllegalArgumentException("genesisValidatorsRoot must be 32 bytes");
@@ -812,7 +813,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.beaconApiUrl = beaconApiUrl;
         this.checkpointRoot = checkpointRoot.clone();
         this.checkpointSlot = checkpointSlot;
-        this.forkVersion = forkVersion.clone();
+        this.forkSchedule = forkSchedule;
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
         this.clGenesisTime = clGenesisTime;
         this.syncState = syncState;
@@ -820,7 +821,7 @@ public class BeaconLightClient implements AutoCloseable {
         this.onPeerFailure = onPeerFailure;
 
         this.store = new LightClientStore();
-        this.processor = new LightClientProcessor(store, this.forkVersion, genesisValidatorsRoot);
+        this.processor = new LightClientProcessor(store, this.forkSchedule, genesisValidatorsRoot);
         // Supply the local Status on demand so BeaconP2PService can serve
         // inbound /status/{1,2} streams opened by peers — modern CL clients
         // drop us if we don't respond within RESP_TIMEOUT (~5 s).
@@ -874,7 +875,7 @@ public class BeaconLightClient implements AutoCloseable {
         if (running) {
             throw new IllegalStateException("BeaconLightClient is already running");
         }
-        log.info("[beacon] Starting with forkVersion={}", bytesToHex(forkVersion));
+        log.info("[beacon] Starting with forkSchedule={}", forkSchedule);
         p2pService.start();
         running = true;
         syncThread = new Thread(this::syncLoop, "beacon-sync");
@@ -1287,7 +1288,7 @@ public class BeaconLightClient implements AutoCloseable {
      * {@code fork_digest}.
      */
     private StatusMessage buildLocalStatus() {
-        return buildLocalStatusFor(forkVersion);
+        return buildLocalStatusFor(forkSchedule.current());
     }
 
     /**
@@ -1499,9 +1500,9 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** Fork versions to try for Status. Currently just the one we're configured for. */
+    /** Fork versions to try for Status. Currently just the schedule's newest. */
     private java.util.List<byte[]> acceptedForkVersions() {
-        return java.util.List.of(forkVersion);
+        return java.util.List.of(forkSchedule.current());
     }
 
     /**
