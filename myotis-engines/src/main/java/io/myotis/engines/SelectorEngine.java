@@ -105,6 +105,22 @@ public final class SelectorEngine implements MyotisEngine {
         // deciding fallback behavior must not turn an in-flight auto-create into a hard
         // failure (or vice versa).
         String choice = Engines.choice();
+        if (!"rust".equals(choice)) return createFor(choice, config, ports);
+        // Explicit rust: never a fallback, and every failure must arrive as the
+        // EngineException this class promises. Resolving the engine, canonicalizing the
+        // name and creating the network all cross the native boundary, so a LinkageError
+        // from any of them is wrapped here instead of taking the host process down.
+        // Android below API 33 runs on this path by default (no Java engine there).
+        try {
+            return createFor(choice, config, ports);
+        } catch (LinkageError e) {
+            throw new EngineException("Rust engine failed to link while creating "
+                    + config.networkName() + ": " + e, e);
+        }
+    }
+
+    /** The create path for one already-read {@code choice}; runs under {@link #create}'s lock. */
+    private ChainHandle createFor(String choice, EngineConfig config, EnginePorts ports) {
         MyotisEngine target = resolveFor(choice);
         // Cross-engine duplicate guard, BEFORE any create attempt: each engine
         // self-checks only its OWN registry, so without this a choice flip between two
@@ -131,18 +147,6 @@ public final class SelectorEngine implements MyotisEngine {
                 log.warn("[engines] auto: Rust engine create({}) failed ({}); "
                         + "falling back to the Java engine", config.networkName(), e.getMessage());
                 target = java;
-            }
-        }
-        if (target != java) {
-            // Explicit rust (auto has returned or switched to java above): never a
-            // fallback, and a failure must still arrive as the EngineException this
-            // class promises, not as a raw LinkageError that takes the host process down.
-            // Android below API 33 runs on this path by default (no Java engine there).
-            try {
-                return createOn(target, canonical, config, ports);
-            } catch (LinkageError e) {
-                throw new EngineException("Rust engine create(" + config.networkName()
-                        + ") failed to link: " + e, e);
             }
         }
         return createOn(target, canonical, config, ports);
