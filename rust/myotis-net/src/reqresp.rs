@@ -1903,6 +1903,62 @@ mod dial_resolution_tests {
         std::sync::Mutex::new(HashMap::new())
     }
 
+    /// The Lighthouse-ban regression: a peer that has subscriptions to announce
+    /// (Lighthouse always does) opens a `/meshsub/` stream toward us right after
+    /// the connection is established. If our swarm cannot negotiate it, that
+    /// peer's gossipsub emits `GossipsubNotSupported` — which Lighthouse turns
+    /// into `PeerAction::Fatal` and a 12 h ban. Here peer A plays Lighthouse
+    /// (subscribed), peer B is our wallet host (no subscriptions), and the
+    /// negotiation must complete with B recorded as a gossipsub peer.
+    #[tokio::test]
+    async fn meshsub_negotiates_without_any_subscription() {
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm a");
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm b");
+        b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
+                break address;
+            }
+        };
+        a.behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub::IdentTopic::new(
+                "/eth2/00000000/light_client_finality_update/ssz_snappy",
+            ))
+            .unwrap();
+        a.dial(addr).unwrap();
+        let b_id = *b.local_peer_id();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = a.select_next_some() => {
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                        gossipsub::Event::GossipsubNotSupported { peer_id },
+                    )) = &ev
+                    {
+                        panic!("peer {peer_id} failed /meshsub/ negotiation — this is the Lighthouse ban");
+                    }
+                    // `peer_protocol` starts every peer as Floodsub and moves it to a
+                    // Gossipsub* kind once the stream negotiated (or NotSupported).
+                    if let Some((_, kind)) =
+                        a.behaviour().gossipsub.peer_protocol().find(|(p, _)| **p == b_id)
+                    {
+                        let kind = format!("{kind:?}");
+                        assert_ne!(kind, "NotSupported");
+                        if kind.starts_with("Gossipsub") {
+                            return;
+                        }
+                    }
+                }
+                _ = b.select_next_some() => {}
+                _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_plain_ip_address_passes_through_untouched() {
         let a: Multiaddr = "/ip4/87.154.209.161/tcp/9105/p2p/\

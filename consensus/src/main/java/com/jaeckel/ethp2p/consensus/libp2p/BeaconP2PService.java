@@ -31,6 +31,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -209,6 +210,9 @@ public class BeaconP2PService implements AutoCloseable {
      */
     private boolean gossipTopicSubscriptionEnabled = false;
 
+    /** Topics {@link #subscribeLightClientGossipTopics()} joined; empty unless the topic switch is on. */
+    private final Set<String> subscribedGossipTopics = ConcurrentHashMap.newKeySet();
+
     /** Toggle topic subscription (requires gossipsub). Must be called before {@link #start()}. */
     public void setGossipTopicSubscriptionEnabled(boolean enabled) {
         if (host != null) {
@@ -273,13 +277,14 @@ public class BeaconP2PService implements AutoCloseable {
      * Start the underlying libp2p host and register light client protocol handlers.
      */
     public void start() {
-        // Observation-only gossipsub: installed so we appear as a mesh-
-        // capable peer in Identify, subscribe to light-client topics and
-        // log messages without propagating them. PR 1 of the gossipsub
-        // rollout plan (see plan-gossipsub-subscription.md).
-        //
-        // Gated off by default — mesh participation is net-negative for
-        // short-session clients (see commit message / gossipsub plan).
+        if (gossipTopicSubscriptionEnabled && !gossipsubEnabled) {
+            throw new IllegalStateException(
+                    "gossip topic subscription requires gossipsub (setGossipsubEnabled(true))");
+        }
+        // Gossipsub is registered so the /meshsub/ protocol negotiates (see the
+        // `gossip` field doc: Lighthouse fatally bans peers that lack it). Topic
+        // subscription is a separate switch, off by default — PR 1 of the
+        // gossipsub rollout plan (plan-gossipsub-subscription.md) is on hold.
         HostBuilder hostBuilder = new HostBuilder()
                 .transport(TcpTransport::new)
                 .secureChannel((key, muxers) -> new NoiseXXSecureChannel(key, muxers))
@@ -426,6 +431,8 @@ public class BeaconP2PService implements AutoCloseable {
                     msg -> handleGossipMessage(optimisticTopic, msg);
             gossip.subscribe(finalityFn, new io.libp2p.core.pubsub.Topic(finalityTopic));
             gossip.subscribe(optimisticFn, new io.libp2p.core.pubsub.Topic(optimisticTopic));
+            subscribedGossipTopics.add(finalityTopic);
+            subscribedGossipTopics.add(optimisticTopic);
             log.info("[beacon-p2p] gossipsub subscribed (observation-only) to: {} and {}",
                     finalityTopic, optimisticTopic);
         } catch (Exception e) {
@@ -764,6 +771,59 @@ public class BeaconP2PService implements AutoCloseable {
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /**
+     * Diagnostic: open one stream to a peer negotiating exactly {@code protocolId}.
+     * Completes with the negotiated id, or fails when the peer does not speak it —
+     * the same multistream-select outcome a remote Lighthouse gets when it opens
+     * its {@code /meshsub/} stream toward us.
+     */
+    public CompletableFuture<String> probeProtocol(String peerMultiaddr, String protocolId) {
+        Host h = host;
+        if (h == null) return Futures.failedFuture(new IllegalStateException("not started"));
+        Multiaddr peerAddr;
+        PeerId peerId;
+        try {
+            peerAddr = new Multiaddr(peerMultiaddr);
+            peerId = peerAddr.getPeerId();
+        } catch (Exception e) {
+            return Futures.failedFuture(e);
+        }
+        if (peerId == null) return Futures.failedFuture(new IllegalArgumentException("no peer id"));
+        ProtocolBinding<String> probe = new ProtocolBinding<>() {
+            @Override
+            public ProtocolDescriptor getProtocolDescriptor() {
+                return new ProtocolDescriptor(protocolId);
+            }
+
+            @Override
+            public CompletableFuture<String> initChannel(P2PChannel channel, String negotiatedProtocol) {
+                channel.close();
+                return CompletableFuture.completedFuture(negotiatedProtocol);
+            }
+        };
+        return findOrConnect(h, peerId, peerAddr)
+                .thenCompose(conn -> conn.muxerSession().createStream(probe).getController());
+    }
+
+    /** Gossip topics this host has joined (empty unless topic subscription is enabled). */
+    public Set<String> subscribedGossipTopics() {
+        return Set.copyOf(subscribedGossipTopics);
+    }
+
+    /**
+     * Our dialable listen multiaddrs, {@code /p2p/<peerId>} included; empty
+     * before {@link #start()}. Loopback tests dial these.
+     */
+    public List<String> listenAddresses() {
+        Host h = host;
+        if (h == null) return List.of();
+        String suffix = "/p2p/" + h.getPeerId();
+        return h.listenAddresses().stream()
+                .map(Object::toString)
+                .map(a -> a.contains("/p2p/") ? a : a + suffix)
+                .toList();
+    }
 
     /** Info about a connected CL peer. */
     public record PeerInfo(String peerId, String remoteAddress, List<String> protocols, String agentVersion) {
