@@ -369,22 +369,22 @@ async fn consume_discovered(
             continue;
         }
         let id = enr.node_id();
-        let verdict = classify_heard(
-            &enr,
-            &seen.lock().expect("seen lock"),
-            &pinned_targets,
-            &accepted_digests,
-        );
-        match verdict {
+        // One critical section from check to claim: the lookup loop claims
+        // its own emissions under the same lock, so neither path can slip a
+        // duplicate into the pool channel between the other's check and
+        // insert. try_send never blocks, so holding a std mutex across it is
+        // fine; nothing awaits while it is held.
+        let mut guard = seen.lock().expect("seen lock");
+        match classify_heard(&enr, &guard, &pinned_targets, &accepted_digests) {
             Heard::Skip => {}
             Heard::NeverCandidate => {
-                seen.lock().expect("seen lock").insert(id);
+                guard.insert(id);
             }
             Heard::Emit(peer) => match tx.try_send(peer) {
                 // Marked seen only once the pool has it: a node dropped on a
                 // full channel is heard again later and emitted then.
                 Ok(()) => {
-                    seen.lock().expect("seen lock").insert(id);
+                    guard.insert(id);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
