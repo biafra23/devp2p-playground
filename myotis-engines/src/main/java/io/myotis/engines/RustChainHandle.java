@@ -125,14 +125,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // Entry stamp for uptime: count from the start request, including the native
         // boot itself — anchored below only when the start succeeds.
         long startRequestNs = System.nanoTime();
+        // Warm-up window BEFORE the native flip (WakeGate#beginWarmup), as resume() does:
+        // reads that arrive while the fresh stack climbs to SYNCED + snap peers are held
+        // (bounded), and one racing this start on another thread (a UI / IPC operator query;
+        // the listener itself only starts below) never sees RUNNING without a window. Only
+        // from STOPPED, the one state a start can succeed from, so a refused start() can't
+        // reopen a window over a serving node; a window a failed start leaves behind closes
+        // at the watcher's first poll (still STOPPED).
+        if (lifecycle() == LifecycleState.STOPPED) wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
         boolean ok = RustEngineNative.nativeStart(handle);
         // Only expose the verified JSON-RPC endpoint once the native stack is up.
         if (ok) {
-            // Warm-up window before the listener exists (WakeGate#beginWarmup): reads that
-            // arrive while the fresh stack climbs to SYNCED + snap peers are held (bounded),
-            // as after a wake. Only on success, so a start() refused because the handle is
-            // already running can't reopen a window over a node that is serving.
-            wakeGate.beginWarmup(WAKE_WAIT_CAP_MS);
             // Anchor uptime to this successful start (cleared in stop() so a restart re-anchors).
             if (!started) { startedAtNs = startRequestNs; started = true; }
             startRpc();

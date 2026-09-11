@@ -149,7 +149,7 @@ class MethodLogger(
         val what = "method=$method id=$id" + (batchPos?.let { " batch=$it" } ?: "")
         val watchdog = launch {
             delay(slowCallWarnMs)
-            rpcLogWarn(SLOW_LOGGER, "[rpc] slow call: $what still unanswered after " +
+            warnSlow("[rpc] slow call: $what still unanswered after " +
                 "${t0.elapsedNow().inWholeMilliseconds}ms (phase=${phase.name})")
         }
         var ending = "finished"
@@ -163,8 +163,20 @@ class MethodLogger(
             watchdog.cancel()
             val ms = t0.elapsedNow().inWholeMilliseconds
             if (ms >= slowCallWarnMs) {
-                rpcLogWarn(SLOW_LOGGER, "[rpc] slow call: $what $ending after ${ms}ms (phase=${phase.name})")
+                warnSlow("[rpc] slow call: $what $ending after ${ms}ms (phase=${phase.name})")
             }
+        }
+    }
+
+    /** A slow-call line that can never fail the request it describes: the watchdog is a
+     *  child of the request's scope, so a throwing log sink (iOS hosts supply their own)
+     *  would otherwise cancel the request — diagnostics must never change outcomes (the
+     *  rule WakeGate's holdReason follows too). */
+    private fun warnSlow(message: String) {
+        try {
+            rpcLogWarn(SLOW_LOGGER, message)
+        } catch (_: Exception) {
+            // a broken log sink is not the request's problem
         }
     }
 }
