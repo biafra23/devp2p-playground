@@ -83,11 +83,14 @@ jobs:
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_without_static_peers
 
-      # Deep catch-up: only when BOTH anchor inputs are supplied. The test
-      # itself fails rather than skipping if they are missing, so the guard is
-      # here to keep "no anchor given" from looking like a failure.
+      # Deep catch-up: skipped only when NEITHER anchor input is supplied, so
+      # "no anchor given" does not look like a failure. A HALF-supplied anchor
+      # still runs the test, which fails loudly on its own must-accompany
+      # guards — an operator who typed a root meant this to run, and skipping
+      # there would be the job-level version of the fake green the test itself
+      # refuses.
       - name: Cold start from an old anchor
-        if: inputs.anchor_root != '' && inputs.anchor_slot != ''
+        if: inputs.anchor_root != '' || inputs.anchor_slot != ''
         working-directory: rust
         env:
           NET: ${{ inputs.network }}

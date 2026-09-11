@@ -53,15 +53,29 @@ use std::time::Duration;
 
 use myotis_net::{ChainConfig, SyncHandle, SyncState};
 
-/// Network under test. Gnosis by default: its light-client servers are almost
+/// Network under test. Gnosis when unset: its light-client servers are almost
 /// all Lighthouse, which is the population that stopped answering in #422.
+/// An unrecognised value REFUSES rather than falling back — a cold-start run
+/// against a network the operator did not ask for is a green result that means
+/// something else (CLAUDE.md: a parameter that can change the answer must be
+/// applied or refused, never accepted and silently ignored).
 fn config_for_env() -> ChainConfig {
     match std::env::var("NET").unwrap_or_else(|_| "gnosis".into()).as_str() {
         "mainnet" => ChainConfig::mainnet(),
         "sepolia" => ChainConfig::sepolia(),
-        _ => ChainConfig::gnosis(),
+        "gnosis" => ChainConfig::gnosis(),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
     }
 }
+
+/// How long the discovery-only cold start may take. Named, with the prose
+/// derived from it, so the budget and the message reporting it cannot drift
+/// apart — the bug this PR fixes in `examples/live_sync.rs`.
+const NO_PINS_BUDGET: Duration = Duration::from_secs(900);
+
+/// How long the deep catch-up may take. Peer-quota-bound: a serving peer
+/// answers roughly one update per 10 s, so a 70-period walk is minutes.
+const OLD_ANCHOR_BUDGET: Duration = Duration::from_secs(1800);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -122,13 +136,14 @@ async fn cold_start_without_static_peers_syncs_through_discovery() {
     assert!(!config.bootstrap_enrs.is_empty(), "discovery needs its bootnodes");
 
     let handle = SyncHandle::start(config).expect("sync start");
-    let synced = run_to_synced(&handle, "no-pins", Duration::from_secs(900)).await;
+    let synced = run_to_synced(&handle, "no-pins", NO_PINS_BUDGET).await;
     handle.stop().await;
 
     assert!(
         synced.is_some(),
-        "cold start with all {pinned} pinned peers removed did not reach SYNCED in 15 min — \
-         discovery alone could not find a light-client server, which is the #422 condition"
+        "cold start with all {pinned} pinned peers removed did not reach SYNCED in {} min — \
+         discovery alone could not find a light-client server, which is the #422 condition",
+        NO_PINS_BUDGET.as_secs() / 60
     );
 }
 
@@ -186,15 +201,15 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
     config.ws_policy.accept_stale_anchor.store(true, Ordering::Relaxed);
 
     let handle = SyncHandle::start(config).expect("sync start");
-    // Peer-quota-bound: ~1 update per 10 s per serving peer, fanned out.
-    let synced = run_to_synced(&handle, "old-anchor", Duration::from_secs(1800)).await;
+    let synced = run_to_synced(&handle, "old-anchor", OLD_ANCHOR_BUDGET).await;
     handle.stop().await;
 
     let synced = synced.unwrap_or_else(|| {
         panic!(
-            "cold start {behind} periods behind did not reach SYNCED in 30 min — \
+            "cold start {behind} periods behind did not reach SYNCED in {} min — \
              the bootstrap may have landed but catch-up made no progress, which is \
-             exactly the #422 stall"
+             exactly the #422 stall",
+            OLD_ANCHOR_BUDGET.as_secs() / 60
         )
     });
     // `sync_start_period` is the period this run's catch-up started from (-1
