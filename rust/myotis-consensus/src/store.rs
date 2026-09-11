@@ -3,6 +3,7 @@
 //! clock input (the slot estimate behind `force_rotate_if_past_period`) is a
 //! plain parameter, exactly as the conformance corpus records it.
 
+use crate::fork::ForkSchedule;
 use crate::spec;
 use crate::ssz::{self, Root};
 use crate::types::{
@@ -176,13 +177,21 @@ impl LightClientStore {
 /// not a duplicate).
 pub struct LightClientProcessor {
     pub store: LightClientStore,
-    fork_version: [u8; 4],
+    /// Per-slot signing-domain selector. Every update is verified under the
+    /// fork active at its `signature_slot` (spec `validate_light_client_update`),
+    /// so a store can walk updates across a fork boundary — a single fixed
+    /// version rejects everything signed on the other side of it (#295).
+    fork_schedule: ForkSchedule,
     genesis_validators_root: Root,
 }
 
 impl LightClientProcessor {
-    pub fn new(store: LightClientStore, fork_version: [u8; 4], genesis_validators_root: Root) -> Self {
-        Self { store, fork_version, genesis_validators_root }
+    pub fn new(
+        store: LightClientStore,
+        fork_schedule: ForkSchedule,
+        genesis_validators_root: Root,
+    ) -> Self {
+        Self { store, fork_schedule, genesis_validators_root }
     }
 
     /// `is_valid_light_client_header` (Capella+): the execution payload header is
@@ -225,17 +234,19 @@ impl LightClientProcessor {
             return false;
         };
 
+        let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
             committee,
             &update.attested_header.beacon,
-            &self.fork_version,
+            &fork_version,
             &self.genesis_validators_root,
         ) {
             tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
                 signature_slot = update.signature_slot,
                 attested_slot = update.attested_header.beacon.slot,
                 participants = update.sync_aggregate.count_participants(),
+                fork_version = ?fork_version,
                 "update rejected: sync-aggregate BLS verification failed");
             return false;
         }
@@ -326,15 +337,18 @@ impl LightClientProcessor {
             return false;
         };
 
+        let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
             committee,
             &update.attested_header.beacon,
-            &self.fork_version,
+            &fork_version,
             &self.genesis_validators_root,
         ) {
             tracing::debug!(store_period, sig_period, used_next = sig_period != store_period,
+                signature_slot = update.signature_slot,
                 attested_slot = update.attested_header.beacon.slot,
+                fork_version = ?fork_version,
                 "finality update rejected: sync-aggregate BLS verification failed");
             return false;
         }

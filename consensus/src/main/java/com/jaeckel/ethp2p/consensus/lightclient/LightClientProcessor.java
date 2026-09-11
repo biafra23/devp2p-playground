@@ -1,6 +1,7 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
 import com.jaeckel.ethp2p.consensus.ssz.SszUtil;
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.consensus.types.LightClientFinalityUpdate;
 import com.jaeckel.ethp2p.consensus.types.LightClientHeader;
 import com.jaeckel.ethp2p.consensus.types.LightClientUpdate;
@@ -19,7 +20,11 @@ public class LightClientProcessor {
     private static final Logger log = LoggerFactory.getLogger(LightClientProcessor.class);
 
     private final LightClientStore store;
-    private final byte[] forkVersion;
+    /** Per-slot signing-domain selector. Every update is verified under the fork
+     *  active at its {@code signatureSlot} (spec {@code validate_light_client_update}),
+     *  so the store can walk updates across a fork boundary — a single fixed version
+     *  rejects everything signed on the other side of it (#295). */
+    private final ForkSchedule forkSchedule;
     private final byte[] genesisValidatorsRoot;
 
     /** Aggregate signature of the last successfully applied finality update. The
@@ -37,12 +42,11 @@ public class LightClientProcessor {
      *  re-verification would not reach. */
     private volatile long lastAppliedFinalitySigSlot = -1;
 
-    public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
+    public LightClientProcessor(LightClientStore store, ForkSchedule forkSchedule, byte[] genesisValidatorsRoot) {
         this.store = store;
-        this.forkVersion = forkVersion.clone();
+        this.forkSchedule = java.util.Objects.requireNonNull(forkSchedule, "forkSchedule");
         this.genesisValidatorsRoot = genesisValidatorsRoot.clone();
-        log.info("[lc-processor] Initialized with forkVersion={}, fv[0]={}, id={}",
-                bytesToHex(this.forkVersion), this.forkVersion[0], System.identityHashCode(this.forkVersion));
+        log.info("[lc-processor] Initialized with forkSchedule={}", forkSchedule);
     }
 
     /**
@@ -111,7 +115,9 @@ public class LightClientProcessor {
                 attestedSlot, finalizedSlot, update.signatureSlot(),
                 participation, update.finalityBranch().length);
 
-        // Verify sync aggregate over attested header
+        // Verify sync aggregate over attested header, under the fork active at
+        // the signature slot (spec: compute_fork_version(epoch(max(sig_slot,1)-1))).
+        byte[] forkVersion = forkSchedule.versionForSignatureSlot(update.signatureSlot());
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),
                 committee,
@@ -119,9 +125,9 @@ public class LightClientProcessor {
                 forkVersion,
                 genesisValidatorsRoot)) {
             log.debug("[lc-processor] Finality update rejected: BLS verification failed " +
-                    "(attestedSlot={}, usedNext={}, forkVersion={}, fv[0]={}, id={}, participation={})",
-                    attestedSlot, sigPeriod != storePeriod, bytesToHex(forkVersion), forkVersion[0],
-                    System.identityHashCode(forkVersion), participation);
+                    "(attestedSlot={}, signatureSlot={}, usedNext={}, forkVersion={}, participation={})",
+                    attestedSlot, update.signatureSlot(), sigPeriod != storePeriod,
+                    bytesToHex(forkVersion), participation);
             return false;
         }
 
@@ -224,16 +230,19 @@ public class LightClientProcessor {
             return false;
         }
 
-        // Verify sync aggregate over attested header
+        // Verify sync aggregate over attested header, under the fork active at
+        // the signature slot (see processFinalityUpdate).
+        byte[] forkVersion = forkSchedule.versionForSignatureSlot(update.signatureSlot());
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),
                 committee,
                 update.attestedHeader().beacon(),
                 forkVersion,
                 genesisValidatorsRoot)) {
-            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}, usedNext={}): "
-                            + "BLS sync-aggregate verify failed",
-                    attestedSlot, finalizedSlot, sigPeriod != storePeriod);
+            log.info("[lc-processor] Update rejected (attestedSlot={}, finalizedSlot={}, signatureSlot={}, "
+                            + "usedNext={}, forkVersion={}): BLS sync-aggregate verify failed",
+                    attestedSlot, finalizedSlot, update.signatureSlot(), sigPeriod != storePeriod,
+                    bytesToHex(forkVersion));
             return false;
         }
 

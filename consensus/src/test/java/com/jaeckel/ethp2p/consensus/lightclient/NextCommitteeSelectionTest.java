@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.consensus.lightclient;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -50,7 +51,7 @@ class NextCommitteeSelectionTest {
         LightClientBootstrap b = LightClientBootstrap.decode(corpus("bootstrap.ssz"));
         LightClientStore store = new LightClientStore();
         store.initialize(b.header(), b.currentSyncCommittee());
-        LightClientProcessor p = new LightClientProcessor(store, FORK_VERSION, GVR);
+        LightClientProcessor p = new LightClientProcessor(store, ForkSchedule.single(FORK_VERSION), GVR);
         assertTrue(p.processUpdate(LightClientUpdate.decode(corpus("001-update.ssz"))));
         assertEquals(1777, store.getCurrentSyncCommitteePeriod());
         assertFalse(Arrays.equals(store.getCurrentSyncCommittee().hashTreeRoot(),
@@ -115,7 +116,7 @@ class NextCommitteeSelectionTest {
         LightClientBootstrap b = LightClientBootstrap.decode(corpus("bootstrap.ssz"));
         LightClientStore store = new LightClientStore();
         store.initialize(b.header(), b.currentSyncCommittee());
-        LightClientProcessor bare = new LightClientProcessor(store, FORK_VERSION, GVR);
+        LightClientProcessor bare = new LightClientProcessor(store, ForkSchedule.single(FORK_VERSION), GVR);
         LightClientUpdate second = LightClientUpdate.decode(corpus("002-update.ssz"));
         assertFalse(bare.processUpdate(second));
         // Two periods ahead is never admissible, next committee or not.

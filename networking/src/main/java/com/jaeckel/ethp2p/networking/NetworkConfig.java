@@ -1,5 +1,6 @@
 package com.jaeckel.ethp2p.networking;
 
+import com.jaeckel.ethp2p.core.consensus.ForkSchedule;
 import com.jaeckel.ethp2p.core.enr.Enr;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
@@ -28,16 +29,26 @@ public record NetworkConfig(
         long checkpointSlot,            // slot of the trusted checkpoint. Used to populate
                                         // Status.finalized_epoch before bootstrap so Lighthouse
                                         // doesn't goodbye us with IrrelevantNetwork(code=2).
-        byte[] currentForkVersion,      // 4 bytes: current fork version for signing domain
+        ForkSchedule forkSchedule,      // the chain's FULL fork schedule (activation epoch -> 4-byte version,
+                                        // ascending, genesis first). Every sync-committee signature is
+                                        // verified under the version active at its signature_slot, so the
+                                        // light client can walk updates across a fork boundary (#295); the
+                                        // entry active at the wall-clock epoch feeds the fork digest, so
+                                        // the NEXT fork may be pinned ahead of activation. Append-only,
+                                        // consensus-critical, same trust standing as genesisValidatorsRoot:
+                                        // pinned from the network's published config
+                                        // (/eth/v1/config/fork_schedule), never fetched. Keep in lockstep
+                                        // with the Rust ChainConfig.fork_schedule (rust/myotis-net/src/sync.rs).
         long activeBlobParamsEpoch,     // EIP-7892: epoch of the currently-active BPO fork, or 0 if none.
                                         // Folded into compute_fork_digest via the XOR formula so our digest
                                         // tracks the network's post-Fulu BPO activations.
         long activeBlobParamsMaxBlobs,  // EIP-7892: MAX_BLOBS_PER_BLOCK for the active BPO entry (paired
                                         // with activeBlobParamsEpoch). Ignored when activeBlobParamsEpoch == 0.
-        byte[] priorForkVersion,        // 4 bytes: immediately preceding fork (nullable). Accepted as
-                                        // a discv5 fork_digest fallback so a configured "current" fork
+        boolean acceptPriorForkDigest,  // accept the PRIOR scheduled fork's digest as a discv5 fork_digest
+                                        // fallback next to the current one, so a configured "current" fork
                                         // that hasn't yet activated on the network doesn't filter every
-                                        // peer out. Null skips the fallback (testnets, genesis fork).
+                                        // peer out. A policy knob — the version itself comes from the
+                                        // schedule. Off for mainnet/sepolia, on for gnosis.
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
         long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
@@ -45,6 +56,19 @@ public record NetworkConfig(
         List<String> clEnrTreeUrls,     // EIP-1459 enrtree:// URLs for consensus-layer libp2p peers
         List<String> clDiscv5Bootnodes  // ENR strings of CL discv5 bootnodes (seed for DHT discovery)
 ) {
+
+    public NetworkConfig {
+        // The schedule maps signature slots to epochs with its own slotsPerEpoch;
+        // it must be THIS chain's geometry or every boundary lands on the wrong
+        // slot. Refused at construction rather than defaulted (CLAUDE.md: a
+        // parameter that can change the answer is applied or refused).
+        java.util.Objects.requireNonNull(forkSchedule, "forkSchedule");
+        if (forkSchedule.slotsPerEpoch() != slotsPerEpochFor(networkId)) {
+            throw new IllegalArgumentException(name + ": forkSchedule.slotsPerEpoch="
+                    + forkSchedule.slotsPerEpoch() + " but the chain's preset has "
+                    + slotsPerEpochFor(networkId));
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Lighthouse mainnet CL bootstrap ENRs
@@ -97,17 +121,26 @@ public record NetworkConfig(
             Bytes.fromHexString("16d197d597d795c05cb9a195a1bd34c77acd6c1f8ba336f75c5cfbc395710d68").toArrayUnsafe(),
             15185856L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
-            // current fork version: Fulu (0x06000000) — activated at slot 13164544 (2025-12-03)
-            new byte[]{0x06, 0x00, 0x00, 0x00},
+            // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
+            ForkSchedule.of(32,
+                    ForkSchedule.fork(0, 0x00000000),      // phase0 (genesis)
+                    ForkSchedule.fork(74240, 0x01000000),  // altair
+                    ForkSchedule.fork(144896, 0x02000000), // bellatrix
+                    ForkSchedule.fork(194048, 0x03000000), // capella
+                    ForkSchedule.fork(269568, 0x04000000), // deneb
+                    ForkSchedule.fork(364032, 0x05000000), // electra
+                    ForkSchedule.fork(411392, 0x06000000)  // fulu
+            ),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on mainnet.
             // BPO2 (Fusaka) at epoch 419072, MAX_BLOBS_PER_BLOCK=21, 2026-01-07.
             // Feeds into compute_fork_digest (XOR of base_digest with sha256 of
             // (epoch_le || max_blobs_le)).
             419072L, 21L,
-            // No prior-fork fallback: mainnet is on Fulu; peers still advertising
+            // No prior-fork digest fallback: mainnet is on Fulu; peers still advertising
             // an older digest are either stale ENRs or unupgraded nodes — matching
             // them wouldn't help us sync to the current head anyway.
-            null,
+            false,
             // CL peer multiaddrs: known light-client-serving peers. Provenance:
             // originally discovered via the Lighthouse peer API 2026-03-11,
             // re-censused via period_census 2026-09-01 (#410), re-verified and
@@ -211,15 +244,24 @@ public record NetworkConfig(
             Bytes.fromHexString("3fdfc6b7c39990c859ca1ea0a73d4f072a49a7d3dfe7f6e416bf90006d6f079b").toArrayUnsafe(),
             11110080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
-            // current fork version: Fulu on sepolia (0x90000075) — activated at epoch 272640 (2025-10-14)
-            new byte[]{(byte) 0x90, 0x00, 0x00, 0x75},
+            // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
+            ForkSchedule.of(32,
+                    ForkSchedule.fork(0, 0x90000069),      // phase0 (genesis)
+                    ForkSchedule.fork(50, 0x90000070),     // altair
+                    ForkSchedule.fork(100, 0x90000071),    // bellatrix
+                    ForkSchedule.fork(56832, 0x90000072),  // capella
+                    ForkSchedule.fork(132608, 0x90000073), // deneb
+                    ForkSchedule.fork(222464, 0x90000074), // electra
+                    ForkSchedule.fork(272640, 0x90000075)  // fulu
+            ),
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia:
             // BPO2 at epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28). Folds into
             // the fork digest XOR — see activeBlobParams.
             275712L, 21L,
-            // No prior-fork fallback (same rationale as mainnet: stale digests
+            // No prior-fork digest fallback (same rationale as mainnet: stale digests
             // wouldn't help us sync to the current head anyway).
-            null,
+            false,
             // CL peer multiaddrs for sepolia. First entry is roost, the
             // dedicated light-client server (rust/roost, docs/lc-server-design.md).
             // It is first because it exists precisely for this: a general-purpose
@@ -340,13 +382,23 @@ public record NetworkConfig(
             Bytes.fromHexString("ed1faabdc3c3a7cac06a67bc7d6c483c2a4af00c37f754a4d3860d06e1745997").toArrayUnsafe(),
             30012384L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
-            // current fork version: Fulu on Gnosis (0x06000064), active since 2026-04-14
-            new byte[]{0x06, 0x00, 0x00, 0x64},
+            // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
+            // 1714688 (2026-04-14); Electra's epoch is also the blob-params epoch below.
+            ForkSchedule.of(16,
+                    ForkSchedule.fork(0, 0x00000064),       // phase0 (genesis)
+                    ForkSchedule.fork(512, 0x01000064),     // altair
+                    ForkSchedule.fork(385536, 0x02000064),  // bellatrix
+                    ForkSchedule.fork(648704, 0x03000064),  // capella
+                    ForkSchedule.fork(889856, 0x04000064),  // deneb
+                    ForkSchedule.fork(1337856, 0x05000064), // electra
+                    ForkSchedule.fork(1714688, 0x06000064)  // fulu
+            ),
             // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE, so clients fold the
             // Electra-baseline blob params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS_PER_BLOCK_ELECTRA=2)
             // into the Fulu fork digest. Yields the live-verified eth2 digest 0x3237dab6.
             1337856L, 2L,
-            new byte[]{0x05, 0x00, 0x00, 0x64}, // prior fork: Electra — accepted as a discv5 fork-digest fallback
+            true, // Electra's digest (the prior scheduled fork) is accepted as a discv5 fork-digest fallback
             // CL peer multiaddrs for Gnosis: Identify-confirmed LC servers harvested
             // from a long-running desktop profile's cl-peers-gnosis.cache (2026-08-06,
             // issue #291 — a cold Gnosis pool starves catch-up because so few nodes
@@ -504,10 +556,48 @@ public record NetworkConfig(
     public List<byte[]> acceptedForkDigests() {
         List<byte[]> digests = new ArrayList<>(2);
         digests.add(currentForkDigest());
-        if (priorForkVersion != null) {
-            digests.add(forkDigestFor(priorForkVersion));
+        // KNOWN LIMIT: the prior digest is the plain pre-EIP-7892 form, which is
+        // what Electra-era peers advertise (gnosis today: 0x7D5AAB40). Once the
+        // prior fork is Fulu or later, stale peers advertise the BPO-FOLDED digest
+        // of their era, so this fallback matches nobody (fail-safe, never a wrong
+        // acceptance). Folding it needs the blob-params entry active in the prior
+        // fork's era — the blob-schedule follow-up deferred in PR #430; until then
+        // this knob is a no-op past the next fork. Rust twin: ChainConfig
+        // ::accepted_fork_digests carries the same note.
+        byte[] prior = priorForkVersion();
+        if (prior != null) {
+            digests.add(forkDigestFor(prior));
         }
         return List.copyOf(digests);
+    }
+
+    /**
+     * The fork version active NOW — the fork DIGEST input (discv5 filtering,
+     * Status, gossip topics). Read from the schedule at the wall-clock epoch, so
+     * the next fork can be pinned ahead of its activation without flipping the
+     * digest early (a not-yet-active digest matches no peer). Not a
+     * signing-domain input: the light client reads the schedule per update
+     * ({@link ForkSchedule#versionForSignatureSlot}).
+     */
+    public byte[] currentForkVersion() {
+        return forkSchedule.versionAtEpoch(wallClockEpoch());
+    }
+
+    /**
+     * The version of the fork before the active one when its digest is accepted
+     * ({@link #acceptPriorForkDigest()}), else {@code null}.
+     */
+    public byte[] priorForkVersion() {
+        return acceptPriorForkDigest ? forkSchedule.priorVersionAtEpoch(wallClockEpoch()) : null;
+    }
+
+    /**
+     * Wall-clock beacon epoch of this chain. Clamped at 0 for a clock set before
+     * genesis (Rust twin: {@code ChainConfig::current_slot_estimate}, saturating).
+     */
+    public long wallClockEpoch() {
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000L - clGenesisTime) / secondsPerSlot();
+        return wallSlot / slotsPerEpoch();
     }
 
     /**
@@ -640,6 +730,10 @@ public record NetworkConfig(
      * period is 8192 on both presets, so that helper is shared.)
      */
     public int slotsPerEpoch() {
+        return slotsPerEpochFor(networkId);
+    }
+
+    private static int slotsPerEpochFor(long networkId) {
         return networkId == 100 ? 16 : 32;
     }
 

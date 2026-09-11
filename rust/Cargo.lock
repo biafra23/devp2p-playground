@@ -4172,6 +4172,7 @@ dependencies = [
 name = "myotis-consensus"
 version = "0.1.8"
 dependencies = [
+ "blst",
  "myotis-bls",
  "sha2",
  "tracing",

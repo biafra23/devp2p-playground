@@ -4,6 +4,7 @@
 
 use std::{fs, path::PathBuf};
 
+use myotis_consensus::fork::ForkSchedule;
 use myotis_consensus::{
     spec, ssz,
     store::{LightClientProcessor, LightClientStore},
@@ -39,7 +40,7 @@ fn processor() -> LightClientProcessor {
     assert!(LightClientProcessor::verify_execution_branch(&b.header));
     let mut store = LightClientStore::new_mainnet_preset();
     store.initialize(b.header, b.current_sync_committee);
-    LightClientProcessor::new(store, FORK, root(GENESIS))
+    LightClientProcessor::new(store, ForkSchedule::single(FORK), root(GENESIS))
 }
 
 fn signature_valid(u: &LightClientUpdate, committee: &SyncCommittee) -> bool {
