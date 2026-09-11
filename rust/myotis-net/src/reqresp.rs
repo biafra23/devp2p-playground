@@ -399,9 +399,10 @@ enum Command {
     Observe {
         peers: Vec<(PeerId, Multiaddr)>,
     },
-    /// One snapshot of both catch-up peer-selection inputs — the LC-server set
-    /// and the per-peer `earliest_available_slot` map — so a round fetches them
-    /// in a single swarm round-trip instead of two.
+    /// One snapshot of the catch-up peer-selection inputs — the LC-server set,
+    /// the per-peer `earliest_available_slot` map, and the per-peer Identify
+    /// agent — so a round fetches them in a single swarm round-trip instead of
+    /// three.
     CatchupMeta {
         reply: oneshot::Sender<CatchupPeerMeta>,
     },
