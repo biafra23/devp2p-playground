@@ -25,7 +25,7 @@ use libp2p::identify;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
+use libp2p::{gossipsub, Multiaddr, PeerId, StreamProtocol, Swarm};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::codec;
@@ -278,6 +278,16 @@ pub struct Behaviour {
     // established connections so a peer flood can't exhaust fds/memory.
     pub limits: connection_limits::Behaviour,
     pub identify: identify::Behaviour,
+    /// Gossipsub with NO subscriptions. It exists so the `/meshsub/` protocol
+    /// negotiates on every connection: Lighthouse (v8.1.3–v8.2.2 verified in
+    /// `lighthouse_network/src/service/mod.rs`) reports a peer whose gossipsub
+    /// upgrade fails with `PeerAction::Fatal` ("does_not_support_gossipsub"),
+    /// which bans the peer id for 12 h after ONE goodbye (reason 0) and bans
+    /// the whole IP once more than five of its peer ids are banned. A wallet
+    /// therefore got exactly one first-contact connection per Lighthouse
+    /// node per start, and the IP ban after a handful of restarts. Negotiating
+    /// the protocol is all the check needs; the mesh is never joined.
+    pub gossipsub: gossipsub::Behaviour,
     pub status_v2: RR,
     pub status_v1: RR,
     pub ping: RR,
@@ -311,6 +321,17 @@ impl Behaviour {
                 identify::Config::new("eth2/1.0.0".into(), local_public_key)
                     .with_agent_version(concat!("myotis/", env!("CARGO_PKG_VERSION"), "-rs").into()),
             ),
+            // Anonymous on both sides matches the eth2 wire (StrictNoSign:
+            // messages carry no signature, key or seqno); nothing is ever
+            // published or subscribed, so this only shapes the handshake.
+            gossipsub: gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Anonymous,
+                gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .build()
+                    .expect("static gossipsub config"),
+            )
+            .expect("static gossipsub behaviour"),
             status_v2: rr(protocols::STATUS_V2, ProtocolSupport::Full, RESP_TIMEOUT),
             status_v1: rr(protocols::STATUS_V1, ProtocolSupport::Full, RESP_TIMEOUT),
             ping: rr(protocols::PING, ProtocolSupport::Full, RESP_TIMEOUT),
@@ -1309,6 +1330,9 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
         }
         E::Identify(_) => {}
+        // No subscriptions, so the only events are peers' subscription
+        // announcements and unsupported-protocol notices; none needs handling.
+        E::Gossipsub(_) => {}
         E::StatusV2(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V2, ev),
         E::StatusV1(ev) => on_rr_event(swarm, ctx, protocols::STATUS_V1, ev),
         E::Ping(ev) => on_rr_event(swarm, ctx, protocols::PING, ev),
@@ -1897,6 +1921,62 @@ mod dial_resolution_tests {
 
     fn memo() -> std::sync::Mutex<HashMap<String, Vec<IpAddr>>> {
         std::sync::Mutex::new(HashMap::new())
+    }
+
+    /// The Lighthouse-ban regression: a peer that has subscriptions to announce
+    /// (Lighthouse always does) opens a `/meshsub/` stream toward us right after
+    /// the connection is established. If our swarm cannot negotiate it, that
+    /// peer's gossipsub emits `GossipsubNotSupported` — which Lighthouse turns
+    /// into `PeerAction::Fatal` and a 12 h ban. Here peer A plays Lighthouse
+    /// (subscribed), peer B is our wallet host (no subscriptions), and the
+    /// negotiation must complete with B recorded as a gossipsub peer.
+    #[tokio::test]
+    async fn meshsub_negotiates_without_any_subscription() {
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm a");
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+            .expect("swarm b");
+        b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = b.select_next_some().await {
+                break address;
+            }
+        };
+        a.behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub::IdentTopic::new(
+                "/eth2/00000000/light_client_finality_update/ssz_snappy",
+            ))
+            .unwrap();
+        a.dial(addr).unwrap();
+        let b_id = *b.local_peer_id();
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = a.select_next_some() => {
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                        gossipsub::Event::GossipsubNotSupported { peer_id },
+                    )) = &ev
+                    {
+                        panic!("peer {peer_id} failed /meshsub/ negotiation — this is the Lighthouse ban");
+                    }
+                    // `peer_protocol` starts every peer as Floodsub and moves it to a
+                    // Gossipsub* kind once the stream negotiated (or NotSupported).
+                    if let Some((_, kind)) =
+                        a.behaviour().gossipsub.peer_protocol().find(|(p, _)| **p == b_id)
+                    {
+                        let kind = format!("{kind:?}");
+                        assert_ne!(kind, "NotSupported");
+                        if kind.starts_with("Gossipsub") {
+                            return;
+                        }
+                    }
+                }
+                _ = b.select_next_some() => {}
+                _ = &mut deadline => panic!("no /meshsub/ negotiation within 15 s"),
+            }
+        }
     }
 
     #[tokio::test]

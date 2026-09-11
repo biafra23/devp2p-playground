@@ -122,7 +122,6 @@ class DesktopNodeController(
                 val config = EngineConfig(
                     canonical, 0, 0, settings.rpcPortFor(canonical),
                     dataDir.resolve("sync-state$suffix.snapshot").toString(),
-                    false,
                     settings.snapTarget(),
                     settings.strictStateFreshness(),
                     dataDir.toString(),

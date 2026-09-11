@@ -1764,7 +1764,6 @@ public final class NodeService extends Service {
                 EngineConfig config = new EngineConfig(
                         n, 0, 0, rpcPort,
                         netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
-                        /*gossipsub*/ false,
                         snapTarget(this),
                         strictStateFreshness(this),
                         // Reconstructible engine-owned state belongs with the other network

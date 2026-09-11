@@ -117,7 +117,6 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private final ClPeerCachePort clPeerCache;
     private final io.myotis.evm.ccipread.CcipGateway ccipGateway;
     private final Path syncSnapshotFile;
-    private final boolean gossipsubEnabled;
 
     // -- per-stack mutable state (formerly Main/NodeService singletons) ---------
     private final Set<String> attempted = ConcurrentHashMap.newKeySet();
@@ -190,8 +189,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                       PeerCachePort peerCache,
                       ClPeerCachePort clPeerCache,
                       io.myotis.evm.ccipread.CcipGateway ccipGateway,
-                      Path syncSnapshotFile,
-                      boolean gossipsubEnabled) {
+                      Path syncSnapshotFile) {
         this.network = network;
         this.ports = ports;
         this.nodeKey = nodeKey;
@@ -199,7 +197,6 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.clPeerCache = clPeerCache;
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
-        this.gossipsubEnabled = gossipsubEnabled;
         this.wakeGate = new WakeGate(phase::get, this::readyForReads,
                 () -> resume(io.myotis.api.WakeReason.REQUEST),
                 System::currentTimeMillis, WAKE_POLL_MS, "wake-resume-" + network.name());
@@ -991,7 +988,6 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         blc.setProvenNonLightClient(clPeerCache.lightClientDenied());
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
-        blc.setGossipsubEnabled(gossipsubEnabled);
         // Weak-subjectivity anchor-age bound: network default + any host override,
         // plus a pre-start stale-anchor consent — all must land before start() so
         // the cold-start gate judges with them.
