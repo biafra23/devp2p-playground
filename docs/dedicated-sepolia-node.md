@@ -464,20 +464,26 @@ head.
 
 ## 7. Pinned identities (DONE) and remaining follow-ups
 
-The pair is pinned in `NetworkConfig.SEPOLIA` on both layers and in both
-engines: `elBootEnodes()` returns the enode (Java) / `ElConfig::sepolia()`
-seeds `boot_enodes` into the peer cache for the pool's warm-start dial (Rust),
-and the CL multiaddr is `prependLocal`-ed onto `clPeerMultiaddrs` so the light
-client tries it first.
+The EL enode and the roost CL multiaddr are pinned in `NetworkConfig.SEPOLIA`
+on both layers and in both engines: `elBootEnodes()` returns the enode (Java) /
+`ElConfig::sepolia()` seeds `boot_enodes` into the peer cache for the pool's
+warm-start dial (Rust), and the CL multiaddr is `prependLocal`-ed onto
+`clPeerMultiaddrs` so the light client tries it first.
 
 | layer | identity |
 |---|---|
 | EL | `enode://cfd3572b…c37e1b2c@188.68.32.16:30405` |
 | CL (roost, first) | `/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5` |
-| CL (Nimbus, fallback) | `/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6` |
 
-Both are only stable because of the key-persistence flags above (Geth's
-datadir `nodekey`, Nimbus's `--netkey-file`). The **address** in every entry is
+The Nimbus CL fallback (`/tcp/9104` through the relay) was **unpinned on
+2026-09-11**: the port still accepts TCP but the libp2p handshake times out, so
+the tunnel's far end is not answering. Three census-verified public Lighthouse
+servers took its place in `clPeerMultiaddrs` (see the list's comment). Re-pin
+the Nimbus once the far end is fixed and its `--netkey-file` identity is
+confirmed from its startup log.
+
+Both are only stable because their keys persist across restarts (Geth's
+datadir `nodekey`; roost's `/data/roost/sepolia.key`). The **address** in every entry is
 the netcup relay (188.68.32.16, a static VPS), not zbox: since 2026-09-06 zbox
 sits behind mobile CGNAT and is reachable only through a WireGuard tunnel to the
 relay, which DNATs the nine serving ports (30405-30407, 9104-9109, tcp+udp) to

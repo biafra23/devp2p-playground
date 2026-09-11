@@ -170,23 +170,17 @@ class NetworkConfigGnosisTest {
         assertTrue(enode.endsWith("@188.68.32.16:30405"), enode);
 
         // roost, the dedicated light-client server, is tried first — that is the
-        // point of having it. The dedicated Nimbus stays behind it as fallback,
-        // so a roost fault degrades to the previous behaviour.
-        String cl = NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(0);
-        assertEquals("/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5", cl,
-                "roost must be the first CL peer tried");
-        // POSITION, not presence: the Rust twin asserts index 1, and index is
-        // load-bearing on this side in particular — addPeer inserts every
-        // discovered peer at Math.min(1, size()), i.e. exactly the slot the
-        // Nimbus occupies, so "somewhere in the list" is a weaker guarantee here
-        // than anywhere else.
-        assertEquals("/ip4/188.68.32.16/tcp/9104/p2p/"
-                        + "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                NetworkConfig.SEPOLIA.clPeerMultiaddrs().get(1),
-                "the dedicated Nimbus must remain SECOND as fallback — a roost outage "
-                        + "then degrades to exactly the previous behaviour");
-        assertTrue(NetworkConfig.SEPOLIA.clPeerMultiaddrs().size() > 2,
-                "pinning must not drop the existing CL peers");
+        // point of having it. The census-verified public servers follow, so a
+        // roost fault degrades to working peers rather than to dead pins.
+        // The full list, in order — the Rust twin
+        // (sepolia_config_matches_networkconfig_java) pins the same strings.
+        assertEquals(List.of(
+                        "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
+                        "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+                        "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+                        "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f"),
+                NetworkConfig.SEPOLIA.clPeerMultiaddrs(),
+                "roost first, then the census-verified public servers, same list as the Rust twin");
     }
 
     @Test

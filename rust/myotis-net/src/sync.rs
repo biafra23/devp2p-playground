@@ -420,18 +420,28 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // FIRST on purpose: it exists because a general-purpose beacon node is
     // structurally bad at serving wallets — one connection semaphore shared
     // between inbound and outbound, and a trimmer that drops light clients
-    // first. Nimbus stays below it, so a roost fault degrades to exactly
-    // today's behaviour rather than to nothing.
+    // first. The census-verified public servers below it are the fallback,
+    // so a roost fault degrades to working peers rather than to nothing.
     //
     // Its peer id comes from /data/roost/sepolia.key and is stable across
-    // restarts by construction; unlike the Nimbus entry there is no flag to
-    // forget, because roost has no mode in which it mints a fresh one.
+    // restarts by construction — roost has no mode in which it mints a
+    // fresh one.
     //
     // The address is the netcup relay (see the ADDRESS note above); ENR
     // publication (design §7) is what removes the need to pin at all.
     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-    "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-    "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
+    // Public sepolia LC servers, census-verified 2026-09-11: each answered
+    // light_client_bootstrap for the pinned root AND updates_by_range(1356,1)
+    // from a fresh peer id, all Lighthouse v8.2.2 (so the catch-up asks them
+    // for one period at a time — see agent_serves_one_period). They replace
+    // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
+    // libp2p handshake times out — the tunnel's far end is not answering) and
+    // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
+    // roost sepolia switched off as well, the bootstrap fan-out spent 82
+    // rounds on three unreachable pins while a wallet sat in SYNCING.
+    "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+    "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+    "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -3238,6 +3248,14 @@ mod tests {
         // A malformed pin would otherwise reach run_sync and surface only as a
         // "skipping unparseable static peer multiaddr" warn.
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 18);
         assert_eq!(c.chain_id, 1);
     }
@@ -3289,16 +3307,25 @@ mod tests {
             c.static_peers,
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
-                "/ip4/18.185.193.198/tcp/9000/p2p/16Uiu2HAm3mfkjmLPtqnSJzNtKxbDuVjVRXidz5UinaZNpjCCKAkS",
+                "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
+                "/ip4/138.201.192.180/tcp/9000/p2p/16Uiu2HAmNHPaVrDFi7zVnEd9vhSHy9e4a5eF5a3aBxNXPPAucWbE",
+                "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
             ],
-            "roost first (the dedicated LC server), the dedicated Nimbus second as \
-             fallback — same list, order AND addresses as the Java \
+            "roost first (the dedicated LC server), then the census-verified public \
+             servers — same list, order AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
         // A malformed pin would otherwise reach run_sync and surface only as a
         // "skipping unparseable static peer multiaddr" warn.
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 10);
     }
 
@@ -3368,6 +3395,14 @@ mod tests {
             c.static_peers.iter().map(|a| a.rsplit('/').next().unwrap()).collect();
         assert_eq!(ids.len(), 23, "one address per peer id (the pool dedupes by id)");
         assert!(c.static_peers.iter().all(|p| parse_static_peer(p).is_some()));
+        // Every pin must also derive a discv5 node id: that is what lets the
+        // targeted lookup recover a pinned server's CURRENT record when its
+        // address rotates, and a re-census that pinned an Ed25519 (12D3KooW…)
+        // id would silently lose that safety net.
+        assert!(c.static_peers.iter().all(|p| crate::discovery::node_id_for_peer(
+            &parse_static_peer(p).expect("parseable pin").id
+        )
+        .is_some()));
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
