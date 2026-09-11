@@ -33,12 +33,43 @@ pub struct DiscoveredPeer {
     pub addr: Multiaddr,
 }
 
+/// The accepted `eth2` fork digests: current first, then the prior fork's
+/// when the chain configures one (`NetworkConfig.acceptedForkDigests`).
+///
+/// `Dynamic` is re-read per candidate ENR (two SHA-256s — noise next to the
+/// UDP round trip that produced the ENR), so a fork pinned ahead of its
+/// activation rotates the filter at its epoch without a restart; a list
+/// captured once at spawn would reject every upgraded peer from that epoch
+/// on and starve CL discovery silently (#295 review). `Fixed` is for tools
+/// and tests that mean one list for the run.
+#[derive(Clone)]
+pub enum AcceptedForkDigests {
+    Fixed(Vec<[u8; 4]>),
+    Dynamic(Arc<dyn Fn() -> Vec<[u8; 4]> + Send + Sync>),
+}
+
+impl AcceptedForkDigests {
+    /// The list to filter the NEXT candidate with.
+    pub fn current(&self) -> Vec<[u8; 4]> {
+        match self {
+            AcceptedForkDigests::Fixed(v) => v.clone(),
+            AcceptedForkDigests::Dynamic(f) => f(),
+        }
+    }
+}
+
+impl From<Vec<[u8; 4]>> for AcceptedForkDigests {
+    fn from(v: Vec<[u8; 4]>) -> Self {
+        AcceptedForkDigests::Fixed(v)
+    }
+}
+
 #[derive(Clone)]
 pub struct DiscoveryConfig {
     pub bootstrap_enrs: Vec<String>,
-    /// Accepted `eth2` fork digests: current first, then the prior fork's when
-    /// the chain configures one (`NetworkConfig.acceptedForkDigests`).
-    pub accepted_fork_digests: Vec<[u8; 4]>,
+    /// See [`AcceptedForkDigests`] — the sync loop passes a `Dynamic` reader
+    /// over `ChainConfig::accepted_fork_digests`.
+    pub accepted_fork_digests: AcceptedForkDigests,
     /// UDP port to bind. 0 lets the OS pick.
     pub listen_port: u16,
     /// libp2p ids of the chain's PINNED peers (the static-peer list). Lookups
@@ -173,7 +204,7 @@ const PINNED_ROUND_EVERY: usize = 4;
 async fn run_lookups(
     discv5: Discv5,
     events: mpsc::Receiver<Event>,
-    accepted_digests: Vec<[u8; 4]>,
+    accepted_digests: AcceptedForkDigests,
     bootnodes: Vec<Enr>,
     pinned_targets: Vec<NodeId>,
     table_size: Arc<AtomicUsize>,
@@ -247,7 +278,7 @@ async fn run_lookups(
                     } else if !seen.lock().expect("seen lock").insert(enr.node_id()) {
                         continue;
                     }
-                    if let Some(peer) = filter_candidate(&enr, &accepted_digests) {
+                    if let Some(peer) = filter_candidate(&enr, &accepted_digests.current()) {
                         emitted += 1;
                         if tx.send(peer).await.is_err() {
                             return; // receiver gone — sync loop shut down
@@ -353,7 +384,7 @@ fn reseed_due(empty_rounds: &mut u32, live_nodes: usize, bootnode_count: usize) 
 /// goes away.
 async fn consume_discovered(
     mut events: mpsc::Receiver<Event>,
-    accepted_digests: Vec<[u8; 4]>,
+    accepted_digests: AcceptedForkDigests,
     pinned_targets: Vec<NodeId>,
     seen: Arc<std::sync::Mutex<HashSet<NodeId>>>,
     tx: mpsc::Sender<DiscoveredPeer>,
@@ -375,7 +406,7 @@ async fn consume_discovered(
         // insert. try_send never blocks, so holding a std mutex across it is
         // fine; nothing awaits while it is held.
         let mut guard = seen.lock().expect("seen lock");
-        match classify_heard(&enr, &guard, &pinned_targets, &accepted_digests) {
+        match classify_heard(&enr, &guard, &pinned_targets, &accepted_digests.current()) {
             Heard::Skip => {}
             Heard::NeverCandidate => {
                 guard.insert(id);

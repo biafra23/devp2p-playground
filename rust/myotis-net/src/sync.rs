@@ -401,6 +401,13 @@ impl ChainConfig {
     /// the prior fork's when configured (`NetworkConfig.acceptedForkDigests`).
     pub fn accepted_fork_digests(&self) -> Vec<[u8; 4]> {
         let mut out = vec![self.current_fork_digest()];
+        // KNOWN LIMIT (Java twin `NetworkConfig.acceptedForkDigests` carries the
+        // same note): the prior digest is the plain pre-EIP-7892 form, which is
+        // what Electra-era peers advertise (gnosis today: 0x7D5AAB40). Once the
+        // prior fork is Fulu or later, stale peers advertise the BPO-FOLDED
+        // digest of their era, so this fallback matches nobody (fail-safe, never
+        // a wrong acceptance). Folding it needs the blob-params entry active in
+        // the prior fork's era — the blob-schedule follow-up deferred in PR #430.
         if let Some(prior) = self.prior_fork_version() {
             out.push(fork_digest(prior, self.genesis_validators_root));
         }
@@ -826,7 +833,13 @@ impl SyncHandle {
 
         let discovery_cfg = DiscoveryConfig {
             bootstrap_enrs: config.bootstrap_enrs.clone(),
-            accepted_fork_digests: config.accepted_fork_digests(),
+            // Re-read per candidate ENR so the filter follows the fork schedule
+            // at the wall clock (a fork pinned ahead rotates it at its epoch
+            // without a restart) — see `AcceptedForkDigests`.
+            accepted_fork_digests: {
+                let chain = config.clone();
+                discovery::AcceptedForkDigests::Dynamic(Arc::new(move || chain.accepted_fork_digests()))
+            },
             listen_port: config.discv5_port,
             // Shared with run_sync's hunt trigger; discovery re-spawns reuse
             // the same flag, so a boost survives a discv5 restart.

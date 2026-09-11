@@ -902,7 +902,10 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
      *  during the first start's brief pre-BLC window (peers land in the cache and
      *  are picked up moments later), already-set on resume. */
     private void startDiscV5() {
-        List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
+        // The accepted digests are re-read per candidate ENR (two SHA-256s), not
+        // captured here: NetworkConfig.acceptedForkDigests() follows the fork
+        // schedule at the wall clock, so a fork pinned ahead of its activation
+        // rotates the filter at its epoch without a restart (#295 review).
         AtomicInteger mismatchesLogged = new AtomicInteger();
 
         // Targeted lookups (#347): derive the discv5 node ids of the pinned CL
@@ -932,6 +935,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
             var eth2 = enr.eth2();
             if (eth2.isEmpty()) return;
             byte[] peerDigest = eth2.get().forkDigest();
+            List<byte[]> acceptedForkDigests = network.acceptedForkDigests();
             int matchIdx = -1;
             for (int i = 0; i < acceptedForkDigests.size(); i++) {
                 if (java.util.Arrays.equals(peerDigest, acceptedForkDigests.get(i))) { matchIdx = i; break; }

@@ -556,6 +556,14 @@ public record NetworkConfig(
     public List<byte[]> acceptedForkDigests() {
         List<byte[]> digests = new ArrayList<>(2);
         digests.add(currentForkDigest());
+        // KNOWN LIMIT: the prior digest is the plain pre-EIP-7892 form, which is
+        // what Electra-era peers advertise (gnosis today: 0x7D5AAB40). Once the
+        // prior fork is Fulu or later, stale peers advertise the BPO-FOLDED digest
+        // of their era, so this fallback matches nobody (fail-safe, never a wrong
+        // acceptance). Folding it needs the blob-params entry active in the prior
+        // fork's era — the blob-schedule follow-up deferred in PR #430; until then
+        // this knob is a no-op past the next fork. Rust twin: ChainConfig
+        // ::accepted_fork_digests carries the same note.
         byte[] prior = priorForkVersion();
         if (prior != null) {
             digests.add(forkDigestFor(prior));
