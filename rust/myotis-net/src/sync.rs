@@ -851,6 +851,16 @@ struct PeerPool {
     /// verify-reject rotation steers toward. Nimbus-class servers stay on the
     /// big span (one answered five periods in a single batch).
     single_period_peers: HashSet<PeerId>,
+    /// Peers whose ONE response applied two or more periods (verified) in a
+    /// single catch-up round — Nimbus/Lodestar/roost-class servers with no
+    /// per-request quota. They lead the proven tier in `candidates` so a
+    /// month-long walk rides the batch server instead of the Lighthouse peer
+    /// that happens to have served most recently: the proven tier used to
+    /// rank by recency alone, and a count=1 chunk lands first almost every
+    /// round, so the single-period server kept winning and kept ranking
+    /// first — a stable one-period-per-11-s walk with a batch server sitting
+    /// unused in the same pool.
+    batch_servers: HashSet<PeerId>,
     /// Per-peer "don't re-ask updates_by_range until" marks. Live CL peers
     /// rate-limit that protocol to ~one served update per request window; an
     /// immediate re-ask returns an empty stream, so rotate away for a while.
@@ -918,6 +928,7 @@ impl PeerPool {
             cooldown_until: HashMap::new(),
             fail_counts: HashMap::new(),
             single_period_peers: HashSet::new(),
+            batch_servers: HashSet::new(),
             recent_serves: HashMap::new(),
             discv5_table_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sync_start_period: -1,
@@ -1073,6 +1084,33 @@ impl PeerPool {
         self.single_period_peers.contains(id)
     }
 
+    /// Record a VERIFIED multi-period serve (two or more of one response's
+    /// periods applied in one round). Delivery alone does not qualify — a
+    /// peer that streams many unverifiable chunks must not be promoted, the
+    /// same rule `mark_proven` follows.
+    fn mark_batch_server(&mut self, id: PeerId) -> bool {
+        self.batch_servers.insert(id)
+    }
+
+    /// Any batch-capable server currently in the pool (evicted ones don't
+    /// count — they cannot be asked).
+    fn has_batch_server(&self) -> bool {
+        self.peers.iter().any(|p| self.batch_servers.contains(&p.id))
+    }
+
+    /// When the soonest serve-quota / rotation cooldown among pool peers
+    /// expires — the pipeline's wake-up when every server is inside its
+    /// window. None when nobody is cooling down.
+    fn earliest_cooldown_expiry(&self) -> Option<Instant> {
+        let now = Instant::now();
+        self.peers
+            .iter()
+            .filter_map(|p| self.cooldown_until.get(&p.id))
+            .filter(|until| **until > now)
+            .min()
+            .copied()
+    }
+
     fn set_updates_cooldown(&mut self, id: PeerId) {
         self.cooldown_until.insert(id, Instant::now() + UPDATES_SERVE_COOLDOWN);
     }
@@ -1214,12 +1252,18 @@ impl PeerPool {
         // even when the proven set outgrows `n` and carries servers that are
         // flagged capable but currently at capacity. Never-served proven
         // peers keep their pool order after the recent ones (stable sort).
+        // Proven BATCH servers lead the tier regardless of recency (see
+        // `batch_servers`): a bounded batch must always carry the peer that
+        // can answer the whole span in one response.
         let mut tier1: Vec<&Peer> = self
             .peers
             .iter()
             .filter(|p| self.proven.contains(&p.id) && ok(self, &p.id))
             .collect();
-        tier1.sort_by_key(|p| std::cmp::Reverse(self.recent_serves.get(&p.id).copied()));
+        tier1.sort_by_key(|p| {
+            (!self.batch_servers.contains(&p.id),
+             std::cmp::Reverse(self.recent_serves.get(&p.id).copied()))
+        });
         for p in tier1 {
             if out.len() >= n {
                 break;
@@ -1556,6 +1600,11 @@ async fn run_sync(
     let mut hunt_probed: HashMap<PeerId, Instant> = HashMap::new();
     let mut hunt_confirmed: HashSet<PeerId> = HashSet::new();
     let mut hunting = false;
+    // Raised by catch_up when the walk is throughput-bound on a few
+    // quota-limited servers with a long span ahead (see
+    // update_throughput_hunt); keeps hunt_due from disengaging the hunt that
+    // catch_up raised for it.
+    let mut throughput_bound = false;
     // Store-progress tracking for the starved-catch-up trigger: any advance
     // of (period, finalized slot) resets the stall clock.
     let mut last_progress = Instant::now();
@@ -1577,6 +1626,7 @@ async fn run_sync(
             processor.store.is_initialized(),
             sync_started.elapsed(),
             last_progress.elapsed(),
+            throughput_bound,
             config.current_slot_estimate(),
             processor.store.current_period(),
             processor.store.finalized_slot(),
@@ -1710,7 +1760,8 @@ async fn run_sync(
             }
             let poisoned = catch_up(&config, &client, &mut pool, &mut processor, &status_tx,
                 &mut peer_rx, &mut staged_updates, &mut clcache, &mut resume,
-                &mut last_persisted_period, &anchor, &hunt_confirmed, hunting)
+                &mut last_persisted_period, &anchor, &mut hunt_confirmed, &mut hunt_probed,
+                &mut hunting, &discovery_cfg.hunt_boost, &mut throughput_bound)
                 .await;
             // Batch-persist every cache verdict from the catch-up rounds in
             // one write, OFF the per-peer hot path (review: no blocking I/O
@@ -2096,8 +2147,14 @@ const HUNT_REPROBE: Duration = Duration::from_secs(600);
 /// (the store period falls behind but the starvation is the same).
 const HUNT_CATCHUP_STALL: Duration = Duration::from_secs(120);
 
-/// Should the LC hunt run this cycle? Three triggers, all meaning "we are
-/// starved of light-client servers":
+/// Should the LC hunt run this cycle? Four triggers, all meaning "we are
+/// starved of light-client servers" (or of the RIGHT servers):
+/// - **Throughput-bound catch-up** (`throughput_bound`, raised by
+///   `catch_up` itself): the walk is progressing, but off a handful of
+///   quota-limited single-period servers with a long span still ahead. Not
+///   a stall, so the progress clock never fires — yet only MORE servers
+///   (ideally a batch-capable one) can speed it up, and only discovery +
+///   probing can find them.
 /// - **Bootstrap stall**: the store never initialized and we've been trying
 ///   longer than [`HUNT_BOOTSTRAP_STALL`] — bootstrap itself can't find a
 ///   server.
@@ -2122,6 +2179,7 @@ fn hunt_due(
     store_initialized: bool,
     since_sync_start: Duration,
     since_progress: Duration,
+    throughput_bound: bool,
     wall_slot: u64,
     store_period: u64,
     finalized_slot: u64,
@@ -2133,7 +2191,7 @@ fn hunt_due(
     }
     let wall_period = spec::compute_sync_committee_period_with(wall_slot, slots_per_period);
     if wall_period > store_period {
-        return since_progress >= HUNT_CATCHUP_STALL;
+        return throughput_bound || since_progress >= HUNT_CATCHUP_STALL;
     }
     let slack_epochs =
         if engaged { SYNCED_SLOT_SLACK_EPOCHS - 1 } else { SYNCED_SLOT_SLACK_EPOCHS };
@@ -2146,16 +2204,59 @@ fn hunt_due(
 /// per call with a 12 s outer cycle.
 const CATCHUP_MAX_IDLE_ROUNDS: u32 = 6;
 
-/// Catch the store's committee period up to wall clock — the behavioral twin
-/// of the Java `catchUpSyncCommittee`/`attemptCatchUpBatch`/
-/// `applyCatchUpResponses`: every fan-out peer gets the SAME
-/// `(current_period, count ≤ 128)` range request in parallel, so any single
-/// successful response starts with the EARLIEST missing period (the whole
-/// pipeline's bottleneck — the committee chain admits no gaps). Response
-/// chunks are staged at consecutive periods (a mislabeled chunk just fails
-/// verification at apply time and gets refetched) and the contiguous prefix
-/// is verified+applied as it forms, `force_rotate_if_past_period` after each
-/// applied update, exactly like the Java.
+/// Outstanding single-period asks the PREFIX period is allowed at once.
+/// The prefix is the pipeline's bottleneck (the committee chain admits no
+/// gaps), so it is never left to one server: the 2026-07-06 disjoint-range
+/// experiment did exactly that and stalled on mostly-unserving peers. Every
+/// batch-capable peer asks for it as well; look-ahead periods get one ask.
+const PREFIX_REDUNDANCY: usize = 2;
+
+/// Fewer distinct peers than this serving in the last minute — with no
+/// batch-capable server known and `THROUGHPUT_HUNT_MIN_SPAN` periods still
+/// ahead — means the walk is throughput-bound on a handful of quota-limited
+/// servers, and the LC hunt engages to find more (see
+/// `update_throughput_hunt`). Four single-period servers give ~4 periods per
+/// quota window, a month of mainnet in ~1 minute.
+const THROUGHPUT_HUNT_MIN_SERVERS: usize = 4;
+
+/// Periods still ahead below which a throughput-bound walk is left alone:
+/// with two or three periods left, a hunt cannot pay for itself.
+const THROUGHPUT_HUNT_MIN_SPAN: u64 = 3;
+
+/// Catch the store's committee period up to wall clock.
+///
+/// A PIPELINE, not a round: one long-lived set of in-flight `updates_by_range`
+/// asks is topped up every time a response lands, so the walk runs at the
+/// POOL's aggregate serve rate instead of one server's. Two ask shapes coexist:
+///
+/// - **Batch-capable peers** (anything not known to truncate) are asked for
+///   the PREFIX period with the full remaining span — the Java
+///   `attemptCatchUpBatch` shape, kept because the prefix is the pipeline's
+///   bottleneck (the committee chain admits no gaps) and must be redundantly
+///   requested. A multi-count ask is never cancelled behind a faster
+///   single-period answer: it stays in flight across top-ups, so a
+///   Nimbus/roost batch lands whenever it finishes and is drained in order.
+/// - **Single-period servers** (Lighthouse enforces one `updates_by_range`
+///   per ~10 s per peer, `agent_serves_one_period` / `single_period_peers`)
+///   each get a DISTINCT look-ahead period: the prefix up to
+///   `PREFIX_REDUNDANCY` times, then the lowest period nobody has staged or
+///   asked for (`next_single_target`). After serving they sit out one
+///   `UPDATES_SERVE_COOLDOWN` — a PER-PEER quota mark, which replaces the old
+///   global pace: ten such servers now deliver ten periods per quota window
+///   where the round-and-sleep loop delivered one, and with a single server
+///   the cadence is unchanged (the quota wait below is that server's refill).
+///
+/// Response chunks are staged at consecutive periods (a mislabeled chunk just
+/// fails verification at apply time and gets refetched) and the contiguous
+/// prefix is verified+applied as it forms, `force_rotate_if_past_period`
+/// after each applied update, exactly like the Java.
+///
+/// The disjoint-range experiment of 2026-07-06 performed worse because it
+/// handed the prefix to ONE mostly-unserving peer. Here the prefix keeps every
+/// batch-capable peer plus `PREFIX_REDUNDANCY` single servers; only the
+/// look-ahead is spread, and a look-ahead ask that fails simply frees its
+/// period for the next top-up.
+#[allow(clippy::too_many_arguments)]
 async fn catch_up(
     config: &ChainConfig,
     client: &ReqRespClient,
@@ -2171,53 +2272,127 @@ async fn catch_up(
     resume: &mut ResumeGuard,
     last_persisted_period: &mut u64,
     anchor: &ExecAnchor,
-    hunt_confirmed: &HashSet<PeerId>,
-    hunting: bool,
+    // Hunt state, shared with the outer loop: `catch_up` runs for many cycles
+    // before returning, so a walk that turns out to be THROUGHPUT-bound (few
+    // servers, none batch-capable, a long span ahead) must engage the hunt
+    // from IN HERE — boost flag plus tail probing in the quota-wait window —
+    // and the outer loop's `hunt_due` must see the verdict
+    // (`throughput_bound`) so its next pass does not disengage it.
+    // `hunt_probed` / `hunt_confirmed` are the probe bookkeeping `hunt_round`
+    // needs.
+    hunt_confirmed: &mut HashSet<PeerId>,
+    hunt_probed: &mut HashMap<PeerId, Instant>,
+    hunting: &mut bool,
+    hunt_boost: &AtomicBool,
+    throughput_bound: &mut bool,
 ) -> bool {
+    type Answer = (Peer, u64, u64, Result<Vec<u8>, RequestError>);
+    // The pipeline: every outstanding ask, across top-ups. Boxed because each
+    // top-up's async block is its own anonymous type.
+    let mut in_flight: FuturesUnordered<futures::future::BoxFuture<'static, Answer>> =
+        FuturesUnordered::new();
+    // Peers with an ask outstanding — never asked twice concurrently.
+    let mut busy: HashSet<PeerId> = HashSet::new();
+    // Outstanding SINGLE-period asks per target period (multi-count asks all
+    // start at the prefix and are not counted: they are redundancy plus the
+    // batch chance, never something a look-ahead relies on).
+    let mut covered: HashMap<u64, usize> = HashMap::new();
+    // A "wave" is the life of the pipeline from empty to empty again: the
+    // unit of idle/backoff and poison accounting (the old round). Top-ups
+    // inside a wave keep it alive; it ends only when nothing is outstanding
+    // and nobody free is left to ask.
+    let mut wave_active = false;
+    let mut wave_progress = false; // staged grew or a period applied
+    let mut wave_applied = 0usize;
+    let mut wave_poisoned = false;
+    let mut wave_rejects = 0usize;
+    let mut last_reject_participants: Option<usize> = None;
     let mut idle_rounds = 0u32;
-    // Exponential pause after fruitless rounds: hammering the whole pool every
-    // ~13 s is exactly what CL peer scoring penalizes, and it burns request
-    // quota on servers that will serve happily a minute later.
+    // Exponential pause after fruitless waves: hammering the whole pool every
+    // few seconds is exactly what CL peer scoring penalizes, and it burns
+    // request quota on servers that will serve happily a minute later.
     let mut empty_backoff = Duration::from_secs(0);
-    // Pace after a SUCCESSFUL round instead of re-asking instantly: LC servers
-    // (Lighthouse) serve ~one update per ~10 s quota window, so the instant
-    // re-ask always came back empty — which put the just-serving peer on
-    // cooldown, rotated the fan-out to non-servers, and climbed the 5→40 s
-    // empty-round backoff ladder. Observed on-device: 20–95 s per period
-    // where the quota allows ~11 s. Sleeping one quota window keeps the
-    // serving peer in the next round's fan-out with its quota refilled.
-    let mut pace_after_apply = false;
+    // Whether THIS call raised `hunting`, so it can lower it again when the
+    // pool stops being throughput-bound (a hunt engaged by the outer loop for
+    // another reason stays the outer loop's to disengage).
+    let mut hunt_engaged_here = false;
+
     loop {
         drain_discovered(peer_rx, pool);
         let slot_estimate = config.current_slot_estimate();
         let wall_period =
-        spec::compute_sync_committee_period_with(slot_estimate, config.slots_per_period());
+            spec::compute_sync_committee_period_with(slot_estimate, config.slots_per_period());
         // Start from the committee's own period, NOT the finalized slot's:
         // after a force-rotate the two diverge by one period (see the Java
         // comment in catchUpSyncCommittee).
         let committee_period = processor.store.current_period();
         if wall_period <= committee_period {
             tracing::info!(period = committee_period, "sync committee is current");
+            // The walk is over; the outer loop's hunt_due re-evaluates the
+            // hunt on its own triggers from here. Outstanding asks are
+            // dropped with `in_flight` — their periods are all applied.
+            *throughput_bound = false;
             return false;
-        }
-        // Sleeps AFTER the done-check: the final applied round must not pay
-        // an 11 s pace (or a backoff) just to discover there is no next
-        // request to protect — SYNCED publishes immediately.
-        if pace_after_apply {
-            pace_after_apply = false;
-            tracing::info!(pace_s = UPDATES_SERVE_COOLDOWN.as_secs(),
-                "catch-up: pacing to the LC serve quota before the next round");
-            tokio::time::sleep(UPDATES_SERVE_COOLDOWN).await;
-        } else if !empty_backoff.is_zero() {
-            tracing::info!(backoff_s = empty_backoff.as_secs(),
-                "catch-up: no progress last round — backing off before retrying");
-            tokio::time::sleep(empty_backoff).await;
         }
         *staged = staged.split_off(&committee_period); // drop already-passed periods
         let span = (wall_period - committee_period).min(UPDATES_BATCH_MAX);
-        tracing::info!(from_period = committee_period, wall_period, span,
-            staged = staged.len(), "catch-up: requesting updates_by_range");
 
+        // ── Wave accounting: the pipeline drained without a top-up refilling it.
+        if wave_active && in_flight.is_empty() {
+            wave_active = false;
+            if wave_poisoned && wave_applied == 0 {
+                return true; // whole wave rejected — restored snapshot can't verify anything
+            }
+            if wave_progress {
+                idle_rounds = 0;
+                empty_backoff = Duration::from_secs(0);
+            } else {
+                idle_rounds += 1;
+                if wave_rejects > 0 {
+                    // Loud on purpose (hosts keep info+ only in their log
+                    // rings): a wave whose staged update for the target period
+                    // keeps failing verification is how a serving peer holding
+                    // a weak update stalls catch-up INDEFINITELY — exactly this
+                    // shape hid a server-side weak-participation update
+                    // (113/512 signers at mainnet period 1840) behind
+                    // debug-only logs for days. The per-check reason logs at
+                    // debug in myotis_consensus::store. (Counts verify-rejects
+                    // only; a chunk that fails DECODE stays debug —
+                    // apply_staged_step reports it as neither applied nor
+                    // rejected, because malformed frames say nothing about our
+                    // store or the period's data.)
+                    tracing::warn!(period = committee_period, rejects = wave_rejects,
+                        idle_rounds, participants = ?last_reject_participants,
+                        "catch-up: staged update for the target period failed verification — \
+                         below-2/3 participants means the serving peer holds a weak update");
+                }
+                if idle_rounds >= CATCHUP_MAX_IDLE_ROUNDS {
+                    tracing::warn!(period = committee_period, idle_rounds,
+                        "catch-up made no progress — returning to the poll loop");
+                    return false;
+                }
+                // Grow the pre-wave pause 5s → 25s: rapid-fire empty waves
+                // burn server quota and our own peer score, but with per-peer
+                // quota marks preventing self-inflicted empties, the waves
+                // that reach here are genuine server droughts — and a 60 s
+                // ceiling meant up to a minute of blindness after a server
+                // RETURNED (droughts dominated measured cold syncs). 25 s
+                // samples recovery twice as fast at bounded quota cost:
+                // CATCHUP_MAX_IDLE_ROUNDS exits to the outer poll loop after
+                // 6 fruitless waves either way.
+                empty_backoff = if empty_backoff.is_zero() {
+                    Duration::from_secs(5)
+                } else {
+                    (empty_backoff * 2).min(Duration::from_secs(25))
+                };
+                tracing::info!(backoff_s = empty_backoff.as_secs(), idle_rounds,
+                    "catch-up: no progress last wave — backing off before retrying");
+                tokio::time::sleep(empty_backoff).await;
+                continue; // re-read the clock and discovery before asking again
+            }
+        }
+
+        // ── Top-up: hand every free, quota-refilled candidate an ask.
         let reqresp::CatchupPeerMeta { mut lc_servers, earliest_slots, agents } =
             client.catchup_peer_meta().await;
         // Reconcile the deny set against the LIVE Identify signal (same protocol
@@ -2256,392 +2431,396 @@ async fn catch_up(
             })
             .map(|(id, _)| id)
             .collect();
-        let peers = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers, &too_shallow);
-        if peers.is_empty() {
+        let candidates = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers, &too_shallow);
+        if candidates.is_empty() && in_flight.is_empty() {
             tracing::warn!("catch-up: no peers available — retrying after discovery");
             return false;
         }
-
-        // Every peer gets the SAME (committee_period, span) request — the Java
-        // attemptCatchUpBatch fan-out, kept deliberately: the prefix period is
-        // the whole pipeline's bottleneck, so it must be redundantly requested;
-        // any single good response advances it. (A staggered disjoint-range
-        // variant was tried live 2026-07-06 and performed WORSE — it made the
-        // prefix a single point of failure among mostly-unserving peers.)
-        let mut ssz_request = Vec::with_capacity(16);
-        ssz_request.extend_from_slice(&committee_period.to_le_bytes());
-        ssz_request.extend_from_slice(&span.to_le_bytes());
-        let wire = codec::encode_request(&ssz_request);
-
-        // count=1 variant for quota-limited servers (see single_period_peers).
-        let mut single_ssz = Vec::with_capacity(16);
-        single_ssz.extend_from_slice(&committee_period.to_le_bytes());
-        single_ssz.extend_from_slice(&1u64.to_le_bytes());
-        let single_wire = codec::encode_request(&single_ssz);
-        // Snapshot: the closures below cannot borrow `pool` (it is mutated as
-        // responses land).
-        let pool_wants_single: HashSet<PeerId> = peers
-            .iter()
-            .filter(|p| pool.wants_single_period(&p.id))
-            .map(|p| p.id)
-            .collect();
-
-        let staged_before = staged.len();
-        let mut poisoned_this_round = false;
-        let mut round_rejects = 0usize;
-        let mut last_reject_participants: Option<usize> = None;
-        let mut in_flight: FuturesUnordered<_> = peers
+        // Free = not already asked, and outside its serve-quota window.
+        // candidates() respects cooldowns in its main pass but its
+        // never-starve fallback does not, so filter here too: asking a peer
+        // inside its quota window just earns an empty answer and another
+        // cooldown — the self-inflicted drought the old global pace existed
+        // to avoid.
+        let free: Vec<Peer> = candidates
             .into_iter()
-            .map(|peer| {
-                let client = client.clone();
-                // Same START period for every peer — see the fan-out comment
-                // above; the prefix period is the pipeline's bottleneck and must
-                // be redundantly requested. The COUNT is per-peer: a server that
-                // closed on a multi-period ask (Lighthouse's quota) is asked for
-                // exactly one, so it can serve instead of being struck out.
-                // Lighthouse gets count=1 from the FIRST ask (its quota makes a
-                // multi-count request yield one chunk then a closed stream); the
-                // reactive single_period_peers mark covers clients we don't know.
-                let single = pool_wants_single.contains(&peer.id)
-                    || agent_serves_one_period(agents.get(&peer.id).map(String::as_str));
-                let (sub_from, sub_count) = (committee_period, if single { 1 } else { span });
-                tracing::debug!(peer = %peer.id, sub_count,
-                    agent = agents.get(&peer.id).map(String::as_str).unwrap_or("?"),
-                    "catch-up: updates_by_range request");
-                let wire = if single { single_wire.clone() } else { wire.clone() };
-                async move {
-                    let res = client
-                        .request_raw(peer.id, peer.addr.clone(), protocols::UPDATES_BY_RANGE, wire)
-                        .await;
-                    (peer, sub_from, sub_count, res)
-                }
-            })
+            .filter(|p| !busy.contains(&p.id) && pool.cooled_down(&p.id))
+            .take(CATCHUP_FANOUT.saturating_sub(in_flight.len()))
             .collect();
-
-        // Collect responses into the staging buffer: chunk i of a response is
-        // staged at its request's sub_from + i (responses are consecutive per
-        // spec; a peer that violates that just fails verify at apply time).
-        // The contiguous prefix is applied AS RESPONSES ARRIVE; the round runs
-        // until every sub-range answered or the span is fully staged — with
-        // disjoint ranges, stragglers carry periods nobody else was asked for.
-        let mut applied = 0usize;
-        while let Some((peer, sub_from, sub_count, res)) = in_flight.next().await {
-            let raw = match res {
-                Ok(raw) => raw,
-                Err(e) => {
-                    if e == RequestError::UnsupportedProtocol {
-                        // Doesn't serve updates_by_range at all — skip in future
-                        // batches (Java peersNoLcUpdates). Peer is alive, keep it.
-                        // Both are no-ops for a static peer: the pool exempts it,
-                        // and the shared cache is read by the Java engine, which
-                        // would otherwise inherit the denial for a curated peer
-                        // (PR #322 review) — so gate the persist on it too.
-                        pool.mark_no_lc_updates(peer.id);
-                        if !pool.is_static(&peer.id) {
-                            clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
-                        }
-                    } else if e == RequestError::ConnectionClosed && sub_count > 1 {
-                        // NOT a dead peer: Lighthouse enforces its
-                        // updates_by_range quota by closing the stream on any
-                        // multi-count request while answering count=1 fine
-                        // (verified live, v8.2.2). Charging a failure here would
-                        // three-strike the entire Lighthouse-class population —
-                        // and the verify-reject rotation steers traffic straight
-                        // at them. Remember to ask this peer one period at a
-                        // time instead, and cost it nothing.
-                        pool.mark_single_period(peer.id);
-                        tracing::debug!(peer = %peer.id, sub_count,
-                            "closed on a multi-period ask — will request one period at a time");
-                    } else if e != RequestError::Shutdown {
-                        // Dial/timeout/connection-closed — count toward eviction
-                        // so dead peers stop occupying MAX_POOL slots.
-                        pool.note_failure(peer.id);
-                        clcache.mark_failure(&format!("{}/p2p/{}", peer.addr, peer.id));
-                    }
-                    tracing::debug!(peer = %peer.id, error = %e, "updates_by_range failed");
-                    continue;
+        let (mut asked_single, mut asked_multi, mut look_ahead_to) = (0usize, 0usize, committee_period);
+        for peer in free {
+            // The COUNT is per-peer: a server that closed on a multi-period ask
+            // (Lighthouse's quota) is asked for exactly one, so it can serve
+            // instead of being struck out. Lighthouse gets count=1 from the
+            // FIRST ask (its quota makes a multi-count request yield one chunk
+            // then a closed stream); the reactive single_period_peers mark
+            // covers clients we don't know.
+            let single = pool.wants_single_period(&peer.id)
+                || agent_serves_one_period(agents.get(&peer.id).map(String::as_str));
+            let (sub_from, sub_count) = if single {
+                match next_single_target(committee_period, span, staged, &covered) {
+                    Some(target) => (target, 1u64),
+                    None => continue, // every period is staged or already asked
                 }
+            } else {
+                (committee_period, span)
             };
-            if raw.len() < 64 {
-                // Tiny frames are peers closing without serving (0 B) or sending
-                // near-empty chunks; dumped verbatim at debug for peer forensics.
-                tracing::debug!(peer = %peer.id, raw_len = raw.len(),
-                    hex = %raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    "small updates_by_range frame");
+            if single {
+                *covered.entry(sub_from).or_insert(0) += 1;
+                asked_single += 1;
+                look_ahead_to = look_ahead_to.max(sub_from);
+            } else {
+                asked_multi += 1;
             }
-            let peer_key = format!("{}/p2p/{}", peer.addr, peer.id);
-            let chunks = match codec::decode_multi_chunk_response(&raw, sub_count as usize) {
-                Ok(c) => c,
-                Err(e) => {
-                    // Undecodable response — with the codec's read budget this
-                    // is also where a byte-dribbling peer lands (it used to hit
-                    // the behaviour timeout instead). Charge it the same way so
-                    // 3-strike eviction still prunes peers that never produce
-                    // a usable chunk.
+            busy.insert(peer.id);
+            let mut ssz_request = Vec::with_capacity(16);
+            ssz_request.extend_from_slice(&sub_from.to_le_bytes());
+            ssz_request.extend_from_slice(&sub_count.to_le_bytes());
+            let wire = codec::encode_request(&ssz_request);
+            tracing::debug!(peer = %peer.id, sub_from, sub_count,
+                agent = agents.get(&peer.id).map(String::as_str).unwrap_or("?"),
+                "catch-up: updates_by_range request");
+            let client = client.clone();
+            in_flight.push(Box::pin(async move {
+                let res = client
+                    .request_raw(peer.id, peer.addr.clone(), protocols::UPDATES_BY_RANGE, wire)
+                    .await;
+                (peer, sub_from, sub_count, res)
+            }));
+        }
+        if asked_single + asked_multi > 0 {
+            tracing::info!(from_period = committee_period, wall_period, span,
+                staged = staged.len(), in_flight = in_flight.len(),
+                asked_single, asked_multi, look_ahead_to,
+                "catch-up: requesting updates_by_range");
+        }
+
+        if in_flight.is_empty() {
+            // Nobody free to ask and nothing outstanding — but servers exist:
+            // they are all inside their serve-quota window. Wait for the
+            // earliest refill (the single-server cadence of the old pace),
+            // and use the wait to probe for MORE servers when the walk is
+            // throughput-bound. Not idle: progress is quota-bound, not
+            // server-bound.
+            let now = Instant::now();
+            let wait = pool
+                .earliest_cooldown_expiry()
+                .map(|until| until.saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO)
+                .clamp(Duration::from_millis(250), UPDATES_SERVE_COOLDOWN);
+            update_throughput_hunt(
+                pool, wall_period, hunting, hunt_boost, throughput_bound, &mut hunt_engaged_here,
+                processor.store.current_period(),
+            );
+            if *throughput_bound {
+                tracing::info!(wait_ms = wait.as_millis() as u64,
+                    "catch-up: every server is inside its serve quota — probing for more servers meanwhile");
+                let (_, _) = tokio::join!(
+                    tokio::time::sleep(wait),
+                    hunt_round(client, pool, processor, clcache, hunt_probed, hunt_confirmed),
+                );
+            } else {
+                tracing::info!(wait_ms = wait.as_millis() as u64,
+                    "catch-up: every server is inside its serve quota — waiting for a refill");
+                tokio::time::sleep(wait).await;
+            }
+            continue;
+        }
+        if !wave_active {
+            wave_active = true;
+            wave_progress = false;
+            wave_applied = 0;
+            wave_poisoned = false;
+            wave_rejects = 0;
+            last_reject_participants = None;
+        }
+
+        // ── One response.
+        let Some((peer, sub_from, sub_count, res)) = in_flight.next().await else {
+            continue;
+        };
+        busy.remove(&peer.id);
+        if sub_count == 1 {
+            if let Some(n) = covered.get_mut(&sub_from) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    covered.remove(&sub_from);
+                }
+            }
+        }
+        let raw = match res {
+            Ok(raw) => raw,
+            Err(e) => {
+                if e == RequestError::UnsupportedProtocol {
+                    // Doesn't serve updates_by_range at all — skip in future
+                    // asks (Java peersNoLcUpdates). Peer is alive, keep it.
+                    // Both are no-ops for a static peer: the pool exempts it,
+                    // and the shared cache is read by the Java engine, which
+                    // would otherwise inherit the denial for a curated peer
+                    // (PR #322 review) — so gate the persist on it too.
+                    pool.mark_no_lc_updates(peer.id);
+                    if !pool.is_static(&peer.id) {
+                        clcache.mark_nolc(&format!("{}/p2p/{}", peer.addr, peer.id));
+                    }
+                } else if e == RequestError::ConnectionClosed && sub_count > 1 {
+                    // NOT a dead peer: Lighthouse enforces its updates_by_range
+                    // quota by closing the stream on any multi-count request
+                    // while answering count=1 fine (verified live, v8.2.2).
+                    // Charging a failure here would three-strike the entire
+                    // Lighthouse-class population — and the verify-reject
+                    // rotation steers traffic straight at them. Remember to
+                    // ask this peer one period at a time instead, and cost it
+                    // nothing: the next top-up hands it a look-ahead period.
+                    pool.mark_single_period(peer.id);
+                    tracing::debug!(peer = %peer.id, sub_count,
+                        "closed on a multi-period ask — will request one period at a time");
+                } else if e != RequestError::Shutdown {
+                    // Dial/timeout/connection-closed — count toward eviction
+                    // so dead peers stop occupying MAX_POOL slots.
                     pool.note_failure(peer.id);
-                    clcache.mark_failure(&peer_key);
-                    tracing::debug!(peer = %peer.id, raw_len = raw.len(), error = %e,
-                        "updates_by_range frame invalid");
-                    continue;
+                    clcache.mark_failure(&format!("{}/p2p/{}", peer.addr, peer.id));
                 }
-            };
-            let mut served = 0usize;
-            for (i, chunk) in chunks.into_iter().enumerate() {
-                if chunk.is_empty() {
-                    break; // truncated/empty chunk — nothing after it is trustworthy
+                tracing::debug!(peer = %peer.id, error = %e, "updates_by_range failed");
+                continue;
+            }
+        };
+        if raw.len() < 64 {
+            // Tiny frames are peers closing without serving (0 B) or sending
+            // near-empty chunks; dumped verbatim at debug for peer forensics.
+            tracing::debug!(peer = %peer.id, raw_len = raw.len(),
+                hex = %raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "small updates_by_range frame");
+        }
+        let peer_key = format!("{}/p2p/{}", peer.addr, peer.id);
+        let chunks = match codec::decode_multi_chunk_response(&raw, sub_count as usize) {
+            Ok(c) => c,
+            Err(e) => {
+                // Undecodable response — with the codec's read budget this is
+                // also where a byte-dribbling peer lands (it used to hit the
+                // behaviour timeout instead). Charge it the same way so
+                // 3-strike eviction still prunes peers that never produce a
+                // usable chunk.
+                pool.note_failure(peer.id);
+                clcache.mark_failure(&peer_key);
+                tracing::debug!(peer = %peer.id, raw_len = raw.len(), error = %e,
+                    "updates_by_range frame invalid");
+                continue;
+            }
+        };
+        let mut served = 0usize;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            if chunk.is_empty() {
+                break; // truncated/empty chunk — nothing after it is trustworthy
+            }
+            served += 1;
+            match staged.entry(sub_from + i as u64) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(StagedChunk {
+                        ssz: chunk,
+                        from: peer_key.clone(),
+                        alternates: Vec::new(),
+                    });
                 }
-                served += 1;
-                match staged.entry(sub_from + i as u64) {
-                    std::collections::btree_map::Entry::Vacant(v) => {
-                        v.insert(StagedChunk {
-                            ssz: chunk,
-                            from: peer_key.clone(),
-                            alternates: Vec::new(),
-                        });
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut o) => {
-                        // Another peer already staged this period: keep this
-                        // copy as a FALLBACK rather than dropping it, so a
-                        // verify-reject on the leader can try someone else's
-                        // (see StagedChunk::alternates). Skip byte-identical
-                        // copies — they would fail verification identically.
-                        let slot = o.get_mut();
-                        if slot.alternates.len() < MAX_STAGED_ALTERNATES
-                            && slot.ssz != chunk
-                            && !slot.alternates.iter().any(|(ssz, _)| *ssz == chunk)
-                        {
-                            slot.alternates.push((chunk, peer_key.clone()));
-                        }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    // Another peer already staged this period: keep this copy
+                    // as a FALLBACK rather than dropping it, so a verify-reject
+                    // on the leader can try someone else's (see
+                    // StagedChunk::alternates). Skip byte-identical copies —
+                    // they would fail verification identically.
+                    let slot = o.get_mut();
+                    if slot.alternates.len() < MAX_STAGED_ALTERNATES
+                        && slot.ssz != chunk
+                        && !slot.alternates.iter().any(|(ssz, _)| *ssz == chunk)
+                    {
+                        slot.alternates.push((chunk, peer_key.clone()));
                     }
                 }
             }
-            if served > 0 {
-                tracing::info!(peer = %peer.id, sub_from, sub_count, served,
-                    raw_len = raw.len(), "updates_by_range served");
-                // A peer that answered DOES serve the protocol, so reverse any
-                // stale nolc verdict — that part is factual. But it is NOT yet
-                // "proven": mark_proven also grants the preferred tier and
-                // wipes fail_counts, and granting that for mere DELIVERY is
-                // what let a fast peer serving an unverifiable update keep
-                // winning selection forever (mainnet 1840). Promotion now
-                // happens only where the update actually VERIFIES, below.
-                //
-                // PARITY (#342): this mirrors the Java reference, which records
-                // a catch-up server ONLY inside `if (applied > 0)` after
-                // processUpdate returned true (BeaconLightClient
-                // .applyCatchUpResponses). The Java engine never had this stall
-                // precisely because it credits verification, not delivery —
-                // keep the two in step.
-                pool.clear_no_lc_for(peer.id);
-                // Deliberately NO cooldown for a peer that just served: it is
-                // often the only willing server in the pool, and the ~13 s
-                // round cadence sits at Lighthouse's ~1-per-10s quota anyway —
-                // the Java client re-asks its serving peer the same way.
-                // Apply at most ONE staged update here — just enough BLS to
-                // decide this response is the round's winner. The rest of the
-                // staged prefix (up to 128 periods from a generous server) is
-                // drained AFTER the fan-out is dropped, so the stragglers'
-                // redundant multi-MiB streams are cancelled behind one
-                // signature verification instead of a full batch of them.
-                let before_period = processor.store.current_period();
-                let step = apply_staged_step(processor, staged, slot_estimate);
-                let (applied_now, verify_rejects, applied_from) =
-                    (step.applied, step.verify_rejects, step.applied_from.clone());
-                // PR #409: carry the participant count into the round WARN so a
-                // below-2/3 stall explains itself.
-                round_rejects += verify_rejects;
-                if let Some(p) = step.reject_participants {
-                    last_reject_participants = Some(p);
+        }
+        if served == 0 {
+            // Unserving answer — NOW the cooldown applies, so the next top-up
+            // rotates toward peers that might actually serve.
+            pool.set_updates_cooldown(peer.id);
+            tracing::debug!(peer = %peer.id, sub_from, sub_count, raw_len = raw.len(),
+                "updates_by_range returned no chunks");
+            continue;
+        }
+        wave_progress = true; // the buffer grew — progress toward the prefix
+        tracing::info!(peer = %peer.id, sub_from, sub_count, served, raw_len = raw.len(),
+            "updates_by_range served");
+        // A peer that answered DOES serve the protocol, so reverse any stale
+        // nolc verdict — that part is factual. But it is NOT yet "proven":
+        // mark_proven also grants the preferred tier and wipes fail_counts,
+        // and granting that for mere DELIVERY is what let a fast peer serving
+        // an unverifiable update keep winning selection forever (mainnet
+        // 1840). Promotion happens only where the update actually VERIFIES,
+        // below.
+        //
+        // PARITY (#342): this mirrors the Java reference, which records a
+        // catch-up server ONLY inside `if (applied > 0)` after processUpdate
+        // returned true (BeaconLightClient.applyCatchUpResponses). The Java
+        // engine never had this stall precisely because it credits
+        // verification, not delivery — keep the two in step.
+        pool.clear_no_lc_for(peer.id);
+        if sub_count == 1 {
+            // Per-peer serve quota: a single-period server that just served
+            // answers empty for the next ~10 s (Lighthouse one_every(10s)),
+            // so sit it out for one window instead of pacing the WHOLE walk
+            // — the other servers' quotas are what the look-ahead spends
+            // meanwhile. Batch servers (multi-count asks) carry no such mark.
+            pool.set_updates_cooldown(peer.id);
+        }
+
+        // ── Apply the contiguous prefix as far as it now reaches. One update
+        // per iteration: persist after EVERY period so an Android kill
+        // mid-drain loses at most one period's BLS work, publish so the
+        // progress bar tracks the drain, and yield so back-to-back BLS
+        // verifications don't pin this worker while the swarm task needs it.
+        // Each period is credited to the peer whose response staged it (not
+        // necessarily this responder: alternates and look-ahead chunks from
+        // earlier responses apply here too — `applied_from` names the source).
+        let mut applied_now_total = 0usize;
+        let mut applied_by: HashMap<PeerId, usize> = HashMap::new();
+        loop {
+            let before_period = processor.store.current_period();
+            let step = apply_staged_step(processor, staged, slot_estimate);
+            wave_rejects += step.verify_rejects;
+            if let Some(p) = step.reject_participants {
+                last_reject_participants = Some(p);
+            }
+            // Charge every peer whose chunk failed verification — by peer KEY,
+            // so the strike lands on whoever actually served the bad copy
+            // rather than on whoever happened to respond last.
+            for bad in &step.rejected_from {
+                if let Some(id) = pool.id_for_key(bad) {
+                    pool.note_verify_reject(id);
+                    clcache.mark_failure(bad);
+                    tracing::warn!(peer = %bad, period = before_period,
+                        "catch-up: update failed verification — peer penalised, \
+                         will try another next round");
                 }
-                // Charge every peer whose chunk failed verification — by peer
-                // KEY, so the strike lands on whoever actually served the bad
-                // copy rather than on whoever happened to respond last.
-                for bad in &step.rejected_from {
-                    if let Some(id) = pool.id_for_key(bad) {
-                        pool.note_verify_reject(id);
-                        clcache.mark_failure(bad);
-                        tracing::warn!(peer = %bad, period = before_period,
-                            "catch-up: update failed verification — peer penalised, \
-                             will try another next round");
-                    }
-                }
-                // ORDER MATTERS: an apply in this batch BLS-verified against
-                // the restored committee and proves the snapshot genuine —
-                // confirm() must win over poison accounting (a reject in the
-                // same batch is a stale/bad chunk another peer staged, not
-                // evidence against the snapshot; counting it first was
-                // exactly how one bad peer could get a good snapshot
-                // deleted despite an honest serve landing in the same round).
-                if applied_now == 0
-                    && verify_rejects > 0
-                    && resume.poisoned(verify_rejects as u32)
+            }
+            if step.applied == 0 {
+                // ORDER MATTERS: an apply BLS-verified against the restored
+                // committee proves the snapshot genuine — confirm() (below,
+                // on the first apply) must win over poison accounting. A
+                // reject with no apply yet is evidence; the verdict is
+                // deferred to wave end so a slower HONEST response can still
+                // confirm the snapshot — a fast bad peer must not win.
+                if applied_now_total == 0
+                    && step.verify_rejects > 0
+                    && resume.poisoned(step.verify_rejects as u32)
                 {
-                    // Defer the verdict to round end: a slower HONEST response
-                    // in this same round can still apply and confirm the
-                    // snapshot — a fast bad peer must not win the race. If an
-                    // apply lands, confirm() resets the guard and the pending
-                    // flag below is ignored.
-                    poisoned_this_round = true;
-                    continue;
+                    wave_poisoned = true;
                 }
-                if applied_now > 0 {
-                    resume.confirm();
-                    // Promotion belongs HERE — to the peer whose update actually
-                    // VERIFIED, which is not necessarily this responder: with
-                    // alternates (and with chunks lingering from earlier
-                    // responses) the applied copy can be someone else's, and
-                    // `applied_from` names its true source. Crediting the
-                    // responder instead would wipe strikes and grant priority
-                    // to a peer that merely delivered bytes (PR #410 review).
-                    let credited = applied_from
-                        .as_deref()
-                        .and_then(|key| pool.id_for_key(key))
-                        .unwrap_or(peer.id);
-                    pool.mark_proven(credited);
-                    pool.note_served(credited); // BLS-verified and applied
-                    // Only VERIFIED periods reach the shared cross-engine
-                    // cache, credited to the peer whose response STAGED the
-                    // applied chunk — usually this responder, but a chunk
-                    // lingering from an earlier response can be the one that
-                    // applies (Java applyCatchUpResponses records AFTER
-                    // processUpdate the same way — never before verification).
-                    if let Some(key) = applied_from.as_deref() {
-                        clcache.record_served(key, before_period, before_period);
-                    }
-                    applied += applied_now;
-                    empty_backoff = Duration::from_secs(0);
-                    // The fastest serving peer won this round — abandon the
-                    // stragglers (identical requests make them redundant) and
-                    // start the next round from the advanced period.
-                    break;
-                }
-            } else {
-                // Unserving answer — NOW the cooldown applies, so the next
-                // round rotates toward peers that might actually serve.
-                pool.set_updates_cooldown(peer.id);
-                tracing::debug!(peer = %peer.id, sub_from, sub_count, raw_len = raw.len(),
-                    "updates_by_range returned no chunks");
+                break;
+            }
+            if applied_now_total == 0 {
+                resume.confirm();
+            }
+            applied_now_total += step.applied;
+            // Promotion belongs to the peer whose update actually VERIFIED —
+            // crediting the responder instead would wipe strikes and grant
+            // priority to a peer that merely delivered bytes (PR #410 review).
+            // Only VERIFIED periods reach the shared cross-engine cache, the
+            // same way (Java applyCatchUpResponses records AFTER processUpdate).
+            let credited = step
+                .applied_from
+                .as_deref()
+                .and_then(|key| pool.id_for_key(key))
+                .unwrap_or(peer.id);
+            pool.mark_proven(credited);
+            pool.note_served(credited); // BLS-verified and applied
+            *applied_by.entry(credited).or_insert(0) += 1;
+            if let Some(key) = step.applied_from.as_deref() {
+                clcache.record_served(key, before_period, before_period);
+            }
+            persist_snapshot(config, processor, last_persisted_period);
+            publish_status(config, client, processor, &*pool, status_tx, anchor, *hunting).await;
+            tokio::task::yield_now().await;
+        }
+        if applied_now_total == 0 {
+            continue; // staged a look-ahead period; the prefix is still outstanding
+        }
+        wave_applied += applied_now_total;
+        tracing::info!(applied = applied_now_total, staged = staged.len(),
+            in_flight = in_flight.len(),
+            period = processor.store.current_period(),
+            finalized_slot = processor.store.finalized_slot(),
+            "catch-up applied");
+        // Promote verified batch servers: two or more periods applied from
+        // one peer's response — preferred by candidates() from now on.
+        for (id, n) in &applied_by {
+            if *n >= 2 && pool.mark_batch_server(*id) {
+                tracing::info!(peer = %id, periods = n,
+                    "catch-up: batch-capable LC server confirmed — preferred from now on");
             }
         }
-        drop(in_flight);
+        update_throughput_hunt(
+            pool, wall_period, hunting, hunt_boost, throughput_bound, &mut hunt_engaged_here,
+            processor.store.current_period(),
+        );
+    }
+}
 
-        if poisoned_this_round && applied == 0 {
-            return true; // whole round rejected — restored snapshot can't verify anything
+/// Engage or release the throughput hunt: a walk with a long span ahead, no
+/// batch-capable server in the pool, and fewer than
+/// `THROUGHPUT_HUNT_MIN_SERVERS` peers serving is going as fast as the few
+/// quota-limited servers allow, and only MORE servers (boosted discovery +
+/// probing the unproven tail) can speed it up. Releases the hunt this call
+/// raised as soon as any of the three conditions stops holding.
+fn update_throughput_hunt(
+    pool: &PeerPool,
+    wall_period: u64,
+    hunting: &mut bool,
+    hunt_boost: &AtomicBool,
+    throughput_bound: &mut bool,
+    hunt_engaged_here: &mut bool,
+    store_period: u64,
+) {
+    let remaining = wall_period.saturating_sub(store_period);
+    let servers = pool.served_last_minute();
+    let bound = remaining >= THROUGHPUT_HUNT_MIN_SPAN
+        && !pool.has_batch_server()
+        && servers < THROUGHPUT_HUNT_MIN_SERVERS;
+    if bound && !*throughput_bound {
+        *throughput_bound = true;
+        if !*hunting {
+            *hunting = true;
+            *hunt_engaged_here = true;
+            hunt_boost.store(true, Ordering::Relaxed);
         }
-
-        if applied > 0 {
-            // Drain the rest of the contiguous staged prefix — a generous
-            // response stages up to the whole remaining span. One update per
-            // iteration: persist after EVERY period so an Android kill
-            // mid-drain loses at most one period's BLS work, not the whole
-            // batch (the ~50 KiB write+rename is milliseconds next to the
-            // ~100 ms BLS verify it checkpoints), publish so the progress bar
-            // tracks the drain instead of jumping at round end, and yield so
-            // back-to-back BLS verifications don't pin this worker while the
-            // swarm task needs it. A verify-reject here is a stale chunk some
-            // other peer staged earlier — the winner already confirmed the
-            // store, so it is dropped for refetch without poison accounting.
-            // Each period is credited to the peer whose response staged it.
-            let mut drained = 0usize;
-            loop {
-                let before_period = processor.store.current_period();
-                let step = apply_staged_step(processor, staged, slot_estimate);
-                let (applied_now, applied_from) = (step.applied, step.applied_from.clone());
-                // Same accounting AND the same WARN as the first apply path:
-                // future-period chunks retained from earlier responders commonly
-                // reject here, and silencing it would leave the Logs tab without
-                // the peer-and-period line this fix promises (PR #410 review).
-                for bad in &step.rejected_from {
-                    if let Some(id) = pool.id_for_key(bad) {
-                        pool.note_verify_reject(id);
-                        clcache.mark_failure(bad);
-                        tracing::warn!(peer = %bad, period = before_period,
-                            "catch-up: update failed verification — peer penalised, \
-                             will try another next round");
-                    }
-                }
-                if applied_now == 0 {
-                    break;
-                }
-                applied += applied_now;
-                drained += 1;
-                if let Some(key) = applied_from.as_deref() {
-                    if let Some(id) = pool.id_for_key(key) {
-                        pool.mark_proven(id);
-                        pool.note_served(id);
-                    }
-                    clcache.record_served(key, before_period, before_period);
-                }
-                persist_snapshot(config, processor, last_persisted_period);
-                publish_status(config, client, processor, &*pool, status_tx, anchor, hunting).await;
-                tokio::task::yield_now().await;
-            }
-            tracing::info!(applied, staged = staged.len(),
-                period = processor.store.current_period(),
-                finalized_slot = processor.store.finalized_slot(),
-                "catch-up round applied");
-            if drained == 0 {
-                // Single-period round (truncating server): the drain didn't
-                // run, so this is the round's one publish+persist. Persisting
-                // every applied period — not just when catch_up returns —
-                // is what keeps an Android kill (reinstall, OOM, user swipe)
-                // from losing every verified period since bootstrap
-                // (observed: 4 periods re-verified after a reinstall).
-                publish_status(config, client, processor, &*pool, status_tx, anchor, hunting).await;
-                persist_snapshot(config, processor, last_persisted_period);
-            }
-            idle_rounds = 0;
-            pace_after_apply = true;
-        } else if staged.len() > staged_before {
-            // No prefix advance yet, but the buffer grew — that's progress
-            // toward unblocking the earliest period; keep going.
-            tracing::debug!(staged = staged.len(), "catch-up staged new periods");
-            idle_rounds = 0;
-            empty_backoff = Duration::from_secs(0);
-        } else {
-            idle_rounds += 1;
-            if round_rejects > 0 {
-                // Loud on purpose (hosts keep info+ only in their log rings): a
-                // round whose staged update for the target period keeps failing
-                // verification is how a serving peer holding a weak update
-                // stalls catch-up INDEFINITELY — exactly this shape hid a
-                // server-side weak-participation update (113/512 signers at
-                // mainnet period 1840) behind debug-only logs for days. The
-                // per-check reason logs at debug in myotis_consensus::store.
-                // (Counts verify-rejects only; a chunk that fails DECODE stays
-                // debug — apply_staged_step reports it as neither applied nor
-                // rejected, because malformed frames say nothing about our
-                // store or the period's data.)
-                tracing::warn!(period = processor.store.current_period(),
-                    rejects = round_rejects, idle_rounds,
-                    participants = ?last_reject_participants,
-                    "catch-up: staged update for the target period failed verification — \
-                     below-2/3 participants means the serving peer holds a weak update");
-            }
-            if idle_rounds >= CATCHUP_MAX_IDLE_ROUNDS {
-                tracing::warn!(period = processor.store.current_period(), idle_rounds,
-                    "catch-up made no progress — returning to the poll loop");
-                return false;
-            }
-            // Grow the pre-round pause 5s → 25s: rapid-fire empty rounds burn
-            // server quota and our own peer score, but with the post-apply
-            // pacing preventing self-inflicted empties, the rounds that reach
-            // here are genuine server droughts — and a 60 s ceiling meant up
-            // to a minute of blindness after a server RETURNED (droughts
-            // dominated measured cold syncs). 25 s samples recovery twice as
-            // fast at bounded quota cost: CATCHUP_MAX_IDLE_ROUNDS exits to
-            // the outer poll loop after 6 fruitless rounds either way, so a
-            // sustained drought cycles at most ~35% more request bursts than
-            // the 60 s ceiling did — it cannot hammer indefinitely faster.
-            empty_backoff = if empty_backoff.is_zero() {
-                Duration::from_secs(5)
-            } else {
-                (empty_backoff * 2).min(Duration::from_secs(25))
-            };
-            tracing::debug!(period = processor.store.current_period(), idle_rounds,
-                "catch-up round made no progress — retrying after backoff");
+        tracing::info!(remaining, servers, pool = pool.len(),
+            "LC hunt engaged — catch-up is throughput-bound on a few single-period \
+             servers; searching for more (batch-capable) servers");
+    } else if !bound && *throughput_bound {
+        *throughput_bound = false;
+        if *hunt_engaged_here {
+            *hunt_engaged_here = false;
+            *hunting = false;
+            hunt_boost.store(false, Ordering::Relaxed);
+            tracing::info!(remaining, servers, batch = pool.has_batch_server(),
+                "LC hunt disengaged — catch-up is no longer throughput-bound");
         }
     }
+}
+
+/// The period a free single-period server should be asked for: the lowest in
+/// `[from, from + span)` that is neither staged nor already covered by enough
+/// outstanding single asks — `PREFIX_REDUNDANCY` for the prefix (the
+/// bottleneck period stays redundantly requested, the lesson of the
+/// 2026-07-06 disjoint-range experiment), one for every look-ahead period.
+/// None when the whole span is staged or asked.
+fn next_single_target(
+    from: u64,
+    span: u64,
+    staged: &std::collections::BTreeMap<u64, StagedChunk>,
+    covered: &HashMap<u64, usize>,
+) -> Option<u64> {
+    (from..from.saturating_add(span)).find(|p| {
+        let want = if *p == from { PREFIX_REDUNDANCY } else { 1 };
+        !staged.contains_key(p) && covered.get(p).copied().unwrap_or(0) < want
+    })
 }
 
 /// Verify+apply AT MOST ONE staged update — the one at the store's current
@@ -3674,31 +3853,111 @@ mod tests {
         let z = Duration::ZERO;
 
         // Bootstrap stall: only after the stall window.
-        assert!(!hunt_due(false, false, Duration::from_secs(10), z, wall, 0, 0, epoch, 8192));
-        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, wall, 0, 0, epoch, 8192));
+        assert!(!hunt_due(false, false, Duration::from_secs(10), z, false, wall, 0, 0, epoch, 8192));
+        assert!(hunt_due(false, false, HUNT_BOOTSTRAP_STALL, z, false, wall, 0, 0, epoch, 8192));
 
         // Finality starvation: period current + finalized older than slack.
-        assert!(hunt_due(false, true, z, z, wall, period, wall - slack - 1, epoch, 8192));
+        assert!(hunt_due(false, true, z, z, false, wall, period, wall - slack - 1, epoch, 8192));
         // Fresh finality → no hunt.
-        assert!(!hunt_due(false, true, z, z, wall, period, wall - 64, epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, false, wall, period, wall - 64, epoch, 8192));
 
         // PROGRESSING catch-up (period behind, store advancing) → no hunt:
         // catch-up's own wide fan-out covers the pool; hunting double-dials.
-        assert!(!hunt_due(false, true, z, z, wall, period - 1, wall - slack - 1, epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, false, wall, period - 1, wall - slack - 1,
+            epoch, 8192));
+        // THROUGHPUT-BOUND catch-up (progressing, but catch_up says the walk
+        // is limited to a few quota-bound servers) → hunt, even with fresh
+        // progress; and the flag means nothing once the period is current.
+        assert!(hunt_due(false, true, z, z, true, wall, period - 1, wall - slack - 1,
+            epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, true, wall, period, wall - 64, epoch, 8192));
         // STARVED catch-up (no store progress past the stall window) → hunt.
-        assert!(hunt_due(false, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
+        assert!(hunt_due(false, true, z, HUNT_CATCHUP_STALL, false, wall, period - 1,
             wall - slack - 1, epoch, 8192));
         // ...and an ENGAGED hunt survives the period boundary the same way
         // (finality starvation rotating into catch-up must not disengage).
-        assert!(hunt_due(true, true, z, HUNT_CATCHUP_STALL, wall, period - 1,
+        assert!(hunt_due(true, true, z, HUNT_CATCHUP_STALL, false, wall, period - 1,
             wall - slack - 1, epoch, 8192));
 
         // Hysteresis on the finality trigger: at staleness between the
         // engaged and disengaged thresholds, an engaged hunt stays on and a
         // disengaged one stays off (no flapping at the boundary).
         let between = wall - slack + epoch - 1; // stale by SLACK-1 epochs + 1 slot
-        assert!(hunt_due(true, true, z, z, wall, period, between, epoch, 8192));
-        assert!(!hunt_due(false, true, z, z, wall, period, between, epoch, 8192));
+        assert!(hunt_due(true, true, z, z, false, wall, period, between, epoch, 8192));
+        assert!(!hunt_due(false, true, z, z, false, wall, period, between, epoch, 8192));
+    }
+
+    #[test]
+    fn batch_servers_lead_the_proven_tier() {
+        let mut pool = PeerPool::new();
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let kp = libp2p::identity::Keypair::generate_secp256k1();
+            let id = kp.public().to_peer_id();
+            ids.push(id);
+            pool.add(id, format!("/ip4/10.0.2.{i}/tcp/9000").parse().unwrap());
+        }
+        for id in &ids {
+            pool.mark_proven(*id);
+        }
+        // ids[2] served most recently (a Lighthouse count=1 winner); ids[0]
+        // is the batch server that served earlier.
+        pool.note_served(ids[0]);
+        std::thread::sleep(Duration::from_millis(5));
+        pool.note_served(ids[2]);
+        assert!(pool.mark_batch_server(ids[0]));
+        assert!(!pool.mark_batch_server(ids[0]), "idempotent: second mark reports nothing new");
+        assert!(pool.has_batch_server());
+        let got: Vec<PeerId> = pool
+            .candidates(3, true, true, &HashSet::new(), &HashSet::new())
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(got[0], ids[0], "batch server first regardless of serve recency");
+        assert_eq!(got[1], ids[2], "then most-recently-served");
+        assert_eq!(got[2], ids[1]);
+    }
+
+    #[test]
+    fn next_single_target_spreads_lookahead_and_keeps_prefix_redundant() {
+        let mut staged = std::collections::BTreeMap::new();
+        let mut covered: HashMap<u64, usize> = HashMap::new();
+        let chunk = || StagedChunk { ssz: vec![1], from: String::new(), alternates: Vec::new() };
+        // Empty pipeline: the prefix first, PREFIX_REDUNDANCY times.
+        assert_eq!(next_single_target(100, 5, &staged, &covered), Some(100));
+        for _ in 0..PREFIX_REDUNDANCY {
+            *covered.entry(100).or_insert(0) += 1;
+        }
+        // Prefix saturated: look-ahead periods, one ask each, in order.
+        assert_eq!(next_single_target(100, 5, &staged, &covered), Some(101));
+        covered.insert(101, 1);
+        assert_eq!(next_single_target(100, 5, &staged, &covered), Some(102));
+        // A staged period is skipped (a look-ahead chunk already landed).
+        staged.insert(102, chunk());
+        assert_eq!(next_single_target(100, 5, &staged, &covered), Some(103));
+        // Whole span covered or staged → nothing to ask.
+        covered.insert(103, 1);
+        staged.insert(104, chunk());
+        assert_eq!(next_single_target(100, 5, &staged, &covered), None);
+        // An ask that came back frees its period again.
+        covered.remove(&101);
+        assert_eq!(next_single_target(100, 5, &staged, &covered), Some(101));
+        // Zero span never asks.
+        assert_eq!(next_single_target(100, 0, &staged, &covered), None);
+    }
+
+    #[test]
+    fn earliest_cooldown_expiry_is_the_pipelines_wakeup() {
+        let mut pool = PeerPool::new();
+        let kp = libp2p::identity::Keypair::generate_secp256k1();
+        let id = kp.public().to_peer_id();
+        pool.add(id, "/ip4/10.0.3.1/tcp/9000".parse().unwrap());
+        assert!(pool.earliest_cooldown_expiry().is_none());
+        pool.set_updates_cooldown(id);
+        let until = pool.earliest_cooldown_expiry().expect("a cooling peer");
+        let left = until.saturating_duration_since(Instant::now());
+        assert!(left <= UPDATES_SERVE_COOLDOWN && left > UPDATES_SERVE_COOLDOWN / 2);
+        assert!(!pool.cooled_down(&id));
     }
 
     #[test]
