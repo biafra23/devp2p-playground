@@ -40,8 +40,13 @@ on:
         type: choice
         options: [gnosis, mainnet, sepolia]
         default: gnosis
+      scope:
+        description: "full = all three checks (release). pins-only = skip the deep walk."
+        type: choice
+        options: [full, pins-only]
+        default: full
       anchor_root:
-        description: "Old anchor block root (64 hex). Empty = run only the no-pins test."
+        description: "Old anchor block root (64 hex). Required when scope is full."
         type: string
         default: ""
       anchor_slot:
@@ -60,7 +65,7 @@ permissions:
 
 jobs:
   cold-start:
-    name: cold start (${{ inputs.network }})
+    name: cold start (${{ inputs.network }}, ${{ inputs.scope }})
     runs-on: ubuntu-latest
     # Both budgets plus the build, with headroom: the old-anchor test alone
     # allows 30 minutes of walking.
@@ -75,6 +80,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+
+      # A green tick must not mean "the release check ran" when the deep walk
+      # was silently skipped for want of an anchor. Skipping is a CHOICE
+      # (scope: pins-only), never an accident of leaving a field blank.
+      - name: Refuse a full run without an anchor
+        if: inputs.scope == 'full' && (inputs.anchor_root == '' || inputs.anchor_slot == '')
+        run: |
+          echo "::error::scope=full runs the old-anchor regression, which needs both" \
+               "anchor_root and anchor_slot. Supply them, or dispatch with scope=pins-only" \
+               "to deliberately run only the pin census and the dead-pins cold start."
+          exit 1
 
       - name: Build the tests
         working-directory: rust
@@ -103,14 +119,11 @@ jobs:
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
 
-      # Deep catch-up: skipped only when NEITHER anchor input is supplied, so
-      # "no anchor given" does not look like a failure. A HALF-supplied anchor
-      # still runs the test, which fails loudly on its own must-accompany
-      # guards — an operator who typed a root meant this to run, and skipping
-      # there would be the job-level version of the fake green the test itself
-      # refuses.
+      # Runs for every scope except an explicit pins-only, so a missing or
+      # half-supplied anchor reaches the test's own loud guards rather than
+      # skipping green. The gate above already refused a blank full run.
       - name: Cold start from an old anchor
-        if: inputs.anchor_root != '' || inputs.anchor_slot != ''
+        if: inputs.scope != 'pins-only'
         working-directory: rust
         env:
           NET: ${{ inputs.network }}

@@ -42,6 +42,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::Multiaddr;
+use myotis_consensus::store::LightClientProcessor;
+use myotis_consensus::types::LightClientBootstrap;
+use myotis_consensus::{spec, ssz};
 use myotis_net::codec;
 use myotis_net::reqresp::{self, LocalStatus};
 use myotis_net::status::StatusMessage;
@@ -209,16 +212,52 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
         match outcome.expect("the retry loop always runs at least once") {
             Ok(Ok(raw)) => match codec::decode_response(&raw, true) {
                 Ok(d) if !d.ssz_payload.is_empty() => {
-                    // A decodable success chunk, and its context bytes name the
-                    // fork it was framed under — check that too, or "the fork
-                    // digest agrees" is a claim nothing verifies.
+                    // Framing alone is not evidence. Apply the SAME acceptance
+                    // the production bootstrap path does (sync.rs): the
+                    // checkpoint pin — we chose the root, the peer chose the
+                    // payload — plus both Merkle branches. Without it a
+                    // bootstrap for some other anchor, or bytes that merely
+                    // decompress, would count as a healthy pin that a fresh
+                    // install then rejects.
                     let ours = config.current_fork_digest();
-                    if d.fork_digest != ours {
-                        dead.push(format!(
-                            "{pin} — served a bootstrap framed for fork {:02x?}, we speak {ours:02x?}",
+                    let verdict = if d.fork_digest != ours {
+                        Err(format!(
+                            "served a bootstrap framed for fork {:02x?}, we speak {ours:02x?}",
                             d.fork_digest
-                        ));
-                        eprintln!("[pins] FORK {addr} ({:02x?} != {ours:02x?})", d.fork_digest);
+                        ))
+                    } else {
+                        match LightClientBootstrap::decode(&d.ssz_payload) {
+                            Err(e) => Err(format!("bootstrap did not decode: {e}")),
+                            Ok(b) if b.header.beacon.hash_tree_root() != config.checkpoint_root => {
+                                Err(format!(
+                                    "served a bootstrap for root {}, not our anchor",
+                                    b.header.beacon.hash_tree_root()[..8]
+                                        .iter()
+                                        .map(|x| format!("{x:02x}"))
+                                        .collect::<String>()
+                                ))
+                            }
+                            Ok(b) => {
+                                let depth = b.current_sync_committee_branch.len();
+                                if !ssz::verify_merkle_branch(
+                                    &b.current_sync_committee.hash_tree_root(),
+                                    &b.current_sync_committee_branch,
+                                    depth,
+                                    spec::sync_committee_gindex(depth),
+                                    &b.header.beacon.state_root,
+                                ) {
+                                    Err("sync-committee branch does not verify".to_string())
+                                } else if !LightClientProcessor::verify_execution_branch(&b.header) {
+                                    Err("execution branch does not verify".to_string())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        }
+                    };
+                    if let Err(why) = verdict {
+                        dead.push(format!("{pin} — {why}"));
+                        eprintln!("[pins] BAD  {addr} — {why}");
                     } else {
                         // #422 was "cannot CATCH UP", which needs
                         // updates_by_range — a server that bootstraps and then
