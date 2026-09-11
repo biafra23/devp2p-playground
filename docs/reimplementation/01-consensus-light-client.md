@@ -423,11 +423,15 @@ Accept the current digest plus the prior-fork digest (eases fork-transition wind
 
 ### 10.6 What is stubbed (flag for any port)
 
-- **Gossipsub is OFF by default and observation-only**: it subscribes to the
-  `light_client_finality_update` / `light_client_optimistic_update` topics, but the handler just
-  logs and returns `Ignore` — **no snappy decode, no SSZ decode, no validation, no message-id, no
-  mesh forwarding**. A real implementation that relied on gossip for liveness would need all of
-  that, plus fork-change resubscribe. The reference relies on req/resp polling instead.
+- **Gossipsub is always negotiated but never used for data.** The `/meshsub/` protocol must be
+  registered on every connection: Lighthouse reports a peer whose gossipsub negotiation fails as
+  `PeerAction::Fatal` ("does_not_support_gossipsub"), bans the peer id for 12 h, and bans the IP
+  once more than five of its peer ids are banned. Registering the protocol is all that check
+  needs. Topic subscription is a separate switch, OFF by default and observation-only: when on it
+  subscribes to the `light_client_finality_update` / `light_client_optimistic_update` topics, but
+  the handler just logs and returns `Ignore` — **no snappy decode, no SSZ decode, no validation,
+  no message-id, no mesh forwarding**. A real implementation that relied on gossip for liveness
+  would need all of that, plus fork-change resubscribe. The reference relies on req/resp polling.
 - `light_client_updates_by_range` / `beacon_blocks_by_range` **responders are absent** (the client
   can initiate, not serve; deliberately not advertised in Identify).
 - Metadata responder is hardcoded (seq 0, all-zero attnets/syncnets); finality/optimistic/bootstrap
