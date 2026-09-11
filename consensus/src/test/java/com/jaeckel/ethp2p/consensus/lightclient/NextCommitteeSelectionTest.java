@@ -75,10 +75,15 @@ class NextCommitteeSelectionTest {
         assertEquals(1778, BeaconChainSpec.computeSyncCommitteePeriod(second.signatureSlot()));
         assertFalse(signatureValid(second, f.store().getCurrentSyncCommittee()), "signed by the NEXT committee");
         assertTrue(signatureValid(second, f.store().getNextSyncCommittee()));
+        byte[] heldNextRoot = f.store().getNextSyncCommittee().hashTreeRoot();
         assertTrue(f.processor().processUpdate(second),
                 "a valid next-committee update must be accepted before rotation");
         assertEquals(1778, f.store().getCurrentSyncCommitteePeriod());
         assertEquals(second.finalizedHeader().beacon().slot(), f.store().getFinalizedSlot());
+        // The rotation installed the HELD next committee, not the P+2 committee this
+        // update carries (processUpdate stores an embedded next only when none is held).
+        assertTrue(Arrays.equals(heldNextRoot, f.store().getCurrentSyncCommittee().hashTreeRoot()));
+        assertNull(f.store().getNextSyncCommittee());
     }
 
     @Test
@@ -135,6 +140,21 @@ class NextCommitteeSelectionTest {
         // Its finalized slot is the first of period 1778, so the store rotated on apply.
         assertEquals(1778, f.store().getCurrentSyncCommitteePeriod());
         assertNull(f.store().getNextSyncCommittee());
+    }
+
+    @Test
+    void appliedFinalityUpdateReplayedWithARelabelledSlotIsRejected() throws IOException {
+        Fixture f = withNext();
+        LightClientUpdate first = LightClientUpdate.decode(corpus("001-update.ssz"));
+        LightClientFinalityUpdate applied = finalityOf(first, first.signatureSlot());
+        assertTrue(f.processor().processFinalityUpdate(applied));
+        // Same aggregate bytes, unsigned signature slot moved into period 1778: the
+        // duplicate memo must not answer for it — it faces the next committee's keys.
+        LightClientFinalityUpdate relabelled = finalityOf(first,
+                first.signatureSlot() + BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD);
+        assertFalse(f.processor().processFinalityUpdate(relabelled));
+        // The genuine duplicate is still memoised.
+        assertTrue(f.processor().processFinalityUpdate(applied));
     }
 
     @Test

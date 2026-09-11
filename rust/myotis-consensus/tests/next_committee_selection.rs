@@ -97,9 +97,14 @@ fn next_period_signature_uses_next_committee() {
     println!("valid real update: store={}, signature_slot={}, signature_period={}, finalized_slot={}",
         p.store.current_period(), second.signature_slot,
         spec::compute_sync_committee_period(second.signature_slot), second.finalized_header.beacon.slot);
+    let held_next_root = p.store.next_sync_committee().unwrap().hash_tree_root();
     assert!(p.process_update(&second), "valid next-committee signature must be accepted");
     assert_eq!(p.store.current_period(), 1778);
     assert_eq!(p.store.finalized_slot(), second.finalized_header.beacon.slot);
+    // The rotation installed the HELD next committee, not the P+2 committee this
+    // update carries (process_update stores an embedded next only when none is held).
+    assert_eq!(p.store.current_sync_committee().unwrap().hash_tree_root(), held_next_root);
+    assert!(p.store.next_sync_committee().is_none());
 }
 
 #[test]

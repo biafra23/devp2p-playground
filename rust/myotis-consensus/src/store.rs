@@ -170,8 +170,10 @@ impl LightClientStore {
 }
 
 /// Processes updates against a store — Rust twin of `LightClientProcessor` (minus
-/// the duplicate-signature fast path, which is a perf memo, not a verdict change:
-/// re-verifying a duplicate reaches the same `true`).
+/// the duplicate-signature fast path, which is a perf memo keyed on the applied
+/// signature AND its slot, behind the period gate — not a verdict change:
+/// re-verifying a duplicate reaches the same `true`, and a relabelled slot is
+/// not a duplicate).
 pub struct LightClientProcessor {
     pub store: LightClientStore,
     fork_version: [u8; 4],

@@ -30,6 +30,12 @@ public class LightClientProcessor {
      *  costs ~18s on Android/ART, so without this the steady-state loop burns a full
      *  core re-proving the same update. */
     private volatile byte[] lastAppliedFinalitySig;
+    /** The signature slot that {@link #lastAppliedFinalitySig} was applied under. The slot is not
+     *  covered by the signature, so the memo must key on both: the same aggregate relabelled into
+     *  another period is a different update that has to face the period gate and the next
+     *  committee's keys (#423), not the memo — and a memo hit must never be a verdict that
+     *  re-verification would not reach. */
+    private volatile long lastAppliedFinalitySigSlot = -1;
 
     public LightClientProcessor(LightClientStore store, byte[] forkVersion, byte[] genesisValidatorsRoot) {
         this.store = store;
@@ -75,20 +81,9 @@ public class LightClientProcessor {
         long finalizedSlot = update.finalizedHeader().beacon().slot();
         int participation = update.syncAggregate().countParticipants();
 
-        byte[] sig = update.syncAggregate().syncCommitteeSignature();
-        byte[] lastSig = lastAppliedFinalitySig;
-        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)) {
-            log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
-                    + "(attestedSlot={}) — skipping re-verify", attestedSlot);
-            return true;
-        }
-
-        log.debug("[lc-processor] Processing finality update: attestedSlot={}, finalizedSlot={}, " +
-                "signatureSlot={}, participation={}/512, finalityBranchLen={}",
-                attestedSlot, finalizedSlot, update.signatureSlot(),
-                participation, update.finalityBranch().length);
-
-        // Same period rule as processUpdate. This path had no gate at all and always
+        // Same period rule as processUpdate, and BEFORE the duplicate memo, so a memo hit
+        // can never be a verdict that re-verification would not reach. This path had no
+        // gate at all and always
         // used the current keys, so with the store at P holding next and a P+1-signed
         // finality update in hand (a local clock lagging the chain; the Rust engine's
         // hunt path while catch-up is starved) the update was rejected until a
@@ -101,6 +96,20 @@ public class LightClientProcessor {
                     + "storePeriod={} (attestedSlot={})", sigPeriod, storePeriod, attestedSlot);
             return false;
         }
+
+        byte[] sig = update.syncAggregate().syncCommitteeSignature();
+        byte[] lastSig = lastAppliedFinalitySig;
+        if (lastSig != null && java.util.Arrays.equals(lastSig, sig)
+                && lastAppliedFinalitySigSlot == update.signatureSlot()) {
+            log.debug("[lc-processor] Finality update is a duplicate of the already-applied one "
+                    + "(attestedSlot={}) — skipping re-verify", attestedSlot);
+            return true;
+        }
+
+        log.debug("[lc-processor] Processing finality update: attestedSlot={}, finalizedSlot={}, " +
+                "signatureSlot={}, participation={}/512, finalityBranchLen={}",
+                attestedSlot, finalizedSlot, update.signatureSlot(),
+                participation, update.finalityBranch().length);
 
         // Verify sync aggregate over attested header
         if (!SyncCommitteeVerifier.verify(
@@ -161,6 +170,7 @@ public class LightClientProcessor {
         }
 
         lastAppliedFinalitySig = sig.clone();
+        lastAppliedFinalitySigSlot = update.signatureSlot();
         log.debug("[lc-processor] Finality update applied: finalizedSlot {} → {}", oldFinalizedSlot, finalizedSlot);
         return true;
     }
