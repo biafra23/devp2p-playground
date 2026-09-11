@@ -43,10 +43,6 @@ public class LightClientProcessor {
         log.info("[lc-processor] Initialized with forkSchedule={}", forkSchedule);
     }
 
-    public ForkSchedule getForkSchedule() {
-        return forkSchedule;
-    }
-
     /**
      * Process a {@link LightClientFinalityUpdate}.
      *

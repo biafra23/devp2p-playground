@@ -394,8 +394,9 @@ by chains with no DNS tree, e.g. Gnosis)`.
 (ascending (activation epoch, 4B version) list, genesis first, with the chain's slotsPerEpoch),
 acceptPriorForkDigest (bool), activeBlobParamsEpoch/MaxBlobs (EIP-7892 BPO),
 clPeerMultiaddrs, clGenesisTime, clEnrTreeUrls, clDiscv5Bootnodes (ENR strings)`.
-`currentForkVersion` / `priorForkVersion` are derived from the schedule (newest entry; the one
-before it when `acceptPriorForkDigest`).
+`currentForkVersion` / `priorForkVersion` are derived from the schedule at the WALL-CLOCK epoch
+(the active entry; the one before it when `acceptPriorForkDigest`), so the next fork can be
+pinned ahead of its activation without flipping the digest early.
 
 | | Mainnet | Gnosis | Sepolia |
 |---|---|---|---|
@@ -406,7 +407,7 @@ before it when `acceptPriorForkDigest`).
 | forkSchedule (epoch:version) | 0:`00000000`, 74240:`01000000`, 144896:`02000000`, 194048:`03000000`, 269568:`04000000`, 364032:`05000000`, 411392:`06000000` | 0:`00000064`, 512:`01000064`, 385536:`02000064`, 648704:`03000064`, 889856:`04000064`, 1337856:`05000064`, 1714688:`06000064` | 0:`90000069`, 50:`90000070`, 100:`90000071`, 56832:`90000072`, 132608:`90000073`, 222464:`90000074`, 272640:`90000075` |
 | currentForkVersion (derived) | `06000000` (Fulu) | `06000064` (Fulu) | `90000075` (Fulu) |
 | acceptPriorForkDigest → priorForkVersion | no → — | yes → `05000064` | no → — |
-| BPO (epoch, maxBlobs) | (419072, 21) | (1337856, 2) | (0, 0) |
+| BPO (epoch, maxBlobs) | (419072, 21) | (1337856, 2) | (275712, 21) |
 | clGenesisTime | 1606824023 | 1638993340 | 1655733600 |
 | secondsPerSlot / slotsPerEpoch | 12 / 32 | **5 / 16** | 12 / 32 |
 | EL/discv5/RPC ports | 30303/9000/8545 | 30304/9001/8546 | 30305/9002/8547 |

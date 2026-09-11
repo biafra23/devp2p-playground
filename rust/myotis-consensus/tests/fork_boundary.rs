@@ -11,7 +11,7 @@ use myotis_consensus::ssz::{self, Root};
 use myotis_consensus::store::{LightClientProcessor, LightClientStore};
 use myotis_consensus::types::{
     BeaconBlockHeader, ExecutionPayloadHeader, LightClientFinalityUpdate, LightClientHeader,
-    SyncAggregate, SyncCommittee, SYNC_COMMITTEE_SIZE,
+    LightClientUpdate, SyncAggregate, SyncCommittee, SYNC_COMMITTEE_SIZE,
 };
 use myotis_consensus::verify;
 
@@ -65,28 +65,8 @@ fn branch(levels: &[Vec<Root>], mut idx: usize) -> Vec<Root> {
 }
 
 fn execution_header() -> ExecutionPayloadHeader {
-    ExecutionPayloadHeader {
-        parent_hash: [0; 32],
-        fee_recipient: [0; 20],
-        state_root: [0; 32],
-        receipts_root: [0; 32],
-        logs_bloom: vec![0; 256],
-        prev_randao: [0; 32],
-        block_number: 0,
-        gas_limit: 0,
-        gas_used: 0,
-        timestamp: 0,
-        extra_data: vec![],
-        base_fee_per_gas: [0; 32],
-        block_hash: [0; 32],
-        transactions_root: [0; 32],
-        withdrawals_root: [0; 32],
-        blob_gas_used: 0,
-        excess_blob_gas: 0,
-        deposit_requests_root: None,
-        withdrawal_requests_root: None,
-        consolidation_requests_root: None,
-    }
+    // Any consistent header will do; only the bloom needs its real width.
+    ExecutionPayloadHeader { logs_bloom: vec![0; 256], ..Default::default() }
 }
 
 /// A header whose execution payload is genuinely committed to its body root
@@ -125,22 +105,56 @@ fn finality_update(
     leaves[leaf] = finalized_header.beacon.hash_tree_root();
     let lv = levels(leaves);
     let attested_header = header(signature_slot, lv.last().unwrap()[0]);
-
-    let domain = verify::compute_domain(&spec::DOMAIN_SYNC_COMMITTEE, &fork_version, &GVR);
-    let signing_root =
-        verify::compute_signing_root(&attested_header.beacon.hash_tree_root(), &domain);
-    let sigs: Vec<_> = keys.iter().map(|k| k.sign(&signing_root, myotis_bls::DST, &[])).collect();
-    let refs: Vec<_> = sigs.iter().collect();
-    let agg = AggregateSignature::aggregate(&refs, false).unwrap().to_signature();
-
+    let sync_aggregate = sign(keys, &attested_header, fork_version);
     LightClientFinalityUpdate {
         attested_header,
         finalized_header,
         finality_branch: branch(&lv, leaf),
-        sync_aggregate: SyncAggregate {
-            sync_committee_bits: [0xff; 64],
-            sync_committee_signature: agg.compress(),
-        },
+        sync_aggregate,
+        signature_slot,
+    }
+}
+
+/// The whole committee signs `attested` under `fork_version`.
+fn sign(keys: &[SecretKey], attested: &LightClientHeader, fork_version: [u8; 4]) -> SyncAggregate {
+    let domain = verify::compute_domain(&spec::DOMAIN_SYNC_COMMITTEE, &fork_version, &GVR);
+    let signing_root = verify::compute_signing_root(&attested.beacon.hash_tree_root(), &domain);
+    let sigs: Vec<_> = keys.iter().map(|k| k.sign(&signing_root, myotis_bls::DST, &[])).collect();
+    let refs: Vec<_> = sigs.iter().collect();
+    let agg = AggregateSignature::aggregate(&refs, false).unwrap().to_signature();
+    SyncAggregate { sync_committee_bits: [0xff; 64], sync_committee_signature: agg.compress() }
+}
+
+/// A catch-up update whose finality branch (depth 6, gindex 105) and
+/// next-sync-committee branch (depth 5, gindex 55) both verify against ONE
+/// attested state root: a 32-leaf state tree with the Checkpoint container at
+/// field 20 (epoch root || finalized root) and the committee at field 23.
+fn catch_up_update(
+    keys: &[SecretKey],
+    finalized_slot: u64,
+    signature_slot: u64,
+    fork_version: [u8; 4],
+) -> LightClientUpdate {
+    let finalized_header = header(finalized_slot, [0; 32]);
+    let next = committee(keys);
+    let zero = [0u8; 32];
+    let mut leaves = vec![zero; 32];
+    leaves[20] = ssz::sha256_pair(&zero, &finalized_header.beacon.hash_tree_root()); // Checkpoint{epoch, root}
+    leaves[23] = next.hash_tree_root();
+    let lv = levels(leaves);
+    let mut finality_branch = vec![zero]; // the epoch leaf, sibling of root inside Checkpoint
+    finality_branch.extend(branch(&lv, 20));
+    assert_eq!(finality_branch.len(), 6);
+    let next_sync_committee_branch = branch(&lv, 23);
+    let attested_header = header(signature_slot, lv.last().unwrap()[0]);
+    let sync_aggregate = sign(keys, &attested_header, fork_version);
+    LightClientUpdate {
+        attested_header,
+        next_sync_committee: next,
+        next_sync_committee_branch,
+        finalized_header,
+        finality_branch,
+        sync_aggregate,
         signature_slot,
     }
 }
@@ -163,6 +177,25 @@ fn verifies_one_update_on_each_side_of_a_fork_boundary() {
     assert_eq!(p.store.finalized_slot(), 200);
     // signature_slot 321: epoch(320) = 10 -> NEW.
     assert!(p.process_finality_update(&finality_update(&keys, 300, boundary_slot + 1, NEW)));
+    assert_eq!(p.store.finalized_slot(), 300);
+}
+
+/// The catch-up path (`LightClientUpdate`) — how a pre-fork checkpoint walks
+/// across the boundary. Java twin: `catchUpUpdatesVerifyAcrossForkBoundary`.
+#[test]
+fn catch_up_updates_verify_across_a_fork_boundary() {
+    let keys = keys();
+    let schedule = ForkSchedule::new(32, &[(0, OLD), (BOUNDARY_EPOCH, NEW)]);
+    let boundary_slot = BOUNDARY_EPOCH * 32;
+    let mut p = processor(&keys, schedule);
+
+    assert!(p.process_update(&catch_up_update(&keys, 200, boundary_slot, OLD)));
+    assert!(p.store.next_sync_committee().is_some(), "first update proves the next committee");
+    assert!(p.process_update(&catch_up_update(&keys, 300, boundary_slot + 1, NEW)));
+    assert_eq!(p.store.finalized_slot(), 300);
+    // Cross-signed: rejected on both sides.
+    assert!(!p.process_update(&catch_up_update(&keys, 400, boundary_slot, NEW)));
+    assert!(!p.process_update(&catch_up_update(&keys, 400, boundary_slot + 1, OLD)));
     assert_eq!(p.store.finalized_slot(), 300);
 }
 

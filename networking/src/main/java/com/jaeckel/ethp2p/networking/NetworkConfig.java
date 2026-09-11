@@ -33,7 +33,8 @@ public record NetworkConfig(
                                         // ascending, genesis first). Every sync-committee signature is
                                         // verified under the version active at its signature_slot, so the
                                         // light client can walk updates across a fork boundary (#295); the
-                                        // newest entry also feeds the fork digest. Append-only,
+                                        // entry active at the wall-clock epoch feeds the fork digest, so
+                                        // the NEXT fork may be pinned ahead of activation. Append-only,
                                         // consensus-critical, same trust standing as genesisValidatorsRoot:
                                         // pinned from the network's published config
                                         // (/eth/v1/config/fork_schedule), never fetched. Keep in lockstep
@@ -563,20 +564,32 @@ public record NetworkConfig(
     }
 
     /**
-     * The newest scheduled fork's version — the fork DIGEST input (discv5
-     * filtering, Status). Not a signing-domain input: the light client reads
-     * the schedule per update ({@link ForkSchedule#versionForSignatureSlot}).
+     * The fork version active NOW — the fork DIGEST input (discv5 filtering,
+     * Status, gossip topics). Read from the schedule at the wall-clock epoch, so
+     * the next fork can be pinned ahead of its activation without flipping the
+     * digest early (a not-yet-active digest matches no peer). Not a
+     * signing-domain input: the light client reads the schedule per update
+     * ({@link ForkSchedule#versionForSignatureSlot}).
      */
     public byte[] currentForkVersion() {
-        return forkSchedule.current();
+        return forkSchedule.versionAtEpoch(wallClockEpoch());
     }
 
     /**
-     * The prior scheduled fork's version when its digest is accepted
+     * The version of the fork before the active one when its digest is accepted
      * ({@link #acceptPriorForkDigest()}), else {@code null}.
      */
     public byte[] priorForkVersion() {
-        return acceptPriorForkDigest ? forkSchedule.prior() : null;
+        return acceptPriorForkDigest ? forkSchedule.priorVersionAtEpoch(wallClockEpoch()) : null;
+    }
+
+    /**
+     * Wall-clock beacon epoch of this chain. Clamped at 0 for a clock set before
+     * genesis (Rust twin: {@code ChainConfig::current_slot_estimate}, saturating).
+     */
+    public long wallClockEpoch() {
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000L - clGenesisTime) / secondsPerSlot();
+        return wallSlot / slotsPerEpoch();
     }
 
     /**

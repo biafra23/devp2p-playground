@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -27,8 +28,7 @@ class NetworkConfigForkScheduleTest {
         assertEquals(epochs.length, forks.size(), "entry count");
         for (int i = 0; i < epochs.length; i++) {
             assertEquals(epochs[i], forks.get(i).epoch(), "epoch of entry " + i);
-            assertArrayEquals(ForkSchedule.fork(0, versions[i]).version(), forks.get(i).version(),
-                    "version of entry " + i);
+            assertEquals(versions[i], forks.get(i).version(), "version of entry " + i);
         }
     }
 
@@ -72,12 +72,47 @@ class NetworkConfigForkScheduleTest {
         assertArrayEquals(new byte[]{0x06, 0, 0, 0x64}, c.forkSchedule().versionForSignatureSlot(27435009L));
     }
 
-    /** The schedule's geometry must be the chain's — the record constructor refuses otherwise. */
+    /**
+     * The digest-side "current" version is the schedule entry active at the WALL
+     * CLOCK, so the next fork can be pinned before it activates without flipping
+     * the digest early. Pinned with a far-future entry appended to each real
+     * schedule: every digest and version must be exactly what it is today.
+     */
     @Test
-    void everyScheduleCarriesItsChainsGeometry() {
+    void aFutureForkPinnedAheadDoesNotChangeTodaysDigest() {
         for (NetworkConfig c : List.of(NetworkConfig.MAINNET, NetworkConfig.SEPOLIA, NetworkConfig.GNOSIS)) {
-            assertEquals(c.slotsPerEpoch(), c.forkSchedule().slotsPerEpoch(), c.name());
+            assertArrayEquals(c.forkSchedule().newest(), c.currentForkVersion(),
+                    c.name() + ": every pinned fork is active today");
+            List<ForkSchedule.Fork> forks = new java.util.ArrayList<>(c.forkSchedule().forks());
+            forks.add(ForkSchedule.fork(Long.MAX_VALUE / 64, 0x7F000000)); // never activates in this test's lifetime
+            NetworkConfig ahead = new NetworkConfig(c.name(), c.networkId(), c.genesisHash(), c.bestBlockHash(),
+                    c.forkIdHash(), c.forkNext(), c.bootnodes(), c.genesisValidatorsRoot(), c.checkpointRoot(),
+                    c.checkpointSlot(), new ForkSchedule(c.forkSchedule().slotsPerEpoch(), forks),
+                    c.activeBlobParamsEpoch(), c.activeBlobParamsMaxBlobs(), c.acceptPriorForkDigest(),
+                    c.clPeerMultiaddrs(), c.beaconApiUrl(), c.clGenesisTime(), c.elEnrTreeUrls(),
+                    c.clEnrTreeUrls(), c.clDiscv5Bootnodes());
+            assertArrayEquals(c.currentForkVersion(), ahead.currentForkVersion(), c.name());
+            assertArrayEquals(c.currentForkDigest(), ahead.currentForkDigest(), c.name());
+            assertEquals(c.acceptedForkDigests().size(), ahead.acceptedForkDigests().size(), c.name());
+            for (int i = 0; i < c.acceptedForkDigests().size(); i++) {
+                assertArrayEquals(c.acceptedForkDigests().get(i), ahead.acceptedForkDigests().get(i), c.name());
+            }
+            // ...while signatures from that far future would already verify under it.
+            assertArrayEquals(new byte[]{0x7F, 0, 0, 0}, ahead.forkSchedule().versionForSignatureSlot(Long.MAX_VALUE));
         }
+    }
+
+    /** A schedule with another chain's geometry is refused at construction. */
+    @Test
+    void mismatchedGeometryIsRefused() {
+        NetworkConfig c = NetworkConfig.GNOSIS;
+        ForkSchedule mainnetGeometry = new ForkSchedule(32, c.forkSchedule().forks());
+        assertThrows(IllegalArgumentException.class, () -> new NetworkConfig(c.name(), c.networkId(),
+                c.genesisHash(), c.bestBlockHash(), c.forkIdHash(), c.forkNext(), c.bootnodes(),
+                c.genesisValidatorsRoot(), c.checkpointRoot(), c.checkpointSlot(), mainnetGeometry,
+                c.activeBlobParamsEpoch(), c.activeBlobParamsMaxBlobs(), c.acceptPriorForkDigest(),
+                c.clPeerMultiaddrs(), c.beaconApiUrl(), c.clGenesisTime(), c.elEnrTreeUrls(),
+                c.clEnrTreeUrls(), c.clDiscv5Bootnodes()));
     }
 
     /** The digest inputs are unchanged by the schedule refactor (live-verified values). */

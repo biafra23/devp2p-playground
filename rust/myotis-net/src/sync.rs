@@ -68,8 +68,9 @@ pub struct ChainConfig {
     /// The chain's full fork schedule — `(activation epoch, fork version)`,
     /// ascending, genesis first. Every sync-committee signature is verified
     /// under the version active at its `signature_slot`, so the store can walk
-    /// updates across a fork boundary (#295); the newest entry also feeds the
-    /// fork digest. Append-only, consensus-critical, same trust standing as
+    /// updates across a fork boundary (#295); the entry active at the
+    /// wall-clock epoch feeds the fork digest, so the NEXT fork may be pinned
+    /// ahead of activation. Append-only, consensus-critical, same trust standing as
     /// `genesis_validators_root`: pinned from the network's published config
     /// (`/eth/v1/config/fork_schedule`), never fetched at runtime. Keep in
     /// lockstep with the Java `NetworkConfig.forkSchedule` — both sides pin
@@ -131,6 +132,16 @@ impl ChainConfig {
         // committee for every update, silently. Both factors are compile-time
         // constants in every shipped config, so a panic here is a build error
         // surfacing, never a runtime condition.
+        // The fork schedule carries its own copy of slots_per_epoch (it maps
+        // signature slots to epochs); the Java NetworkConfig refuses a
+        // mismatch in its constructor and this is the Rust twin of that check,
+        // on the accessor every period division goes through.
+        assert_eq!(
+            self.fork_schedule.slots_per_epoch(),
+            self.slots_per_epoch,
+            "{}: fork_schedule geometry must match the chain's slots_per_epoch",
+            self.name
+        );
         self.slots_per_epoch
             .checked_mul(self.epochs_per_sync_committee_period)
             .filter(|p| *p > 0)
@@ -191,12 +202,14 @@ impl ChainConfig {
     }
 
     pub fn mainnet() -> Self {
+        // One binding for both the period math and the schedule's slot->epoch map.
+        let slots_per_epoch: u64 = 32;
         Self {
             name: "mainnet",
             chain_id: 1,
             // consensus-specs configs/mainnet.yaml *_FORK_EPOCH / *_FORK_VERSION.
             // Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
-            fork_schedule: ForkSchedule::new(32, &[
+            fork_schedule: ForkSchedule::new(slots_per_epoch, &[
                 (0, [0x00, 0x00, 0x00, 0x00]),       // phase0 (genesis)
                 (74_240, [0x01, 0x00, 0x00, 0x00]),  // altair
                 (144_896, [0x02, 0x00, 0x00, 0x00]), // bellatrix
@@ -211,7 +224,7 @@ impl ChainConfig {
             ),
             genesis_time: 1_606_824_023, // 2020-12-01 12:00:23 UTC
             seconds_per_slot: 12,
-            slots_per_epoch: 32,
+            slots_per_epoch,
             epochs_per_sync_committee_period: 256,
             // BPO2 (Fusaka) blob schedule entry: epoch 419072, MAX_BLOBS=21.
             blob_params_epoch: 419_072,
@@ -241,12 +254,14 @@ impl ChainConfig {
     /// `NetworkConfig.SEPOLIA` (networking/src/main/java/.../NetworkConfig.java),
     /// whose sepolia CL wiring landed in PR #192.
     pub fn sepolia() -> Self {
+        // One binding for both the period math and the schedule's slot->epoch map.
+        let slots_per_epoch: u64 = 32;
         Self {
             name: "sepolia",
             chain_id: 11_155_111,
             // eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH / *_FORK_VERSION.
             // Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
-            fork_schedule: ForkSchedule::new(32, &[
+            fork_schedule: ForkSchedule::new(slots_per_epoch, &[
                 (0, [0x90, 0x00, 0x00, 0x69]),       // phase0 (genesis)
                 (50, [0x90, 0x00, 0x00, 0x70]),      // altair
                 (100, [0x90, 0x00, 0x00, 0x71]),     // bellatrix
@@ -263,7 +278,7 @@ impl ChainConfig {
             ),
             genesis_time: 1_655_733_600, // 2022-06-20 14:00:00 UTC
             seconds_per_slot: 12, // mainnet preset
-            slots_per_epoch: 32,
+            slots_per_epoch,
             epochs_per_sync_committee_period: 256,
             // EIP-7892 BLOB_SCHEDULE — latest active entry on sepolia: BPO2 at
             // epoch 275712, MAX_BLOBS_PER_BLOCK=21 (2025-10-28).
@@ -300,13 +315,15 @@ impl ChainConfig {
     /// (still 8192 slots per sync-committee period: 512 epochs × 16), and a
     /// prior-fork digest fallback (Electra) accepted alongside the Fulu digest.
     pub fn gnosis() -> Self {
+        // One binding for both the period math and the schedule's slot->epoch map.
+        let slots_per_epoch: u64 = 16;
         Self {
             name: "gnosis",
             chain_id: 100,
             // gnosischain/configs mainnet/config.yaml *_FORK_EPOCH / *_FORK_VERSION
             // (16-slot epochs). Fulu (0x06000064) active since epoch 1714688
             // (2026-04-14); Electra's epoch is also the blob_params_epoch below.
-            fork_schedule: ForkSchedule::new(16, &[
+            fork_schedule: ForkSchedule::new(slots_per_epoch, &[
                 (0, [0x00, 0x00, 0x00, 0x64]),         // phase0 (genesis)
                 (512, [0x01, 0x00, 0x00, 0x64]),       // altair
                 (385_536, [0x02, 0x00, 0x00, 0x64]),   // bellatrix
@@ -322,7 +339,7 @@ impl ChainConfig {
             ),
             genesis_time: 1_638_993_340, // 2021-12-08 19:55:40 UTC
             seconds_per_slot: 5,
-            slots_per_epoch: 16,
+            slots_per_epoch,
             epochs_per_sync_committee_period: 512,
             // EIP-7892: Gnosis has no explicit BLOB_SCHEDULE — clients fold the
             // Electra-baseline params (ELECTRA_FORK_EPOCH=1337856, MAX_BLOBS=2)
@@ -390,21 +407,29 @@ impl ChainConfig {
         out
     }
 
-    /// The newest scheduled fork's version — the digest input (discv5 filter,
-    /// Status). NOT a signing-domain input: verification reads the schedule
-    /// per update (`ForkSchedule::version_for_signature_slot`).
+    /// The fork version active NOW — the digest input (discv5 filter, Status).
+    /// Read from the schedule at the wall-clock epoch, so the next fork can be
+    /// pinned ahead of its activation without flipping the digest early (a
+    /// not-yet-active digest matches no peer). NOT a signing-domain input:
+    /// verification reads the schedule per update
+    /// (`ForkSchedule::version_for_signature_slot`).
     pub fn current_fork_version(&self) -> [u8; 4] {
-        self.fork_schedule.current()
+        self.fork_schedule.version_at_epoch(self.wall_clock_epoch())
     }
 
-    /// The prior fork's version when its digest is accepted
-    /// (`accept_prior_fork_digest`), else `None`.
+    /// The version of the fork before the active one when its digest is
+    /// accepted (`accept_prior_fork_digest`), else `None`.
     pub fn prior_fork_version(&self) -> Option<[u8; 4]> {
         if self.accept_prior_fork_digest {
-            self.fork_schedule.prior()
+            self.fork_schedule.prior_version_at_epoch(self.wall_clock_epoch())
         } else {
             None
         }
+    }
+
+    /// Wall-clock beacon epoch (Java twin: `NetworkConfig.wallClockEpoch`).
+    pub fn wall_clock_epoch(&self) -> u64 {
+        self.current_slot_estimate() / self.slots_per_epoch.max(1)
     }
 
     pub fn current_fork_digest(&self) -> [u8; 4] {
@@ -3257,7 +3282,7 @@ mod tests {
         assert_eq!(c.prior_fork_version(), None); // fallback digest off
         // The FULL schedule (consensus-specs configs/mainnet.yaml) — the Java
         // twin (NetworkConfigForkScheduleTest) pins the same list.
-        assert_eq!(c.fork_schedule.slots_per_epoch(), 32);
+        assert_eq!(c.fork_schedule.slots_per_epoch(), c.slots_per_epoch);
         assert_eq!(
             c.fork_schedule.forks(),
             &[
@@ -3337,6 +3362,43 @@ mod tests {
         assert_eq!(c.chain_id, 1);
     }
 
+    /// The digest-side "current" version is the schedule entry active at the
+    /// WALL CLOCK, so the next fork can be pinned before it activates without
+    /// flipping the digest early. Pinned with a far-future entry appended to
+    /// each real schedule: every digest and version must be what it is today.
+    /// Java twin: NetworkConfigForkScheduleTest.aFutureForkPinnedAheadDoesNotChangeTodaysDigest.
+    #[test]
+    fn a_future_fork_pinned_ahead_does_not_change_todays_digest() {
+        for c in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
+            assert_eq!(c.current_fork_version(), c.fork_schedule.newest(),
+                "{}: every pinned fork is active today", c.name);
+            let mut forks = c.fork_schedule.forks().to_vec();
+            forks.push((u64::MAX / 64, [0x7F, 0, 0, 0])); // never activates in this test's lifetime
+            let ahead = ChainConfig {
+                fork_schedule: ForkSchedule::new(c.fork_schedule.slots_per_epoch(), &forks),
+                ..c.clone()
+            };
+            assert_eq!(ahead.current_fork_version(), c.current_fork_version(), "{}", c.name);
+            assert_eq!(ahead.current_fork_digest(), c.current_fork_digest(), "{}", c.name);
+            assert_eq!(ahead.accepted_fork_digests(), c.accepted_fork_digests(), "{}", c.name);
+            // ...while signatures from that far future would already verify under it.
+            assert_eq!(ahead.fork_schedule.version_for_signature_slot(u64::MAX), [0x7F, 0, 0, 0]);
+            // The geometry twin-check fires on the shared accessor.
+            let _ = ahead.slots_per_period();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "geometry must match")]
+    fn mismatched_schedule_geometry_is_refused() {
+        let c = ChainConfig::gnosis();
+        let wrong = ChainConfig {
+            fork_schedule: ForkSchedule::new(32, c.fork_schedule.forks()),
+            ..c
+        };
+        let _ = wrong.slots_per_period();
+    }
+
     #[test]
     fn sepolia_config_matches_networkconfig_java() {
         let c = ChainConfig::sepolia();
@@ -3344,7 +3406,7 @@ mod tests {
         assert_eq!(c.current_fork_version(), [0x90, 0x00, 0x00, 0x75]); // Fulu on sepolia
         assert_eq!(c.prior_fork_version(), None); // fallback digest off
         // eth-clients/sepolia metadata/config.yaml — Java twin pins the same.
-        assert_eq!(c.fork_schedule.slots_per_epoch(), 32);
+        assert_eq!(c.fork_schedule.slots_per_epoch(), c.slots_per_epoch);
         assert_eq!(
             c.fork_schedule.forks(),
             &[
@@ -3429,7 +3491,7 @@ mod tests {
         assert_eq!(c.prior_fork_version(), Some([0x05, 0x00, 0x00, 0x64])); // Electra
         // gnosischain/configs mainnet/config.yaml — Java twin pins the same.
         // 16-slot epochs: the schedule carries its own geometry.
-        assert_eq!(c.fork_schedule.slots_per_epoch(), 16);
+        assert_eq!((c.fork_schedule.slots_per_epoch(), c.slots_per_epoch), (16, 16));
         assert_eq!(
             c.fork_schedule.forks(),
             &[

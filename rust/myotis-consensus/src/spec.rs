@@ -45,15 +45,6 @@ pub fn finalized_root_gindex(branch_depth: usize) -> u64 {
     checkpoint_gindex * 2 + 1
 }
 
-/// `compute_epoch_at_slot` for a chain whose epoch is `slots_per_epoch` slots
-/// long. PANICS on zero for the same reason
-/// [`compute_sync_committee_period_with`] does: the fork schedule is keyed by
-/// epoch, so a defaulted geometry would silently pick a wrong signing domain.
-pub fn compute_epoch_at_slot_with(slot: u64, slots_per_epoch: u64) -> u64 {
-    assert!(slots_per_epoch > 0, "slots_per_epoch must be non-zero");
-    slot / slots_per_epoch
-}
-
 /// Mainnet-preset period math. Prefer [`compute_sync_committee_period_with`]
 /// wherever the chain is known — see its note.
 pub fn compute_sync_committee_period(slot: u64) -> u64 {

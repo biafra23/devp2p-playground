@@ -14,6 +14,15 @@
 //! one fixed version and were correct only because every checkpoint pin
 //! happened to sit after its network's newest fork.
 //!
+//! # Shippable ahead of activation
+//!
+//! The schedule may (and should) carry the NEXT scheduled fork before it
+//! activates: verification is keyed by the update's own slot, and the
+//! digest-side "active" version is read with [`ForkSchedule::version_at_epoch`]
+//! at the wall-clock epoch (`ChainConfig::current_fork_version`), so a future
+//! entry changes nothing until its epoch arrives. Only the blob-parameter
+//! (EIP-7892) digest fold remains a single configured value.
+//!
 //! # Trust posture
 //!
 //! Consensus-critical configuration with the same standing as the genesis
@@ -76,32 +85,38 @@ impl ForkSchedule {
         &self.forks
     }
 
-    /// The newest scheduled fork's version — what the legacy single
-    /// `fork_version` field held. Feeds the fork DIGEST (discv5 filtering,
-    /// Status), never signature verification.
-    pub fn current(&self) -> [u8; 4] {
+    /// The newest scheduled fork's version — possibly not yet active. Callers
+    /// that need the fork active NOW (the digest, Status) must use
+    /// [`version_at_epoch`](Self::version_at_epoch) with the wall-clock epoch;
+    /// this is for pins and diagnostics.
+    pub fn newest(&self) -> [u8; 4] {
         self.forks[self.forks.len() - 1].1
-    }
-
-    /// The fork before [`current`](Self::current), when the schedule has one.
-    pub fn prior(&self) -> Option<[u8; 4]> {
-        let n = self.forks.len();
-        (n >= 2).then(|| self.forks[n - 2].1)
     }
 
     /// `compute_fork_version(epoch)`: the version of the latest fork whose
     /// activation epoch is `<= epoch`. Total — the genesis entry covers epoch 0.
     pub fn version_at_epoch(&self, epoch: u64) -> [u8; 4] {
+        self.forks[self.index_at_epoch(epoch)].1
+    }
+
+    /// The version of the fork BEFORE the one active at `epoch`, or `None`
+    /// when that is the genesis fork — the discv5 prior-digest fallback input.
+    pub fn prior_version_at_epoch(&self, epoch: u64) -> Option<[u8; 4]> {
+        let i = self.index_at_epoch(epoch);
+        (i >= 1).then(|| self.forks[i - 1].1)
+    }
+
+    fn index_at_epoch(&self, epoch: u64) -> usize {
         // Ascending list; the last entry with activation <= epoch wins.
-        let mut version = self.forks[0].1;
-        for (activation, v) in &self.forks {
+        let mut idx = 0;
+        for (i, (activation, _)) in self.forks.iter().enumerate() {
             if *activation <= epoch {
-                version = *v;
+                idx = i;
             } else {
                 break;
             }
         }
-        version
+        idx
     }
 
     /// The fork version a sync aggregate signed at `signature_slot` must be
@@ -112,9 +127,8 @@ impl ForkSchedule {
     /// PREVIOUS slot, so a signature at the first slot of a fork's activation
     /// epoch still uses the old version, and only the next slot switches.
     pub fn version_for_signature_slot(&self, signature_slot: u64) -> [u8; 4] {
-        let epoch =
-            spec::compute_epoch_at_slot_with(signature_slot.max(1) - 1, self.slots_per_epoch);
-        self.version_at_epoch(epoch)
+        // slots_per_epoch is non-zero by construction (see `new`).
+        self.version_at_epoch((signature_slot.max(1) - 1) / self.slots_per_epoch)
     }
 }
 
@@ -164,13 +178,21 @@ mod tests {
     }
 
     #[test]
-    fn current_and_prior_are_the_tail() {
+    fn prior_version_is_the_one_before_the_active_fork() {
         let s = three();
-        assert_eq!(s.current(), C);
-        assert_eq!(s.prior(), Some(B));
+        assert_eq!(s.prior_version_at_epoch(0), None);
+        assert_eq!(s.prior_version_at_epoch(9), None);
+        assert_eq!(s.prior_version_at_epoch(10), Some(A));
+        assert_eq!(s.prior_version_at_epoch(20), Some(B));
+        assert_eq!(s.prior_version_at_epoch(u64::MAX), Some(B));
+    }
+
+    #[test]
+    fn newest_and_single() {
+        assert_eq!(three().newest(), C);
         let one = ForkSchedule::single(A);
-        assert_eq!(one.current(), A);
-        assert_eq!(one.prior(), None);
+        assert_eq!(one.newest(), A);
+        assert_eq!(one.prior_version_at_epoch(u64::MAX), None);
         assert_eq!(one.version_for_signature_slot(u64::MAX), A);
     }
 

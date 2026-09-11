@@ -180,11 +180,29 @@ class LightClientProcessorTest {
     /** Boundary epoch 10 = slot 320 on the mainnet preset. */
     private static final long BOUNDARY_EPOCH = 10;
     private static final long BOUNDARY_SLOT = BOUNDARY_EPOCH * 32;
+    /** The smallest participation the 2/3 rule accepts (341 is refused above):
+     *  Milagro signing is ~8 ms per signer, so every signer saved is CI time. */
+    private static final int MIN_PARTICIPANTS = 342;
+    /** Signed updates are immutable inputs here, so the four distinct ones are
+     *  built once for all boundary tests (each build signs 342 messages). */
+    private static final java.util.Map<String, Object> SIGNED = new java.util.HashMap<>();
 
     private static ForkSchedule boundarySchedule() {
         return ForkSchedule.of(32,
-                new ForkSchedule.Fork(0, OLD_FORK),
-                new ForkSchedule.Fork(BOUNDARY_EPOCH, NEW_FORK));
+                ForkSchedule.fork(0, 0x05000000),
+                ForkSchedule.fork(BOUNDARY_EPOCH, 0x06000000));
+    }
+
+    private LightClientFinalityUpdate boundaryFinality(long finalizedSlot, long signatureSlot, byte[] fork) {
+        String key = "fin:" + finalizedSlot + ":" + signatureSlot + ":" + fork[0];
+        return (LightClientFinalityUpdate) SIGNED.computeIfAbsent(key,
+                k -> buildFinalityUpdate(finalizedSlot, signatureSlot, MIN_PARTICIPANTS, fork));
+    }
+
+    private LightClientUpdate boundaryUpdate(long finalizedSlot, long signatureSlot, byte[] fork) {
+        String key = "upd:" + finalizedSlot + ":" + signatureSlot + ":" + fork[0];
+        return (LightClientUpdate) SIGNED.computeIfAbsent(key,
+                k -> buildUpdate(finalizedSlot, signatureSlot, fork));
     }
 
     /** Rust twin: tests/fork_boundary.rs. */
@@ -192,10 +210,24 @@ class LightClientProcessorTest {
     void verifiesAcrossForkBoundary() {
         LightClientProcessor p = new LightClientProcessor(store, boundarySchedule(), GVR);
         // signatureSlot 320: the spec verifies epoch(319) = 9 -> still OLD.
-        assertTrue(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
+        assertTrue(p.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT, OLD_FORK)));
         assertEquals(200L, store.getFinalizedSlot());
         // signatureSlot 321: epoch(320) = 10 -> NEW.
-        assertTrue(p.processFinalityUpdate(buildFinalityUpdate(300L, BOUNDARY_SLOT + 1, 512, NEW_FORK)));
+        assertTrue(p.processFinalityUpdate(boundaryFinality(300L, BOUNDARY_SLOT + 1, NEW_FORK)));
+        assertEquals(300L, store.getFinalizedSlot());
+    }
+
+    /** The catch-up path (LightClientUpdate) — how a pre-fork checkpoint walks across. */
+    @Test
+    void catchUpUpdatesVerifyAcrossForkBoundary() {
+        LightClientProcessor p = new LightClientProcessor(store, boundarySchedule(), GVR);
+        assertTrue(p.processUpdate(boundaryUpdate(200L, BOUNDARY_SLOT, OLD_FORK)));
+        assertNotNull(store.getNextSyncCommittee(), "first update proves the next committee");
+        assertTrue(p.processUpdate(boundaryUpdate(300L, BOUNDARY_SLOT + 1, NEW_FORK)));
+        assertEquals(300L, store.getFinalizedSlot());
+        // Cross-signed: rejected on both sides.
+        assertFalse(p.processUpdate(boundaryUpdate(400L, BOUNDARY_SLOT, NEW_FORK)));
+        assertFalse(p.processUpdate(boundaryUpdate(400L, BOUNDARY_SLOT + 1, OLD_FORK)));
         assertEquals(300L, store.getFinalizedSlot());
     }
 
@@ -203,8 +235,8 @@ class LightClientProcessorTest {
     void rejectsUpdateSignedUnderTheOtherSidesFork() {
         LightClientProcessor p = new LightClientProcessor(store, boundarySchedule(), GVR);
         // NEW at the last OLD slot, OLD at the first NEW slot: both must fail.
-        assertFalse(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, NEW_FORK)));
-        assertFalse(p.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT + 1, 512, OLD_FORK)));
+        assertFalse(p.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT, NEW_FORK)));
+        assertFalse(p.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT + 1, OLD_FORK)));
         assertEquals(100L, store.getFinalizedSlot(), "nothing applied");
     }
 
@@ -212,14 +244,41 @@ class LightClientProcessorTest {
     @Test
     void singleVersionScheduleStallsAtTheBoundary() {
         LightClientProcessor oldOnly = new LightClientProcessor(store, ForkSchedule.single(OLD_FORK), GVR);
-        assertTrue(oldOnly.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
-        assertFalse(oldOnly.processFinalityUpdate(buildFinalityUpdate(300L, BOUNDARY_SLOT + 1, 512, NEW_FORK)));
+        assertTrue(oldOnly.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT, OLD_FORK)));
+        assertFalse(oldOnly.processFinalityUpdate(boundaryFinality(300L, BOUNDARY_SLOT + 1, NEW_FORK)));
 
         LightClientStore fresh = new LightClientStore();
         fresh.initialize(TestUtil.dummyLightClientHeader(
                 new BeaconBlockHeader(100L, 0L, new byte[32], new byte[32], new byte[32])), syncCommittee);
         LightClientProcessor newOnly = new LightClientProcessor(fresh, ForkSchedule.single(NEW_FORK), GVR);
-        assertFalse(newOnly.processFinalityUpdate(buildFinalityUpdate(200L, BOUNDARY_SLOT, 512, OLD_FORK)));
+        assertFalse(newOnly.processFinalityUpdate(boundaryFinality(200L, BOUNDARY_SLOT, OLD_FORK)));
+    }
+
+    /**
+     * A LightClientUpdate whose finality branch (depth 6, gindex 105) and
+     * next-sync-committee branch (depth 5, gindex 55) both verify against ONE
+     * attested state root: a 32-leaf state tree with the checkpoint container
+     * at field 20 (epoch root || finalized root) and the committee at field 23.
+     */
+    private LightClientUpdate buildUpdate(long finalizedSlot, long signatureSlot, byte[] forkVersion) {
+        LightClientHeader finalizedHeader = TestUtil.consistentLightClientHeader(
+                finalizedSlot, 0L, new byte[32], new byte[32]);
+        byte[] zero = new byte[32];
+        byte[][] leaves = new byte[32][32];
+        leaves[20] = SszUtil.sha256(zero, finalizedHeader.beacon().hashTreeRoot()); // Checkpoint{epoch, root}
+        leaves[23] = syncCommittee.hashTreeRoot();
+        byte[][] tree = TestUtil.buildMerkleTree(leaves);
+        byte[][] checkpointBranch = TestUtil.extractBranch(tree, 5, 20);
+        byte[][] finalityBranch = new byte[6][];
+        finalityBranch[0] = zero; // the epoch leaf, sibling of the root inside Checkpoint
+        System.arraycopy(checkpointBranch, 0, finalityBranch, 1, 5);
+        byte[][] committeeBranch = TestUtil.extractBranch(tree, 5, 23);
+
+        LightClientHeader attestedHeader = TestUtil.consistentLightClientHeader(
+                signatureSlot, 0L, new byte[32], tree[1]);
+        SyncAggregate agg = buildSyncAggregate(attestedHeader.beacon(), MIN_PARTICIPANTS, forkVersion);
+        return new LightClientUpdate(attestedHeader, syncCommittee, committeeBranch,
+                finalizedHeader, finalityBranch, agg, signatureSlot);
     }
 
     @Test

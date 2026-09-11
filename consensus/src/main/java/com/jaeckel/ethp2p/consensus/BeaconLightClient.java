@@ -78,7 +78,7 @@ public class BeaconLightClient implements AutoCloseable {
     private final String beaconApiUrl;            // nullable; HTTP API for peer discovery
     private final byte[] checkpointRoot;      // 32-byte trusted checkpoint block root
     private final long checkpointSlot;        // slot of trusted checkpoint (for pre-bootstrap Status)
-    private final ForkSchedule forkSchedule;  // per-slot signing-domain selector (#295); its newest entry feeds Status
+    private final ForkSchedule forkSchedule;  // per-slot signing-domain selector (#295); Status uses the wall-clock-active entry
     /**
      * Active BPO parameters per EIP-7892: {@code (epoch, max_blobs_per_block)}.
      * Folded into {@link #computeForkDigest(byte[])} via the XOR-mix-in
@@ -1288,7 +1288,7 @@ public class BeaconLightClient implements AutoCloseable {
      * {@code fork_digest}.
      */
     private StatusMessage buildLocalStatus() {
-        return buildLocalStatusFor(forkSchedule.current());
+        return buildLocalStatusFor(activeForkVersion());
     }
 
     /**
@@ -1500,9 +1500,21 @@ public class BeaconLightClient implements AutoCloseable {
         }
     }
 
-    /** Fork versions to try for Status. Currently just the schedule's newest. */
+    /** Fork versions to try for Status. Currently just the one active now. */
     private java.util.List<byte[]> acceptedForkVersions() {
-        return java.util.List.of(forkSchedule.current());
+        return java.util.List.of(activeForkVersion());
+    }
+
+    /**
+     * The fork version active at the wall clock — the Status/digest input. Read
+     * from the schedule per call so a fork pinned ahead of its activation takes
+     * effect at its epoch with no restart, and never before (a not-yet-active
+     * digest matches no peer). Mirrors {@code NetworkConfig.currentForkVersion}.
+     */
+    private byte[] activeForkVersion() {
+        long wallSlot = Math.max(0L, System.currentTimeMillis() / 1000 - clGenesisTime)
+                / Math.max(1, secondsPerSlot);
+        return forkSchedule.versionAtEpoch(wallSlot / Math.max(1, slotsPerEpoch));
     }
 
     /**

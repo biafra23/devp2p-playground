@@ -192,10 +192,6 @@ impl LightClientProcessor {
         Self { store, fork_schedule, genesis_validators_root }
     }
 
-    pub fn fork_schedule(&self) -> &ForkSchedule {
-        &self.fork_schedule
-    }
-
     /// `is_valid_light_client_header` (Capella+): the execution payload header is
     /// bound to the beacon body solely through this branch — the sync-committee
     /// signature does NOT cover it.
