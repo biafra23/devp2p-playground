@@ -132,10 +132,7 @@ async fn main() {
 
     let deadline = Instant::now() + Duration::from_secs(crawl_secs);
     // updates_by_range request body: SSZ (start_period u64 LE, count u64 LE).
-    let mut ssz_request = Vec::with_capacity(16);
-    ssz_request.extend_from_slice(&period.to_le_bytes());
-    ssz_request.extend_from_slice(&1u64.to_le_bytes());
-    let finality_wire: Vec<u8> = codec::encode_request(&ssz_request);
+    let finality_wire: Vec<u8> = codec::encode_updates_by_range_request(period, 1);
 
     let mut results: Vec<(String, String, Verdict, f64)> = Vec::new();
     let spawn_probe = |peer_id: libp2p::PeerId,

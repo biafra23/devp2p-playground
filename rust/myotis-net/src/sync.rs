@@ -2335,8 +2335,8 @@ async fn catch_up(
     let mut outstanding: HashMap<PeerId, Ask> = HashMap::new();
     // A "wave" is the life of the pipeline from empty to empty again: the
     // unit of idle/backoff accounting (the old round). Top-ups inside a wave
-    // keep it alive; it ends only when nothing is outstanding and nobody
-    // free is left to ask.
+    // keep it alive; it ends only when nothing is outstanding AND nobody
+    // free is left to ask (see `can_ask`).
     let mut wave_active = false;
     let mut wave_progress = false; // net staged growth or a period applied
     let mut wave_rejects = 0usize;
@@ -2367,8 +2367,24 @@ async fn catch_up(
         *staged = staged.split_off(&committee_period); // drop already-passed periods
         let span = (wall_period - committee_period).min(UPDATES_BATCH_MAX);
 
-        // ── Wave accounting: the pipeline drained without a top-up refilling it.
-        if wave_active && in_flight.is_empty() {
+        // Can the top-up below hand out an ask at all? Computed first so the
+        // wave verdict is taken only when the pipeline is empty AND nobody
+        // free is left — a transient drain with a free peer (a first-contact
+        // batch ask closed and the peer marked single-period at no cost) is
+        // re-asked at once, not backed off. Skipped outright when every peer
+        // is busy or inside its window, or the pipeline is full — the meta
+        // round-trip and candidate ranking are not free, and a burst of
+        // responses would otherwise pay them once each for nothing. Also
+        // skipped once the restored snapshot is poisoned and no apply has
+        // confirmed it: the pipeline then drains within one request timeout
+        // and the wave-end verdict fires — the old per-round deadline, not a
+        // pool-sized one.
+        let can_ask = in_flight.len() < CATCHUP_FANOUT
+            && pool.has_free_peer(|id| !outstanding.contains_key(id))
+            && !resume.poisoned(0);
+
+        // ── Wave accounting: the pipeline drained and nothing can refill it.
+        if wave_active && in_flight.is_empty() && !can_ask {
             wave_active = false;
             if resume.poisoned(0) {
                 // Restored snapshot can't verify anything (no apply confirmed
@@ -2425,17 +2441,6 @@ async fn catch_up(
         }
 
         // ── Top-up: hand every free, quota-refilled candidate an ask.
-        // Skipped outright when no slot can be filled (every peer busy or
-        // inside its window, or the pipeline full) — the meta round-trip and
-        // candidate ranking are not free, and a burst of responses would
-        // otherwise pay them once each for nothing. Also skipped once the
-        // restored snapshot is poisoned and no apply has confirmed it: the
-        // pipeline then drains within one request timeout and the wave-end
-        // verdict above fires — the old per-round deadline, not a pool-sized
-        // one.
-        let can_ask = in_flight.len() < CATCHUP_FANOUT
-            && pool.has_free_peer(|id| !outstanding.contains_key(id))
-            && !resume.poisoned(0);
         if can_ask {
             let reqresp::CatchupPeerMeta { mut lc_servers, earliest_slots, agents } =
                 client.catchup_peer_meta().await;
@@ -2476,20 +2481,30 @@ async fn catch_up(
                 })
                 .map(|(id, _)| id)
                 .collect();
-            // Busy peers are skipped inside candidates(); the never-starve
-            // fallback there ignores cooldowns, so the quota window is
-            // re-checked here: asking a peer inside its window just earns an
-            // empty answer and another cooldown — the self-inflicted drought
-            // the old global pace existed to avoid.
+            // candidates() honours the busy set as `skip` in its main tiers,
+            // but its LAST-RESORT tier ignores `skip` (issue #291) and its
+            // never-starve tier ignores cooldowns, so both are re-checked
+            // here: a peer with an ask outstanding is never asked twice, and
+            // asking a peer inside its quota window just earns an empty
+            // answer and another cooldown — the self-inflicted drought the
+            // old global pace existed to avoid. The too-shallow filter is
+            // the STRONG PREFERENCE the comment above describes: shallow
+            // peers are asked only when no deeper free peer exists (the #291
+            // fallback the old code got from candidates() itself — a hard
+            // veto here left a pool of checkpoint-synced peers with zero
+            // asks and no exit).
             let busy: HashSet<PeerId> = outstanding.keys().copied().collect();
             let candidates = pool.candidates(CATCHUP_FANOUT, true, true, &lc_servers, &busy);
             if candidates.is_empty() && in_flight.is_empty() {
                 tracing::warn!("catch-up: no peers available — retrying after discovery");
                 return false;
             }
-            let free: Vec<Peer> = candidates
+            let (deep, shallow): (Vec<Peer>, Vec<Peer>) = candidates
                 .into_iter()
-                .filter(|p| pool.cooled_down(&p.id) && !too_shallow.contains(&p.id))
+                .filter(|p| !busy.contains(&p.id) && pool.cooled_down(&p.id))
+                .partition(|p| !too_shallow.contains(&p.id));
+            let free: Vec<Peer> = if deep.is_empty() { shallow } else { deep }
+                .into_iter()
                 .take(CATCHUP_FANOUT - in_flight.len())
                 .collect();
             // Coverage of the span by outstanding single asks, for the
@@ -2637,7 +2652,7 @@ async fn catch_up(
                     if !pool.is_static(&peer.id) {
                         clcache.mark_nolc(&peer_key);
                     }
-                } else if e == RequestError::ConnectionClosed && !single {
+                } else if e == RequestError::ConnectionClosed && !single && sub_count > 1 {
                     // NOT a dead peer: Lighthouse enforces its updates_by_range
                     // quota by closing the stream on any multi-count request
                     // while answering count=1 fine (verified live, v8.2.2).
@@ -2646,6 +2661,10 @@ async fn catch_up(
                     // rotation steers traffic straight at them. Remember to
                     // ask this peer one period at a time instead, and cost it
                     // nothing: the next top-up hands it a look-ahead period.
+                    // The signature is a MULTI-count ask being closed — a
+                    // span-1 batch ask has count 1 and its close is an
+                    // ordinary failure (a batch server that blips at a period
+                    // rollover must not be degraded to count=1 for good).
                     pool.mark_single_period(peer.id);
                     tracing::debug!(peer = %peer.id, sub_count,
                         "closed on a multi-period ask — will request one period at a time");
