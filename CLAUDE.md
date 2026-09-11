@@ -210,14 +210,15 @@ rulings, 2026-09-02 and 2026-09-11):
 
    ```bash
    cd rust
-   # 3a. are the shipped pins and bootnodes alive? (seconds)
-   NET=gnosis cargo test -p myotis-net --test live_pins_alive -- --ignored --nocapture
+   # 3a. are the shipped pins and bootnodes alive? (seconds when healthy)
+   NET=gnosis cargo test --release -p myotis-net --test live_pins_alive -- \
+       --ignored --nocapture --test-threads=1
    # 3b. dead pins: every pinned CL server configured but unreachable
-   NET=gnosis cargo test -p myotis-net --test live_cold_start -- \
+   NET=gnosis cargo test --release -p myotis-net --test live_cold_start -- \
        --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
    # 3c. deep catch-up: an anchor further behind than the network's ws bound
    NET=gnosis MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
-     cargo test -p myotis-net --test live_cold_start -- \
+     cargo test --release -p myotis-net --test live_cold_start -- \
        --ignored --nocapture cold_start_from_an_old_anchor
    ```
 

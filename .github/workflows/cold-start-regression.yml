@@ -91,7 +91,7 @@ jobs:
           RUST_LOG: warn,myotis_net=info
         run: |
           cargo test --release -p myotis-net --test live_pins_alive -- \
-            --ignored --nocapture
+            --ignored --nocapture --test-threads=1
 
       # Discovery-only: no pinned peers at all.
       - name: Cold start with every pinned peer unreachable
