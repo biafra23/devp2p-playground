@@ -48,6 +48,17 @@ use myotis_net::{protocols, ChainConfig, SyncHandle};
 /// under a second, and a slow-but-alive one must not be reported as dead.
 const PIN_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A first bootstrap request may legitimately MISS. roost's handler is a pure
+/// cache read — the design forbids I/O on the swarm task — so an uncached root
+/// answers `ResourceUnavailable` and queues a background fetch, expecting the
+/// wallet to retry (`rust/roost/src/store.rs`, "a miss stays
+/// ResourceUnavailable, with a background task filling it"). roost drops its
+/// cached bootstraps whenever the fork/blob schedule changes, and starts empty
+/// after a restart, so a single-shot check reports the project's own primary
+/// server as dead on a cold cache. Retry the way a wallet does.
+const MISS_RETRIES: usize = 2;
+const MISS_BACKOFF: Duration = Duration::from_secs(6);
+
 /// How long discovery gets to seed its routing table from the bootnodes.
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
 
@@ -115,22 +126,45 @@ async fn every_pinned_cl_peer_serves_this_builds_anchor() {
             }
         }
         let peer = peer.expect("pinned multiaddr carries a peer id");
-        let req = myotis_net::codec::encode_request(&config.checkpoint_root);
-        let outcome = tokio::time::timeout(
-            PIN_TIMEOUT,
-            client.request_raw(peer, addr.clone(), protocols::BOOTSTRAP, req),
-        )
-        .await;
-        match outcome {
+        // `None` until the first attempt runs; the loop below always sets it.
+        let mut outcome = None;
+        for attempt in 0..=MISS_RETRIES {
+            if attempt > 0 {
+                eprintln!("[pins] .... {addr} retrying after a miss ({attempt}/{MISS_RETRIES})");
+                tokio::time::sleep(MISS_BACKOFF).await;
+            }
+            let req = myotis_net::codec::encode_request(&config.checkpoint_root);
+            outcome = Some(
+                tokio::time::timeout(
+                    PIN_TIMEOUT,
+                    client.request_raw(peer, addr.clone(), protocols::BOOTSTRAP, req),
+                )
+                .await,
+            );
+            // Only a cache MISS is worth retrying: a real bootstrap, a dial
+            // failure and a timeout are all final answers.
+            match &outcome {
+                Some(Ok(Ok(raw))) if raw.len() <= 64 => continue,
+                _ => break,
+            }
+        }
+        match outcome.expect("the retry loop always runs at least once") {
             Ok(Ok(raw)) if raw.len() > 64 => {
                 alive += 1;
                 eprintln!("[pins] OK   {addr} ({} B bootstrap)", raw.len());
             }
             Ok(Ok(raw)) => {
-                // Answered, but not with a bootstrap: it no longer holds our
-                // anchor, or it refuses light-client requests.
-                dead.push(format!("{pin} — answered {} B, not a bootstrap", raw.len()));
-                eprintln!("[pins] THIN {addr} ({} B)", raw.len());
+                // Answered, but never with a bootstrap even after the retries:
+                // it does not hold our anchor, or it refuses light-client
+                // requests. `raw[0]` is the eth2 result code (3 =
+                // ResourceUnavailable, which for roost means a cache miss its
+                // background fetch did not fill in time).
+                let code = raw.first().copied().unwrap_or(255);
+                dead.push(format!(
+                    "{pin} — answered {} B with result code {code}, not a bootstrap",
+                    raw.len()
+                ));
+                eprintln!("[pins] THIN {addr} ({} B, code {code})", raw.len());
             }
             Ok(Err(e)) => {
                 dead.push(format!("{pin} — {e}"));
