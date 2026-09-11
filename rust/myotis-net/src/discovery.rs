@@ -360,44 +360,67 @@ async fn consume_discovered(
 ) {
     while let Some(event) = events.recv().await {
         let Event::Discovered(enr) = event else { continue };
+        // A full channel drops the node unmarked (see below), so deciding
+        // anything about it now — the key decode behind filter_candidate and
+        // its debug line — would only be repeated on the next hearing. On
+        // mainnet, where nearly every ENR matches, a full channel is the
+        // steady state between sync-loop drains.
+        if tx.capacity() == 0 {
+            continue;
+        }
         let id = enr.node_id();
-        // Pinned ids keep the lookup path's seq gate: a hearsay copy may be
-        // an older record than the one already emitted.
-        if pinned_targets.contains(&id) {
-            continue;
-        }
-        if seen.lock().expect("seen lock").contains(&id) {
-            continue;
-        }
-        let Some(peer) = filter_candidate(&enr, &accepted_digests) else {
-            // Off-fork or no TCP endpoint: never a candidate, never re-checked.
-            seen.lock().expect("seen lock").insert(id);
-            continue;
-        };
-        match tx.try_send(peer) {
-            Ok(()) => {
+        let verdict = classify_heard(
+            &enr,
+            &seen.lock().expect("seen lock"),
+            &pinned_targets,
+            &accepted_digests,
+        );
+        match verdict {
+            Heard::Skip => {}
+            Heard::NeverCandidate => {
                 seen.lock().expect("seen lock").insert(id);
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Not recorded: heard again later, emitted then.
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Heard::Emit(peer) => match tx.try_send(peer) {
+                // Marked seen only once the pool has it: a node dropped on a
+                // full channel is heard again later and emitted then.
+                Ok(()) => {
+                    seen.lock().expect("seen lock").insert(id);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            },
         }
     }
 }
 
-/// The fork-matched, TCP-bearing peers among `enrs` that `seen` has not yet
-/// recorded — recording them as it goes, so a node is emitted once per `seen`
-/// lifetime. The lookup loop's once-ever rule in one place, with a test.
-fn collect_new_candidates(
-    enrs: impl IntoIterator<Item = Enr>,
-    seen: &mut HashSet<NodeId>,
+/// What to do with one ENR heard in a NODES response.
+enum Heard {
+    /// Pinned (the lookup path's seq gate owns it) or already emitted.
+    Skip,
+    /// Off-fork or no TCP endpoint: never a candidate, record it so it is
+    /// never re-checked.
+    NeverCandidate,
+    /// A fresh fork-matched node — emit, and record it once the pool has it.
+    Emit(DiscoveredPeer),
+}
+
+/// The per-ENR decision behind [`consume_discovered`], pure so the once-ever
+/// rule is testable: `seen` is read here and written by the caller, because
+/// only the caller knows whether the emission landed.
+fn classify_heard(
+    enr: &Enr,
+    seen: &HashSet<NodeId>,
+    pinned_targets: &[NodeId],
     accepted_digests: &[[u8; 4]],
-) -> Vec<DiscoveredPeer> {
-    enrs.into_iter()
-        .filter(|enr| seen.insert(enr.node_id()))
-        .filter_map(|enr| filter_candidate(&enr, accepted_digests))
-        .collect()
+) -> Heard {
+    let id = enr.node_id();
+    if pinned_targets.contains(&id) || seen.contains(&id) {
+        return Heard::Skip;
+    }
+    match filter_candidate(enr, accepted_digests) {
+        Some(peer) => Heard::Emit(peer),
+        None => Heard::NeverCandidate,
+    }
 }
 
 /// ENR → dial candidate, applying the same gates the Java discv5 callback does:
@@ -471,20 +494,28 @@ mod tests {
     const GNOSIS_BOOT_ENR: &str = "enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA";
 
     #[test]
-    fn heard_nodes_are_emitted_once_each() {
+    fn a_heard_node_is_emitted_once_and_pins_are_left_to_the_lookup_path() {
         let enr: Enr = GNOSIS_BOOT_ENR.parse().expect("boot ENR parses");
         let digest = enr_eth2_fork_digest(&enr).expect("eth2 field");
+        let id = enr.node_id();
         let mut seen = HashSet::new();
-        // First sweep: the node is new and fork-matched → emitted.
-        let first = collect_new_candidates(vec![enr.clone()], &mut seen, &[digest]);
-        assert_eq!(first.len(), 1);
-        assert_eq!(Some(first[0].peer_id), enr_to_peer_id(&enr));
-        // Second sweep of the same table: already seen → nothing, no churn.
-        assert!(collect_new_candidates(vec![enr.clone()], &mut seen, &[digest]).is_empty());
-        // A node on another fork is recorded as seen but never emitted.
-        let mut seen2 = HashSet::new();
-        assert!(collect_new_candidates(vec![enr.clone()], &mut seen2, &[[0, 0, 0, 0]]).is_empty());
-        assert!(seen2.contains(&enr.node_id()));
+        // Fresh and fork-matched → emit, with the peer id the ENR's key yields.
+        match classify_heard(&enr, &seen, &[], &[digest]) {
+            Heard::Emit(peer) => assert_eq!(Some(peer.peer_id), enr_to_peer_id(&enr)),
+            _ => panic!("a fresh fork-matched node must be emitted"),
+        }
+        // Not yet marked (the send has not landed) → still emitted next time.
+        assert!(matches!(classify_heard(&enr, &seen, &[], &[digest]), Heard::Emit(_)));
+        // Once the caller marks it → skipped for good.
+        seen.insert(id);
+        assert!(matches!(classify_heard(&enr, &seen, &[], &[digest]), Heard::Skip));
+        // Pinned ids are never emitted from hearsay, marked or not.
+        assert!(matches!(classify_heard(&enr, &HashSet::new(), &[id], &[digest]), Heard::Skip));
+        // Off-fork → never a candidate (the caller records it as seen).
+        assert!(matches!(
+            classify_heard(&enr, &HashSet::new(), &[], &[[0, 0, 0, 0]]),
+            Heard::NeverCandidate
+        ));
     }
 
     #[test]
