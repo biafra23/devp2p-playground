@@ -187,6 +187,19 @@ public class LightClientProcessor {
             return false;
         }
 
+        // The aggregate is signed by the committee of signatureSlot's PERIOD (spec
+        // validate_light_client_update): the current committee for storePeriod, the
+        // held next committee for storePeriod + 1. Verifying both admitted periods
+        // with the current keys rejected genuine next-committee updates before
+        // rotation and accepted a current-committee signature whose unsigned
+        // signatureSlot had been relabelled into the next period (#423).
+        if (sigPeriod != storePeriod) {
+            committee = store.getNextSyncCommittee();
+            if (committee == null) {
+                return false; // unreachable: the gate admitted P+1 only with a next committee
+            }
+        }
+
         // Verify sync aggregate over attested header
         if (!SyncCommitteeVerifier.verify(
                 update.syncAggregate(),

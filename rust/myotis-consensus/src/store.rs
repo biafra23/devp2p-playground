@@ -220,6 +220,22 @@ impl LightClientProcessor {
             return false;
         }
 
+        // The aggregate is signed by the committee of signature_slot's PERIOD
+        // (spec validate_light_client_update): the current committee for
+        // store_period, the held next committee for store_period + 1. Using
+        // the current keys for both admitted periods rejected genuine
+        // next-committee updates before rotation and accepted a
+        // current-committee signature whose unsigned signature_slot had been
+        // relabelled into the next period (#423).
+        let committee = if sig_period == store_period {
+            committee
+        } else {
+            let Some(next) = self.store.next_sync_committee() else {
+                return false; // unreachable: the gate admitted P+1 only with a next committee
+            };
+            next
+        };
+
         if !verify::verify_sync_aggregate(
             &update.sync_aggregate,
             committee,
