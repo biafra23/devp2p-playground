@@ -7,11 +7,14 @@
 //! hides. Each test then removes ONE crutch and asserts the wallet still
 //! reaches SYNCED:
 //!
-//! * `cold_start_without_static_peers_syncs_through_discovery` — every pinned
-//!   server is gone, so discovery alone has to find light-client servers.
-//!   This is the "recovery when the preferred static endpoint is unavailable"
-//!   case: in the reported incident the pins were stale AND roost was down, and
-//!   nothing else got the wallet a usable peer.
+//! * `cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery` —
+//!   the pins are still CONFIGURED but every address is a black hole, which is
+//!   the shape #422 reported: stale pins plus roost down. Keeping the peer ids
+//!   matters and is why this does not simply clear the list — a pinned peer is
+//!   exempt from eviction (`PeerPool::evict` returns early for `static_ids`),
+//!   so a dead pin stays in the pool for the life of the process, keeps being
+//!   handed to every catch-up fan-out, and keeps steering targeted discovery
+//!   lookups at a server that will never answer. Discovery has to win anyway.
 //!
 //! * `cold_start_from_an_old_anchor_walks_periods_to_head` — the trust anchor
 //!   is several periods behind, so bootstrap is not enough and catch-up must
@@ -19,9 +22,9 @@
 //!   proves almost nothing, which is why the anchor is a parameter.
 //!
 //! ```bash
-//! # discovery-only (default network: gnosis — where #422 bit hardest)
+//! # dead pins (default network: gnosis — where #422 bit hardest)
 //! cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
-//!     cold_start_without_static_peers
+//!     cold_start_with_every_pinned_peer_unreachable
 //!
 //! # Old anchor: it must be MORE THAN the network's weak-subjectivity bound
 //! # behind the wall clock (gnosis 3 periods, mainnet/sepolia 13) — the test
@@ -68,7 +71,7 @@ fn config_for_env() -> ChainConfig {
     }
 }
 
-/// How long the discovery-only cold start may take. Named, with the prose
+/// How long the dead-pins cold start may take. Named, with the prose
 /// derived from it, so the budget and the message reporting it cannot drift
 /// apart — the bug this PR fixes in `examples/live_sync.rs`.
 const NO_PINS_BUDGET: Duration = Duration::from_secs(900);
@@ -123,26 +126,51 @@ fn assert_no_cl_env_overrides() {
     }
 }
 
+/// RFC 5737 TEST-NET-3, reserved for documentation: nothing routes there, so a
+/// dial fails the way a decommissioned or firewalled server's does.
+const BLACKHOLE_PREFIX: &str = "203.0.113.";
+
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live network test: cold start with NO pinned peers, takes minutes"]
-async fn cold_start_without_static_peers_syncs_through_discovery() {
+#[ignore = "live network test: cold start with every pin DEAD, takes minutes"]
+async fn cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery() {
     init_tracing();
     assert_no_cl_env_overrides();
     let mut config = config_for_env();
+
+    // Keep every pinned peer ID, point it at a black hole. NOT a cleared list:
+    // pinned peers are exempt from eviction, so these stay in the pool, keep
+    // taking fan-out slots in every catch-up round, and keep aiming targeted
+    // discovery lookups at servers that will never answer. That is the #422
+    // shape, and it is strictly harder than having no pins at all.
     let pinned = config.static_peers.len();
-    // The crutch under test. Discovery keeps its bootnodes — removing those
-    // would test nothing but "a node with no way in cannot get in".
-    config.static_peers.clear();
+    assert!(pinned > 0, "this network pins no CL peers, so there is nothing to kill");
+    config.static_peers = config
+        .static_peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let id = p.rsplit("/p2p/").next().expect("pinned multiaddr carries a peer id");
+            // A distinct address each, so none can collide with a live host.
+            format!("/ip4/{BLACKHOLE_PREFIX}{}/tcp/9000/p2p/{id}", i % 254 + 1)
+        })
+        .collect();
+    assert!(
+        config.static_peers.iter().all(|p| p.contains(BLACKHOLE_PREFIX)),
+        "every pin must be blackholed, or this measures a live server"
+    );
+    // Discovery keeps its bootnodes — removing those would test nothing but
+    // "a node with no way in cannot get in".
     assert!(!config.bootstrap_enrs.is_empty(), "discovery needs its bootnodes");
 
     let handle = SyncHandle::start(config).expect("sync start");
-    let synced = run_to_synced(&handle, "no-pins", NO_PINS_BUDGET).await;
+    let synced = run_to_synced(&handle, "dead-pins", NO_PINS_BUDGET).await;
     handle.stop().await;
 
     assert!(
         synced.is_some(),
-        "cold start with all {pinned} pinned peers removed did not reach SYNCED in {} min — \
-         discovery alone could not find a light-client server, which is the #422 condition",
+        "cold start with all {pinned} pinned peers unreachable did not reach SYNCED in {} min — \
+         discovery could not find a light-client server while the dead pins held their \
+         un-evictable pool slots, which is the #422 condition",
         NO_PINS_BUDGET.as_secs() / 60
     );
 }

@@ -8,9 +8,16 @@
 # release, or when changing discovery, the peer pool, or the catch-up loop.
 #
 # What each proves, and why a green pipeline elsewhere does not:
-#   * no-pins:    every pinned server removed, so DISCOVERY alone has to find a
-#                 light-client server. The dispatched smoke job dials a warm
-#                 peer cache, which hides exactly this.
+#   * pins-alive: do the shipped pins and bootnodes actually answer? Seconds,
+#                 and the one that would have caught #422 before it shipped.
+#                 A CI runner is a clean host, which matters: a Lighthouse node
+#                 that banned a dev box's IP looks dead from there and is fine
+#                 from here.
+#   * dead-pins:  every pinned server still CONFIGURED but unreachable — the
+#                 #422 shape. Pinned peers are exempt from eviction, so they
+#                 hold their pool slots and keep steering targeted lookups;
+#                 discovery has to find a real server anyway. The dispatched
+#                 smoke job dials a warm peer cache, which hides this.
 #   * old-anchor: the trust anchor is several periods behind, so bootstrap is
 #                 not enough and catch-up must actually walk periods. A
 #                 release-fresh anchor walks 0-2 periods and proves little,
@@ -71,17 +78,30 @@ jobs:
 
       - name: Build the tests
         working-directory: rust
-        run: cargo test --release -p myotis-net --test live_cold_start --no-run
+        run: |
+          cargo test --release -p myotis-net --test live_cold_start --no-run
+          cargo test --release -p myotis-net --test live_pins_alive --no-run
+
+      # Cheap and first: if the shipped pins are dead, say so before spending
+      # 15 minutes proving the wallet copes without them.
+      - name: Are the shipped pins and bootnodes alive?
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+          RUST_LOG: warn,myotis_net=info
+        run: |
+          cargo test --release -p myotis-net --test live_pins_alive -- \
+            --ignored --nocapture
 
       # Discovery-only: no pinned peers at all.
-      - name: Cold start without any pinned peer
+      - name: Cold start with every pinned peer unreachable
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
           RUST_LOG: info,myotis_net=debug
         run: |
           cargo test --release -p myotis-net --test live_cold_start -- \
-            --ignored --nocapture cold_start_without_static_peers
+            --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
 
       # Deep catch-up: skipped only when NEITHER anchor input is supplied, so
       # "no anchor given" does not look like a failure. A HALF-supplied anchor
