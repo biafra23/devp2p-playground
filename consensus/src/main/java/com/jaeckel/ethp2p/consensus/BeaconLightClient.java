@@ -1738,7 +1738,13 @@ public class BeaconLightClient implements AutoCloseable {
      *  would add up to ~77 s of dead time per 8-batch call), and the fire stamp
      *  lives on an instance field so the NEXT call's batch 0 can't re-ask
      *  inside the window either (Gnosis's 5 s poll cycle would otherwise do
-     *  exactly that at every batch-cap call boundary). */
+     *  exactly that at every batch-cap call boundary).
+     *  DIVERGENCE: the Rust engine no longer paces the whole walk. Its
+     *  catch-up pipelines across peers — a per-peer quota mark of the same
+     *  length after each single-period serve, distinct look-ahead periods per
+     *  quota-limited server, batch asks kept streaming — so with more than one
+     *  serving peer it catches up faster than this engine. The apply/credit
+     *  rules (#342, #410) stay mirrored; only the request schedule differs. */
     private static final long CATCHUP_QUOTA_PACE_MS = 11_000;
     /** nanoTime (monotonic — an NTP step must not skew the pace, same rule as
      *  the uptime stamps) of the last catch-up batch request fire — the quota
