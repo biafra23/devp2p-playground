@@ -399,11 +399,12 @@ enum Command {
     Observe {
         peers: Vec<(PeerId, Multiaddr)>,
     },
-    /// One snapshot of both catch-up peer-selection inputs — the LC-server set
-    /// and the per-peer `earliest_available_slot` map — so a round fetches them
-    /// in a single swarm round-trip instead of two.
+    /// One snapshot of the catch-up peer-selection inputs — the LC-server set,
+    /// the per-peer `earliest_available_slot` map, and the per-peer Identify
+    /// agent — so a round fetches them in a single swarm round-trip instead of
+    /// three.
     CatchupMeta {
-        reply: oneshot::Sender<(HashSet<PeerId>, HashMap<PeerId, u64>)>,
+        reply: oneshot::Sender<CatchupPeerMeta>,
     },
     Shutdown,
 }
@@ -506,15 +507,16 @@ impl ReqRespClient {
         rx.await.unwrap_or_default()
     }
 
-    /// Both catch-up peer-selection inputs in one round-trip: the set of
-    /// Identify-confirmed LC servers, and `earliest_available_slot` per peer
-    /// (from the auto-Status exchange). Peers absent from the earliest map
-    /// haven't completed Status yet (unknown — never skipped); a v1 peer
-    /// reports 0 (history from genesis).
-    pub async fn catchup_peer_meta(&self) -> (HashSet<PeerId>, HashMap<PeerId, u64>) {
+    /// The catch-up peer-selection inputs in one round-trip: the set of
+    /// Identify-confirmed LC servers, `earliest_available_slot` per peer
+    /// (from the auto-Status exchange), and each peer's Identify agent string.
+    /// Peers absent from the earliest map haven't completed Status yet
+    /// (unknown — never skipped); a v1 peer reports 0 (history from genesis).
+    /// Peers absent from the agent map haven't completed Identify yet.
+    pub async fn catchup_peer_meta(&self) -> CatchupPeerMeta {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(Command::CatchupMeta { reply }).await.is_err() {
-            return (HashSet::new(), HashMap::new());
+            return CatchupPeerMeta::default();
         }
         rx.await.unwrap_or_default()
     }
@@ -522,6 +524,14 @@ impl ReqRespClient {
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown).await;
     }
+}
+
+/// Catch-up peer-selection inputs (see `ReqRespClient::catchup_peer_meta`).
+#[derive(Debug, Default, Clone)]
+pub struct CatchupPeerMeta {
+    pub lc_servers: HashSet<PeerId>,
+    pub earliest_slots: HashMap<PeerId, u64>,
+    pub agents: HashMap<PeerId, String>,
 }
 
 /// Shared local view the responder answers from. The sync loop refreshes it as
@@ -990,6 +1000,9 @@ struct SwarmCtx {
     lc_servers: HashSet<PeerId>,
     /// `earliest_available_slot` learned from each peer's auto-Status reply.
     peer_earliest: HashMap<PeerId, u64>,
+    /// Identify `agent_version` per peer — the catch-up fan-out sizes its
+    /// request per client family from this (see `sync::agent_serves_one_period`).
+    peer_agents: HashMap<PeerId, String>,
     local_status: Arc<LocalStatus>,
     /// Present only on a serving host; `None` on a wallet, where the
     /// light-client protocols answer `ResourceUnavailable` as before.
@@ -1031,6 +1044,7 @@ async fn run_swarm(
         queued: HashMap::new(),
         lc_servers: HashSet::new(),
         peer_earliest: HashMap::new(),
+        peer_agents: HashMap::new(),
         local_status,
         lc,
         in_flight: HashMap::new(),
@@ -1092,7 +1106,11 @@ async fn run_swarm(
                     }
                 }
                 Some(Command::CatchupMeta { reply }) => {
-                    let _ = reply.send((ctx.lc_servers.clone(), ctx.peer_earliest.clone()));
+                    let _ = reply.send(CatchupPeerMeta {
+                        lc_servers: ctx.lc_servers.clone(),
+                        earliest_slots: ctx.peer_earliest.clone(),
+                        agents: ctx.peer_agents.clone(),
+                    });
                 }
             },
             event = swarm.select_next_some() => handle_swarm_event(&mut swarm, &mut ctx, event),
@@ -1237,6 +1255,7 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                 // re-runs Identify + auto-Status and repopulates both).
                 ctx.status_done.remove(&peer_id);
                 ctx.lc_servers.remove(&peer_id);
+                ctx.peer_agents.remove(&peer_id);
                 ctx.peer_earliest.remove(&peer_id);
                 ctx.observed_ips.remove(&peer_id);
                 ctx.peer_source_ips.remove(&peer_id);
@@ -1285,6 +1304,7 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
                 let port = inbound.then(|| multiaddr_port(&info.observed_addr)).flatten();
                 ctx.observed_ips.insert(peer_id, Observation { source, ip, port });
             }
+            ctx.peer_agents.insert(peer_id, info.agent_version.clone());
             tracing::debug!(peer = %peer_id, agent = %info.agent_version,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
         }

@@ -559,7 +559,9 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // first two served this census a 512/512 period-1840 update; the third
     // was verified via the standalone Nimbus light client):
     //  - 57.129.130.18: Lighthouse v8.2.2; enforces the one_every(10s) updates
-    //    quota, so it serves ONE period per ask (single_period_peers handles it);
+    //    quota, so it serves ONE period per ask (`agent_serves_one_period` asks
+    //    it for one up front; `single_period_peers` is the fallback for peers
+    //    that closed a batch before Identify named them);
     //    also served the Java engine's catch-up (periods 1837-1838).
     //  - 84.112.35.112: served the Java engine (1836-1837) and this census.
     //  - 91.189.182.90: Nimbus fleet; served the standalone Nimbus light client
@@ -2206,7 +2208,8 @@ async fn catch_up(
         tracing::info!(from_period = committee_period, wall_period, span,
             staged = staged.len(), "catch-up: requesting updates_by_range");
 
-        let (mut lc_servers, earliest_slots) = client.catchup_peer_meta().await;
+        let reqresp::CatchupPeerMeta { mut lc_servers, earliest_slots, agents } =
+            client.catchup_peer_meta().await;
         // Reconcile the deny set against the LIVE Identify signal (same protocol
         // nolc tracks, self-expiring on disconnect) BEFORE folding in
         // hunt_confirmed — see clear_no_lc for why the finality-attesting hunt
@@ -2286,8 +2289,15 @@ async fn catch_up(
                 // be redundantly requested. The COUNT is per-peer: a server that
                 // closed on a multi-period ask (Lighthouse's quota) is asked for
                 // exactly one, so it can serve instead of being struck out.
-                let single = pool_wants_single.contains(&peer.id);
+                // Lighthouse gets count=1 from the FIRST ask (its quota makes a
+                // multi-count request yield one chunk then a closed stream); the
+                // reactive single_period_peers mark covers clients we don't know.
+                let single = pool_wants_single.contains(&peer.id)
+                    || agent_serves_one_period(agents.get(&peer.id).map(String::as_str));
                 let (sub_from, sub_count) = (committee_period, if single { 1 } else { span });
+                tracing::debug!(peer = %peer.id, sub_count,
+                    agent = agents.get(&peer.id).map(String::as_str).unwrap_or("?"),
+                    "catch-up: updates_by_range request");
                 let wire = if single { single_wire.clone() } else { wire.clone() };
                 async move {
                     let res = client
@@ -2693,6 +2703,19 @@ fn apply_staged_step(
     out
 }
 
+/// Whether a client family should be asked for ONE period per request.
+///
+/// Lighthouse rate-limits `light_client_updates_by_range` at `one_every(10s)`
+/// (`lighthouse_network/src/rpc/config.rs`): a count=N request costs N tokens
+/// against a one-token bucket, so it serves the first chunk and closes the
+/// stream. Asking it for one period up front turns every first contact into
+/// a served update instead of a truncated one. Nimbus and roost answer whole
+/// spans (a Nimbus node served five periods in one batch), and unknown
+/// agents keep the span until the reactive `single_period_peers` mark fires.
+pub(crate) fn agent_serves_one_period(agent: Option<&str>) -> bool {
+    agent.is_some_and(|a| a.starts_with("Lighthouse"))
+}
+
 /// What one `apply_staged_step` pass did — richer than the old tuple so the
 /// caller can charge verify-rejects to the peers that actually served them.
 #[derive(Default)]
@@ -3056,6 +3079,18 @@ async fn publish_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lighthouse_agents_get_single_period_requests() {
+        assert!(agent_serves_one_period(Some("Lighthouse/v8.2.2-e423a66/x86_64-linux")));
+        assert!(agent_serves_one_period(Some("Lighthouse/v8.1.3-176cce5/x86_64-linux")));
+        assert!(!agent_serves_one_period(Some("nimbus-eth2/v26.4.0")));
+        assert!(!agent_serves_one_period(Some("lodestar/v1.47.0/2aff495")));
+        assert!(!agent_serves_one_period(Some("myotis/0.1.8-rs")));
+        // Case-sensitive on purpose: Lighthouse always capitalises its agent.
+        assert!(!agent_serves_one_period(Some("lighthouse/v8.2.2")));
+        assert!(!agent_serves_one_period(None));
+    }
 
     /// A LightClientHeader with a real (post-merge) execution payload for the
     /// anchor-wiring tests.
