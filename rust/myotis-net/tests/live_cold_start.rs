@@ -23,10 +23,20 @@
 //! cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
 //!     cold_start_without_static_peers
 //!
-//! # old anchor: pass one that is genuinely behind. A good source is the
-//! # PREVIOUS release's embedded checkpoint, which was a real finalized root
-//! # and is one release old by construction:
-//! #   git show v0.1.8:rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
+//! # Old anchor: it must be MORE THAN the network's weak-subjectivity bound
+//! # behind the wall clock (gnosis 3 periods, mainnet/sepolia 13) — the test
+//! # asserts that, because a shallower anchor walks a period or two and would
+//! # have survived the bug this guards.
+//! #
+//! # Take it from a release OLDER than the current one. Note the newest tag is
+//! # usually the release whose anchor is the one on main, so it is no good:
+//! #   prev=$(git tag --sort=-v:refname | sed -n 2p)
+//! #   git show "$prev":rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
+//! #
+//! # Worked example, measured 2026-09-11 — v0.1.7's gnosis anchor, 70 periods
+//! # behind, walked to head in 170 s:
+//! #   MYOTIS_TEST_ANCHOR_ROOT=5387a11e014d8d4a9e8ca072ccd6639be912ab9a15b14b3b1f2d49b79551d954
+//! #   MYOTIS_TEST_ANCHOR_SLOT=29458656
 //! NET=gnosis \
 //! MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
 //! cargo test -p myotis-net --test live_cold_start -- --ignored --nocapture \
@@ -62,38 +72,48 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Drive the handle to SYNCED or the deadline. Returns the first synced status
-/// and the period the store held once it had bootstrapped, so a caller can
-/// assert the catch-up actually walked.
+/// Drive the handle to SYNCED or the deadline.
 async fn run_to_synced(
     handle: &SyncHandle,
     label: &str,
     budget: Duration,
-) -> (Option<myotis_net::SyncStatus>, Option<u64>) {
+) -> Option<myotis_net::SyncStatus> {
     let deadline = tokio::time::Instant::now() + budget;
-    let mut period_after_bootstrap = None;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let s = handle.status();
         eprintln!(
-            "[{label}] state={} period={} finalized_slot={} peers={} served/min={}",
-            s.state, s.period, s.finalized_slot, s.peer_count, s.served_peers_last_min
+            "[{label}] state={} period={} start_period={} finalized_slot={} peers={} served/min={}",
+            s.state, s.period, s.sync_start_period, s.finalized_slot, s.peer_count,
+            s.served_peers_last_min
         );
-        // First status with a committee in hand: the bootstrap landed.
-        if period_after_bootstrap.is_none() && s.period > 0 {
-            period_after_bootstrap = Some(s.period);
-        }
         if s.state == SyncState::Synced {
-            return (Some(s), period_after_bootstrap);
+            return Some(s);
         }
     }
-    (None, period_after_bootstrap)
+    None
+}
+
+/// The CL source-selection overrides are applied in the `ChainConfig`
+/// constructors, so a stray one silently changes what a test dials — setting
+/// `MYOTIS_CL_STATIC_PEERS` to a known-good server is exactly how #422's
+/// reporter built their *control*, which is the opposite of what these
+/// regressions measure.
+fn assert_no_cl_env_overrides() {
+    for var in ["MYOTIS_CL_STATIC_PEERS", "MYOTIS_CL_DISABLE_DISCV5"] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set — it changes which peers this test dials, so the result \
+             would not mean what the test claims. Unset it."
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live network test: cold start with NO pinned peers, takes minutes"]
 async fn cold_start_without_static_peers_syncs_through_discovery() {
     init_tracing();
+    assert_no_cl_env_overrides();
     let mut config = config_for_env();
     let pinned = config.static_peers.len();
     // The crutch under test. Discovery keeps its bootnodes — removing those
@@ -102,7 +122,7 @@ async fn cold_start_without_static_peers_syncs_through_discovery() {
     assert!(!config.bootstrap_enrs.is_empty(), "discovery needs its bootnodes");
 
     let handle = SyncHandle::start(config).expect("sync start");
-    let (synced, _) = run_to_synced(&handle, "no-pins", Duration::from_secs(900)).await;
+    let synced = run_to_synced(&handle, "no-pins", Duration::from_secs(900)).await;
     handle.stop().await;
 
     assert!(
@@ -116,22 +136,27 @@ async fn cold_start_without_static_peers_syncs_through_discovery() {
 #[ignore = "live network test: cold start from an OLD anchor, takes many minutes"]
 async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
     init_tracing();
+    assert_no_cl_env_overrides();
     let mut config = config_for_env();
 
-    // An anchor that is genuinely behind. Without one the walk is 0-2 periods
-    // and the test passes vacuously, so require it rather than defaulting.
-    let Ok(root_hex) = std::env::var("MYOTIS_TEST_ANCHOR_ROOT") else {
-        eprintln!(
-            "skipping: set MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT to an anchor \
-             that is several periods behind (see this file's header for where to get one)"
-        );
-        return;
-    };
-    let slot: u64 = std::env::var("MYOTIS_TEST_ANCHOR_SLOT")
+    // The anchor is required, and a missing one FAILS rather than returning:
+    // this test only runs when someone asked for it by name (it is #[ignore]d),
+    // and a green "1 passed" for a run that did nothing is how a regression
+    // quietly stops being one.
+    let env_non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let root_hex = env_non_empty("MYOTIS_TEST_ANCHOR_ROOT").unwrap_or_else(|| {
+        panic!(
+            "set MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT to an anchor further \
+             behind than this network's weak-subjectivity bound — see this file's header \
+             for where to get one"
+        )
+    });
+    let slot: u64 = env_non_empty("MYOTIS_TEST_ANCHOR_SLOT")
         .expect("MYOTIS_TEST_ANCHOR_SLOT must accompany MYOTIS_TEST_ANCHOR_ROOT")
+        .trim()
         .parse()
         .expect("anchor slot must be a number");
-    let root_hex = root_hex.trim_start_matches("0x");
+    let root_hex = root_hex.trim().trim_start_matches("0x");
     assert_eq!(root_hex.len(), 64, "anchor root must be 32 bytes of hex");
     let mut root = [0u8; 32];
     for (i, b) in root.iter_mut().enumerate() {
@@ -140,13 +165,17 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
 
     let anchor_period = slot / config.slots_per_period();
     let wall_period = config.wall_clock_period();
+    let bound = config.effective_ws_bound_periods();
     assert!(
-        wall_period > anchor_period,
-        "anchor period {anchor_period} is not behind the wall clock ({wall_period}) — \
-         this test would prove nothing"
+        wall_period > anchor_period && wall_period - anchor_period > bound,
+        "anchor period {anchor_period} is only {} behind the wall clock ({wall_period}), \
+         which is within this network's weak-subjectivity bound of {bound} periods — a walk \
+         that short would have survived the #422 bug, so the test would prove nothing",
+        wall_period.saturating_sub(anchor_period)
     );
     let behind = wall_period - anchor_period;
-    eprintln!("[old-anchor] anchor period {anchor_period}, wall {wall_period} ({behind} behind)");
+    eprintln!("[old-anchor] anchor period {anchor_period}, wall {wall_period} ({behind} behind, \
+               ws bound {bound})");
 
     config.checkpoint_root = root;
     config.checkpoint_slot = slot;
@@ -158,8 +187,7 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
 
     let handle = SyncHandle::start(config).expect("sync start");
     // Peer-quota-bound: ~1 update per 10 s per serving peer, fanned out.
-    let (synced, after_bootstrap) =
-        run_to_synced(&handle, "old-anchor", Duration::from_secs(1800)).await;
+    let synced = run_to_synced(&handle, "old-anchor", Duration::from_secs(1800)).await;
     handle.stop().await;
 
     let synced = synced.unwrap_or_else(|| {
@@ -169,10 +197,16 @@ async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
              exactly the #422 stall"
         )
     });
-    let start = after_bootstrap.expect("a synced store must have bootstrapped");
+    // `sync_start_period` is the period this run's catch-up started from (-1
+    // until bootstrap), so this is exact rather than sampled: the walk has to
+    // have covered the whole gap, not merely moved.
+    assert!(synced.sync_start_period >= 0, "a synced store must have bootstrapped");
+    assert_eq!(
+        synced.sync_start_period as u64, anchor_period,
+        "catch-up started from a different period than the anchor we pinned"
+    );
     assert!(
-        synced.period > start,
-        "reached SYNCED without advancing a single period (bootstrapped at {start}) — \
-         the anchor was not actually behind, so the catch-up walk went untested"
+        synced.period > synced.sync_start_period as u64,
+        "reached SYNCED without advancing a period, so the catch-up walk went untested"
     );
 }
