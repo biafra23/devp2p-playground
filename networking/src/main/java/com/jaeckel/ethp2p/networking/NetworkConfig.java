@@ -117,9 +117,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15185856, 2026-09-10, period 1853)
-            Bytes.fromHexString("16d197d597d795c05cb9a195a1bd34c77acd6c1f8ba336f75c5cfbc395710d68").toArrayUnsafe(),
-            15185856L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15195488, 2026-09-11, period 1854)
+            Bytes.fromHexString("1192ec915ea859c2ed537d0a2fa267be86b2a7d4277ad6062c5f32c0d416861e").toArrayUnsafe(),
+            15195488L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -158,6 +158,13 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
+                    // Census status 2026-09-12 (live_pins_alive, run 34660361028,
+                    // against this build's anchor, period 1854, from a clean CI
+                    // host): 4 of 12 served it — roost, 84.112.35.112,
+                    // 91.189.182.90, 54.201.148.177 — and 57.129.130.18, named
+                    // below, was among the eight that did not. Above the floor and
+                    // discovery seeds fine, so not release-blocking; re-census and
+                    // prune is the follow-up.
                     // Re-verified 2026-09-02 — the first two served the census a
                     // 512/512 period-1840 update, the third served the standalone
                     // Nimbus light client; the rest TCP-alive. TCP-dead pruned.
@@ -240,9 +247,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11110080, 2026-09-10, period 1356)
-            Bytes.fromHexString("3fdfc6b7c39990c859ca1ea0a73d4f072a49a7d3dfe7f6e416bf90006d6f079b").toArrayUnsafe(),
-            11110080L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11119712, 2026-09-11, period 1357)
+            Bytes.fromHexString("80080a10434ff91fd9dd50722c354f4ca7ae18b7be308d5ed84870b74c2c497a").toArrayUnsafe(),
+            11119712L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14).
@@ -298,9 +305,14 @@ public record NetworkConfig(
             // removes the need to pin at all.
             //
             // The public servers after it are census-verified 2026-09-11: each
-            // answered light_client_bootstrap for the pinned root AND
+            // answered light_client_bootstrap for the THEN-pinned root AND
             // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
-            // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
+            // v8.2.2. Re-verified 2026-09-12 against the anchor this build
+            // ships (period 1357) by the release's live_pins_alive run: 4 of 4
+            // pins, roost included, served a bootstrap for the new root and a
+            // period of updates — re-run it after every checkpoint refresh,
+            // since a census against a superseded root says nothing about the
+            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
             // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
             // switched off as well, cost the Rust engine's bootstrap fan-out
@@ -378,9 +390,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30012384, 2026-09-10, period 3663)
-            Bytes.fromHexString("ed1faabdc3c3a7cac06a67bc7d6c483c2a4af00c37f754a4d3860d06e1745997").toArrayUnsafe(),
-            30012384L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30035440, 2026-09-11, period 3666)
+            Bytes.fromHexString("6e6130e99ce3df489ddcd4aa73299319a202cb32219248ce6aa2c48c1287b3d7").toArrayUnsafe(),
+            30035440L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
@@ -412,6 +424,12 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
+                    // Census status 2026-09-12 (live_pins_alive, run 34660358795,
+                    // against this build's anchor, period 3666, from a clean CI
+                    // host): 8 of 23 served it, 4 more answered a bootstrap but no
+                    // updates, 11 did not answer. Above the floor and discovery
+                    // seeds fine, so not release-blocking; re-census and prune is
+                    // the follow-up. Per-entry detail in the Rust twin.
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
