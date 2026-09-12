@@ -520,9 +520,20 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // publication (design §7) is what removes the need to pin at all.
     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
     // Public sepolia LC servers, census-verified 2026-09-11: each answered
-    // light_client_bootstrap for the pinned root AND updates_by_range(1356,1)
-    // from a fresh peer id, all Lighthouse v8.2.2 (so the catch-up asks them
-    // for one period at a time — see agent_serves_one_period). They replace
+    // light_client_bootstrap for the THEN-pinned root AND
+    // updates_by_range(1356,1) from a fresh peer id, all Lighthouse v8.2.2 (so
+    // the catch-up asks them for one period at a time — see
+    // agent_serves_one_period).
+    //
+    // Re-verified 2026-09-12 against the anchor THIS build ships (period
+    // 1357), by the release's live_pins_alive run on a clean CI host: 4 of 4
+    // pins, roost included, served a bootstrap for the new root and a period
+    // of updates. Re-run it after every checkpoint refresh — a census against
+    // a superseded root says nothing about the anchor a fresh install actually
+    // starts from, which is the #422 shape: every check green while no pinned
+    // server can answer for the root being shipped.
+    //
+    // They replace
     // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
     // libp2p handshake times out — the tunnel's far end is not answering) and
     // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
@@ -579,6 +590,16 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // server in that state would have cost every gnosis wallet its
     // strikes-to-eviction on a peer that could never answer.
     "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
+    // CENSUS STATUS 2026-09-12 (live_pins_alive, run 34660358795, against the
+    // anchor this build ships — period 3666 — from a clean CI host): 8 of 23
+    // served it — roost, 134.65.194.144, 144.76.118.19, 144.76.163.174,
+    // 148.251.181.49, 148.251.235.60, 159.195.138.9, 164.152.161.131. Four
+    // more answered a bootstrap but failed updates protocol negotiation
+    // (135.129.103.34, 135.148.35.18, 144.76.164.21, 148.251.237.209): they
+    // can anchor a fresh install but cannot advance it. The remaining eleven
+    // did not answer at all. Above live_pins_alive's floor and the bootnodes
+    // seed discovery on their own, so not release-blocking; a re-census and
+    // prune (examples/period_census.rs) is the follow-up.
     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
@@ -651,6 +672,15 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // track_upstream_ip) — so repoint Nimbus, roost republishes with a bumped
     // seq, then refresh this pin and the bootstrap ENR below.
     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
+    // CENSUS STATUS 2026-09-12 (live_pins_alive, run 34660361028, against the
+    // anchor this build ships — period 1854 — from a clean CI host, so not the
+    // Lighthouse IP-ban artifact that makes a dev box's census lie): 4 of 12
+    // served it — roost, 84.112.35.112, 91.189.182.90, 54.201.148.177. The
+    // other eight did not answer, 57.129.130.18 among them, so ITS per-entry
+    // evidence below is stale. Still above live_pins_alive's floor and the
+    // bootnodes seed discovery on their own, so this was not release-blocking;
+    // a re-census and prune (examples/period_census.rs) is the follow-up.
+    //
     // Re-verified 2026-09-02 (census: updates_by_range(1840,1) answered with a
     // 512/512 update, or TCP-alive at minimum; TCP-dead entries pruned — the
     // roost comment above says why pinning an unreachable address is not free).
@@ -3523,7 +3553,13 @@ mod tests {
         assert!(agent_serves_one_period(Some("Lighthouse/v8.1.3-176cce5/x86_64-linux")));
         assert!(!agent_serves_one_period(Some("nimbus-eth2/v26.4.0")));
         assert!(!agent_serves_one_period(Some("lodestar/v1.47.0/2aff495")));
-        assert!(!agent_serves_one_period(Some("myotis/0.1.8-rs")));
+        // Built the way the engine builds it (reqresp.rs), so this sample
+        // cannot drift to a previous release's version at the next sweep.
+        assert!(!agent_serves_one_period(Some(concat!(
+            "myotis/",
+            env!("CARGO_PKG_VERSION"),
+            "-rs"
+        ))));
         // Case-sensitive on purpose: Lighthouse always capitalises its agent.
         assert!(!agent_serves_one_period(Some("lighthouse/v8.2.2")));
         assert!(!agent_serves_one_period(None));

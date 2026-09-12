@@ -158,6 +158,13 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9109/p2p/16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             List.of(
+                    // Census status 2026-09-12 (live_pins_alive, run 34660361028,
+                    // against this build's anchor, period 1854, from a clean CI
+                    // host): 4 of 12 served it — roost, 84.112.35.112,
+                    // 91.189.182.90, 54.201.148.177 — and 57.129.130.18, named
+                    // below, was among the eight that did not. Above the floor and
+                    // discovery seeds fine, so not release-blocking; re-census and
+                    // prune is the follow-up.
                     // Re-verified 2026-09-02 — the first two served the census a
                     // 512/512 period-1840 update, the third served the standalone
                     // Nimbus light client; the rest TCP-alive. TCP-dead pruned.
@@ -298,9 +305,14 @@ public record NetworkConfig(
             // removes the need to pin at all.
             //
             // The public servers after it are census-verified 2026-09-11: each
-            // answered light_client_bootstrap for the pinned root AND
+            // answered light_client_bootstrap for the THEN-pinned root AND
             // updates_by_range(1356,1) from a fresh peer id, all Lighthouse
-            // v8.2.2. They replace two dead pins — the zbox Nimbus behind the
+            // v8.2.2. Re-verified 2026-09-12 against the anchor this build
+            // ships (period 1357) by the release's live_pins_alive run: 4 of 4
+            // pins, roost included, served a bootstrap for the new root and a
+            // period of updates — re-run it after every checkpoint refresh,
+            // since a census against a superseded root says nothing about the
+            // anchor a fresh install starts from. They replace two dead pins — the zbox Nimbus behind the
             // relay (9104: TCP accepts, the libp2p handshake times out) and
             // 18.185.193.198 (TCP timeout for days) — that, with roost sepolia
             // switched off as well, cost the Rust engine's bootstrap fan-out
@@ -412,6 +424,12 @@ public record NetworkConfig(
             prependLocal(
                     "/ip4/188.68.32.16/tcp/9108/p2p/16Uiu2HAmG76htC8Bht97af8tEoH5yeNbPatxz6zeHpWoYc4cHdzh",
             List.of(
+                    // Census status 2026-09-12 (live_pins_alive, run 34660358795,
+                    // against this build's anchor, period 3666, from a clean CI
+                    // host): 8 of 23 served it, 4 more answered a bootstrap but no
+                    // updates, 11 did not answer. Above the floor and discovery
+                    // seeds fine, so not release-blocking; re-census and prune is
+                    // the follow-up. Per-entry detail in the Rust twin.
                     "/ip4/104.37.190.86/tcp/15974/p2p/16Uiu2HAky9pZH5QBGwtPgXm3A58ahKLSuuUJbZpreBMZrmksUW59",
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/135.129.103.34/tcp/9006/p2p/16Uiu2HAmA5FYL7dQftsHktHvuVTRyPdc1sH6qcWiXaVEPM6FMyN2",
